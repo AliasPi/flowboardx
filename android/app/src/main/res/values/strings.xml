@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Flowboard X</string>
+    <string name="widget_title">Flowboard X</string>
+    <string name="widget_description">Neues Whiteboard starten und letzte Dokumente öffnen</string>
+    <string name="widget_new_whiteboard">Neues Whiteboard</string>
+    <string name="widget_no_documents">Noch keine Whiteboards</string>
+</resources>

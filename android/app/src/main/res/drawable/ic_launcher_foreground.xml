@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Native vector counterpart of lib/src/app/brand_mark.dart. The 108-unit
+  viewport and additional inset keep the complete mark inside Android's
+  adaptive-icon safe zone for every launcher mask.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#2E4DE2B1"
+        android:pathData="M54,18.945 A35.055,35.055 0,1 0 54,89.055 A35.055,35.055 0,1 0 54,18.945 Z" />
+    <path
+        android:fillColor="#D14DE2B1"
+        android:pathData="M54,22.635 L63.532,30.988 L76.178,31.822 L77.012,44.468 L85.365,54 L77.012,63.532 L76.178,76.178 L63.532,77.012 L54,85.365 L44.468,77.012 L31.822,76.178 L30.988,63.532 L22.635,54 L30.988,44.468 L31.822,31.822 L44.468,30.988 Z" />
+    <path
+        android:fillColor="#FF18201F"
+        android:pathData="M54,40.162 A13.838,13.838 0,1 0 54,67.838 A13.838,13.838 0,1 0 54,40.162 Z" />
+    <path
+        android:fillColor="@android:color/transparent"
+        android:pathData="M35.55,76.14 L72.45,31.86"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeLineCap="round"
+        android:strokeWidth="9.594" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M28.17,83.52 L39.24,63.225 L48.465,72.45 Z" />
+</vector>
