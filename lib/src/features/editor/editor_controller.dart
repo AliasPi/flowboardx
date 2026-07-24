@@ -46,16 +46,20 @@ class EditorController extends ChangeNotifier {
     required Directory assetDirectory,
     Uuid? uuid,
     HandwritingRecognitionService? handwritingRecognition,
-  }) => EditorController._(
-    initialDocument: document,
-    repository: repository,
-    assetDirectory: assetDirectory,
-    uuid: uuid,
-    handwritingRecognition: handwritingRecognition,
-    ownsDocumentSession: true,
-    followsDocumentNavigation: true,
-    historyOwnerId: CommandHistory.defaultOwnerId,
-  );
+  }) {
+    final hydration = _upgradePersistedTextFrames(document);
+    return EditorController._(
+      initialDocument: hydration.document,
+      repository: repository,
+      assetDirectory: assetDirectory,
+      uuid: uuid,
+      handwritingRecognition: handwritingRecognition,
+      ownsDocumentSession: true,
+      followsDocumentNavigation: true,
+      historyOwnerId: CommandHistory.defaultOwnerId,
+      persistInitialDocument: hydration.changed,
+    );
+  }
 
   /// Creates an interaction view that shares document history and Auto-Save
   /// with [owner], while retaining its own page, camera, selection and active
@@ -78,6 +82,7 @@ class EditorController extends ChangeNotifier {
     ownsDocumentSession: false,
     followsDocumentNavigation: false,
     activePageId: owner.page.id,
+    persistInitialDocument: false,
     historyOwnerId: participantId == null
         ? 'participant:${const Uuid().v4()}'
         : 'participant:${participantId.trim()}',
@@ -95,6 +100,7 @@ class EditorController extends ChangeNotifier {
     CommandHistory? sharedHistory,
     AutosaveController? sharedAutosave,
     String? activePageId,
+    bool persistInitialDocument = false,
   }) : _uuid = uuid ?? const Uuid(),
        history = sharedHistory ?? CommandHistory(initialDocument),
        autosave =
@@ -126,6 +132,7 @@ class EditorController extends ChangeNotifier {
         lastError = 'Speichern fehlgeschlagen: $error';
         notifyListeners();
       });
+      if (persistInitialDocument) autosave.schedule(initialDocument);
     }
   }
 
@@ -1429,6 +1436,7 @@ class EditorController extends ChangeNotifier {
     bool? italic,
     BoardTextAlign? alignment,
     double? maximumWidth,
+    double? minimumWidth,
   }) {
     final index = page.objects.indexWhere((object) => object.id == objectId);
     if (index < 0 || page.objects[index] is! TextObject) return false;
@@ -1447,6 +1455,7 @@ class EditorController extends ChangeNotifier {
       transform: TextObjectLayout.fit(
         value: updated,
         maximumWidth: maximumWidth ?? TextObjectLayout.defaultMaximumWidth,
+        minimumObjectWidth: minimumWidth ?? TextObjectLayout.minimumWidth,
       ),
     );
     if (updated.text == current.text &&
@@ -1566,36 +1575,30 @@ class EditorController extends ChangeNotifier {
       lastError = null;
       final appending = InlineTextEditingEngine.isAppendAtEnd(current, points);
       double? maximumWidth;
+      double? minimumWidth;
       if (appending) {
+        final candidate = current.copyWith(text: updated);
+        final insets = TextObjectLayout.contentInsetsFor(candidate);
         final inkRight = points.fold<double>(
           current.transform.width,
           (maximum, point) => math.max(maximum, point.dx),
         );
-        final addedCharacters = math.max(
-          1,
-          updated.length - current.text.length,
-        );
-        final estimatedTextRight =
-            current.transform.width +
-            addedCharacters * current.fontSize * .68 +
-            current.fontSize;
         final desired = math.max(
-          inkRight + current.fontSize,
-          estimatedTextRight,
+          inkRight + insets.right,
+          TextObjectLayout.preferredWidth(candidate),
         );
         final available = math.max(
           TextObjectLayout.minimumWidth,
           viewport.worldBounds.right - current.transform.x,
         );
-        maximumWidth = math.min(
-          available,
-          math.max(TextObjectLayout.defaultMaximumWidth, desired),
-        );
+        maximumWidth = math.min(available, desired);
+        minimumWidth = math.min(current.transform.width, maximumWidth);
       }
       return updateTextObject(
         objectId: current.id,
         text: updated,
         maximumWidth: maximumWidth,
+        minimumWidth: minimumWidth,
       );
     } catch (error) {
       if (!_closed) {
@@ -1699,9 +1702,12 @@ class EditorController extends ChangeNotifier {
         );
       }
       lastError = null;
+      final hydratedPage = _upgradePersistedTextFramesInPage(
+        materialization.page,
+      ).page;
       history.execute(
         AddTemplatePageCommand(
-          page: materialization.page,
+          page: hydratedPage,
           assets: materialization.assets,
           insertAt: _followsDocumentNavigation ? null : currentPageIndex + 1,
           selectNewPage: _followsDocumentNavigation,
@@ -1709,7 +1715,7 @@ class EditorController extends ChangeNotifier {
         ownerId: _historyOwnerId,
       );
       committed = true;
-      _activePageId = materialization.page.id;
+      _activePageId = hydratedPage.id;
       _afterPageChanged();
     } catch (error) {
       if (!committed) await materialization?.rollbackFiles();
@@ -2889,12 +2895,46 @@ class EditorController extends ChangeNotifier {
           bold: value.bold,
           italic: value.italic,
           alignment: value.alignment,
+          textLayoutVersion: value.textLayoutVersion,
           sourceStrokeIds: value.sourceStrokeIds,
           zIndex: value.zIndex,
           opacity: value.opacity,
           locked: value.locked,
         ),
       };
+}
+
+({WhiteboardDocument document, bool changed}) _upgradePersistedTextFrames(
+  WhiteboardDocument document,
+) {
+  var changed = false;
+  final pages = document.pages
+      .map((page) {
+        final hydration = _upgradePersistedTextFramesInPage(page);
+        if (hydration.changed) changed = true;
+        return hydration.page;
+      })
+      .toList(growable: false);
+  if (!changed) return (document: document, changed: false);
+  return (document: document.copyWith(pages: pages), changed: true);
+}
+
+({BoardPage page, bool changed}) _upgradePersistedTextFramesInPage(
+  BoardPage page,
+) {
+  var changed = false;
+  final objects = page.objects
+      .map((object) {
+        if (object is! TextObject) return object;
+        final upgraded = TextObjectLayout.upgradeLegacyFrame(object);
+        if (!identical(upgraded, object)) changed = true;
+        return upgraded;
+      })
+      .toList(growable: false);
+  return (
+    page: changed ? page.copyWith(objects: objects).sanitized() : page,
+    changed: changed,
+  );
 }
 
 class _AnnotationTarget {

@@ -28,6 +28,7 @@ abstract final class InlineTextEditingEngine {
   static List<InlineTextToken> tokensFor(TextObject value) {
     if (value.text.isEmpty) return const <InlineTextToken>[];
     final painter = _painter(value);
+    final origin = _painterOrigin(value, painter);
     final tokens = <InlineTextToken>[];
     for (final match in RegExp(r'\S+').allMatches(value.text)) {
       final boxes = painter.getBoxesForSelection(
@@ -35,7 +36,12 @@ abstract final class InlineTextEditingEngine {
       );
       Rect? bounds;
       for (final box in boxes) {
-        final rect = Rect.fromLTRB(box.left, box.top, box.right, box.bottom);
+        final rect = Rect.fromLTRB(
+          box.left,
+          box.top,
+          box.right,
+          box.bottom,
+        ).shift(origin);
         bounds = bounds == null ? rect : bounds.expandToInclude(rect);
       }
       if (bounds != null && !bounds.isEmpty) {
@@ -155,8 +161,9 @@ abstract final class InlineTextEditingEngine {
     }
 
     final painter = _painter(value);
+    final origin = _painterOrigin(value, painter);
     final caret = painter
-        .getPositionForOffset(inkBounds.center)
+        .getPositionForOffset(inkBounds.center - origin)
         .offset
         .clamp(0, value.text.length);
     painter.dispose();
@@ -178,10 +185,13 @@ abstract final class InlineTextEditingEngine {
   static bool isAppendAtEnd(TextObject value, List<Offset> inkPoints) {
     if (value.text.isEmpty || inkPoints.isEmpty) return false;
     final painter = _painter(value);
-    final caret = painter.getOffsetForCaret(
-      TextPosition(offset: value.text.length),
-      Rect.zero,
-    );
+    final origin = _painterOrigin(value, painter);
+    final caret =
+        painter.getOffsetForCaret(
+          TextPosition(offset: value.text.length),
+          Rect.zero,
+        ) +
+        origin;
     painter.dispose();
     final bounds = _pointsBounds(inkPoints);
     final verticalTolerance = math.max(22, value.fontSize * 1.25);
@@ -215,12 +225,25 @@ abstract final class InlineTextEditingEngine {
         .toList(growable: false);
   }
 
-  static TextPainter _painter(TextObject value) => TextPainter(
-    text: TextSpan(text: value.text, style: TextObjectLayout.styleFor(value)),
-    textDirection: TextDirection.ltr,
-    textAlign: TextObjectLayout.textAlignFor(value.alignment),
-    maxLines: null,
-  )..layout(maxWidth: math.max(1, value.transform.width));
+  static TextPainter _painter(TextObject value) {
+    final insets = TextObjectLayout.contentInsetsFor(value);
+    return TextObjectLayout.createPainter(
+      value,
+    )..layout(maxWidth: math.max(1, value.transform.width - insets.horizontal));
+  }
+
+  static Offset _painterOrigin(TextObject value, TextPainter painter) {
+    final insets = TextObjectLayout.contentInsetsFor(value);
+    final contentWidth = math.max(1, value.transform.width - insets.horizontal);
+    final x = switch (value.alignment) {
+      BoardTextAlign.left => insets.left,
+      BoardTextAlign.center =>
+        insets.left + contentWidth / 2 - painter.width / 2,
+      BoardTextAlign.right =>
+        value.transform.width - insets.right - painter.width,
+    };
+    return Offset(x, insets.top);
+  }
 
   static Rect _pointsBounds(List<Offset> points) {
     var left = points.first.dx;

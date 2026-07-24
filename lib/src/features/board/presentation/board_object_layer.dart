@@ -323,23 +323,50 @@ class _TextBody extends StatelessWidget {
   final double displayScale;
 
   @override
-  Widget build(BuildContext context) {
-    return Align(
-      alignment: switch (text.alignment) {
-        BoardTextAlign.left => Alignment.topLeft,
-        BoardTextAlign.center => Alignment.topCenter,
-        BoardTextAlign.right => Alignment.topRight,
-      },
-      child: Text(
-        text.text,
-        textAlign: TextObjectLayout.textAlignFor(text.alignment),
-        textScaler: TextScaler.noScaling,
-        style: TextObjectLayout.styleFor(
-          text,
-        ).copyWith(fontSize: text.fontSize * displayScale),
-      ),
-    );
+  Widget build(BuildContext context) => Semantics(
+    label: text.text,
+    child: CustomPaint(
+      key: ValueKey<String>('board-text-${text.id}'),
+      painter: BoardTextPainter(text, displayScale: displayScale),
+    ),
+  );
+}
+
+/// Paints text in logical document coordinates, then scales the completed
+/// paragraph. Zoom therefore cannot change wrapping or hide the final line.
+class BoardTextPainter extends CustomPainter {
+  const BoardTextPainter(this.text, {required this.displayScale});
+
+  final TextObject text;
+  final double displayScale;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (text.text.isEmpty || size.isEmpty) return;
+    final scale = displayScale.isFinite && displayScale > 0
+        ? displayScale
+        : 1.0;
+    final logicalSize = Size(size.width / scale, size.height / scale);
+    final contentRect = TextObjectLayout.contentRectFor(text, logicalSize);
+    final painter = TextObjectLayout.createPainter(text)
+      ..layout(maxWidth: contentRect.width);
+    final x = switch (text.alignment) {
+      BoardTextAlign.left => contentRect.left,
+      BoardTextAlign.center => contentRect.center.dx - painter.width / 2,
+      BoardTextAlign.right => contentRect.right - painter.width,
+    };
+    canvas
+      ..save()
+      ..scale(scale)
+      ..clipRect(Offset.zero & logicalSize);
+    painter.paint(canvas, Offset(x, contentRect.top));
+    canvas.restore();
+    painter.dispose();
   }
+
+  @override
+  bool shouldRepaint(covariant BoardTextPainter oldDelegate) =>
+      oldDelegate.text != text || oldDelegate.displayScale != displayScale;
 }
 
 class _ShapePainter extends CustomPainter {

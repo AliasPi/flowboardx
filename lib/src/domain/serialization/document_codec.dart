@@ -46,7 +46,7 @@ final class DocumentCodec {
 final class DocumentMigrator {
   const DocumentMigrator();
 
-  static const currentVersion = 5;
+  static const currentVersion = 6;
 
   Map<String, Object?> migrate(Map<String, Object?> source) {
     var document = _deepMap(source);
@@ -63,6 +63,7 @@ final class DocumentMigrator {
         2 => _fromV2ToV3(document),
         3 => _fromV3ToV4(document),
         4 => _fromV4ToV5(document),
+        5 => _fromV5ToV6(document),
         _ => throw FormatException(
           'Keine Migration für Dokumentversion $version.',
         ),
@@ -249,6 +250,30 @@ final class DocumentMigrator {
     }
     result['pages'] = pages;
     result['schemaVersion'] = 5;
+    return result;
+  }
+
+  /// Schema 6 identifies text frames created with the legacy, unpadded
+  /// typography. Exact reflow needs Flutter's font engine and is therefore
+  /// completed on the root isolate when the editor hydrates the document.
+  Map<String, Object?> _fromV5ToV6(Map<String, Object?> source) {
+    final result = _deepMap(source);
+    final pages = _mutableList(result['pages']);
+    for (var pageIndex = 0; pageIndex < pages.length; pageIndex++) {
+      final page = _asMutableMap(pages[pageIndex]);
+      final objects = _mutableList(page['objects']);
+      for (var objectIndex = 0; objectIndex < objects.length; objectIndex++) {
+        final object = _asMutableMap(objects[objectIndex]);
+        if (object['type']?.toString() == 'text') {
+          object['textLayoutVersion'] ??= 1;
+        }
+        objects[objectIndex] = object;
+      }
+      page['objects'] = objects;
+      pages[pageIndex] = page;
+    }
+    result['pages'] = pages;
+    result['schemaVersion'] = 6;
     return result;
   }
 

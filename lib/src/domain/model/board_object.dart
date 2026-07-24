@@ -447,6 +447,8 @@ final class CoverObject extends BoardObject {
 }
 
 final class TextObject extends BoardObject {
+  static const int currentLayoutVersion = 2;
+
   TextObject({
     required super.id,
     required super.transform,
@@ -456,6 +458,7 @@ final class TextObject extends BoardObject {
     this.bold = false,
     this.italic = false,
     this.alignment = BoardTextAlign.left,
+    this.textLayoutVersion = currentLayoutVersion,
     Iterable<String> sourceStrokeIds = const [],
     super.zIndex = 0,
     super.opacity = 1,
@@ -470,6 +473,7 @@ final class TextObject extends BoardObject {
   final bool bold;
   final bool italic;
   final BoardTextAlign alignment;
+  final int textLayoutVersion;
   final List<String> sourceStrokeIds;
 
   TextObject copyWith({
@@ -480,6 +484,7 @@ final class TextObject extends BoardObject {
     bool? bold,
     bool? italic,
     BoardTextAlign? alignment,
+    int? textLayoutVersion,
     Iterable<String>? sourceStrokeIds,
     int? zIndex,
     double? opacity,
@@ -493,6 +498,7 @@ final class TextObject extends BoardObject {
     bold: bold ?? this.bold,
     italic: italic ?? this.italic,
     alignment: alignment ?? this.alignment,
+    textLayoutVersion: textLayoutVersion ?? this.textLayoutVersion,
     sourceStrokeIds: sourceStrokeIds ?? this.sourceStrokeIds,
     zIndex: zIndex ?? this.zIndex,
     opacity: opacity ?? this.opacity,
@@ -516,6 +522,7 @@ final class TextObject extends BoardObject {
     'bold': bold,
     'italic': italic,
     'alignment': alignment.name,
+    'textLayoutVersion': textLayoutVersion,
     'sourceStrokeIds': sourceStrokeIds,
   };
 
@@ -532,6 +539,7 @@ final class TextObject extends BoardObject {
       json['alignment'],
       BoardTextAlign.left,
     )!,
+    textLayoutVersion: math.max(1, _integer(json['textLayoutVersion'], 1)),
     sourceStrokeIds: _stringList(json['sourceStrokeIds']),
     zIndex: _integer(json['zIndex'], 0),
     opacity: _double(json['opacity'], 1).clamp(0, 1),

@@ -9,6 +9,7 @@ import '../../domain/model/ink.dart';
 import '../../domain/model/scene_order.dart';
 import '../board/presentation/dashed_ink_path.dart';
 import '../board/presentation/ink_painter.dart';
+import '../editor/text_object_layout.dart';
 
 /// Lightweight, asset-independent page preview. Raster assets intentionally use
 /// recognizable placeholders while their real transforms and annotations are
@@ -102,7 +103,10 @@ class DocumentPagePreviewPainter extends CustomPainter {
         }
         continue;
       }
-      final object = item.object!;
+      final sourceObject = item.object!;
+      final object = sourceObject is TextObject
+          ? TextObjectLayout.upgradeLegacyFrame(sourceObject)
+          : sourceObject;
       _paintObject(canvas, object, scale);
       final layer = annotations[object.id];
       final transform = object.transform;
@@ -444,39 +448,32 @@ class DocumentPagePreviewPainter extends CustomPainter {
     );
   }
 
-  void _paintText(Canvas canvas, Rect rect, TextObject text, double scale) {
+  void _paintText(Canvas canvas, Rect rect, TextObject text, double _) {
     if (text.text.isEmpty) return;
-    final painter = TextPainter(
-      text: TextSpan(
-        text: text.text,
-        style: TextStyle(
-          inherit: false,
-          color: _withObjectOpacity(Color(text.colorArgb), text.opacity),
-          fontSize: math.max(
-            text.fontSize.isFinite && text.fontSize > 0 ? text.fontSize : 16.0,
-            8 / scale,
-          ),
-          fontWeight: text.bold ? FontWeight.bold : FontWeight.normal,
-          fontStyle: text.italic ? FontStyle.italic : FontStyle.normal,
-        ),
-      ),
-      textDirection: TextDirection.ltr,
-      textAlign: switch (text.alignment) {
-        BoardTextAlign.left => TextAlign.left,
-        BoardTextAlign.center => TextAlign.center,
-        BoardTextAlign.right => TextAlign.right,
-      },
-      maxLines: 4,
-      ellipsis: '…',
-    )..layout(maxWidth: rect.width);
+    final previewText = text.copyWith(
+      colorArgb: _withObjectOpacity(
+        Color(text.colorArgb),
+        text.opacity,
+      ).toARGB32(),
+    );
+    final insets = TextObjectLayout.contentInsetsFor(previewText);
+    final content = Rect.fromLTRB(
+      rect.left + insets.left,
+      rect.top + insets.top,
+      rect.right - insets.right,
+      rect.bottom - insets.bottom,
+    );
+    if (content.isEmpty) return;
+    final painter = TextObjectLayout.createPainter(previewText)
+      ..layout(maxWidth: content.width);
     final x = switch (text.alignment) {
-      BoardTextAlign.left => rect.left,
-      BoardTextAlign.center => rect.center.dx - painter.width / 2,
-      BoardTextAlign.right => rect.right - painter.width,
+      BoardTextAlign.left => content.left,
+      BoardTextAlign.center => content.center.dx - painter.width / 2,
+      BoardTextAlign.right => content.right - painter.width,
     };
     canvas.save();
     canvas.clipRect(rect);
-    painter.paint(canvas, Offset(x, rect.top));
+    painter.paint(canvas, Offset(x, content.top));
     canvas.restore();
     painter.dispose();
   }

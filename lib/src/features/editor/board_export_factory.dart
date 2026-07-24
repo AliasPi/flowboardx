@@ -12,6 +12,7 @@ import '../../domain/model/scene_order.dart';
 import '../board/presentation/board_object_layer.dart';
 import '../board/presentation/ink_painter.dart';
 import '../export_share/export_share.dart';
+import 'text_object_layout.dart';
 
 class PreparedBoardExport {
   PreparedBoardExport(this.snapshot);
@@ -377,13 +378,7 @@ class BoardExportFactory {
         };
         canvas.drawRect(covered, ui.Paint()..color = ui.Color(cover.colorArgb));
       case final TextObject text:
-        _paintLabel(
-          canvas,
-          rect,
-          text.text,
-          ui.Color(text.colorArgb),
-          size: text.fontSize,
-        );
+        _paintTextObject(canvas, rect, text);
     }
     canvas.restore();
     canvas.restore();
@@ -426,6 +421,34 @@ class BoardExportFactory {
       ellipsis: '…',
     )..layout(maxWidth: rect.width);
     painter.paint(canvas, rect.topLeft);
+    painter.dispose();
+  }
+
+  static void _paintTextObject(
+    ui.Canvas canvas,
+    ui.Rect rect,
+    TextObject text,
+  ) {
+    if (text.text.isEmpty || rect.isEmpty) return;
+    final insets = TextObjectLayout.contentInsetsFor(text);
+    final content = ui.Rect.fromLTRB(
+      rect.left + insets.left,
+      rect.top + insets.top,
+      rect.right - insets.right,
+      rect.bottom - insets.bottom,
+    );
+    if (content.isEmpty) return;
+    final painter = TextObjectLayout.createPainter(text)
+      ..layout(maxWidth: content.width);
+    final x = switch (text.alignment) {
+      BoardTextAlign.left => content.left,
+      BoardTextAlign.center => content.center.dx - painter.width / 2,
+      BoardTextAlign.right => content.right - painter.width,
+    };
+    canvas.save();
+    canvas.clipRect(rect);
+    painter.paint(canvas, ui.Offset(x, content.top));
+    canvas.restore();
     painter.dispose();
   }
 }

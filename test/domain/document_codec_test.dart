@@ -188,6 +188,10 @@ void main() {
       ]);
       expect(decoded.assets.single.sha256, 'abc');
       expect(decoded.metadata.custom['subject'], 'biology');
+      expect(
+        (decoded.currentPage.objects.last as TextObject).textLayoutVersion,
+        TextObject.currentLayoutVersion,
+      );
     });
 
     test('migrates legacy v1 ink, viewport, presets and objects', () {
@@ -256,6 +260,46 @@ void main() {
         0xFFCC1122,
       );
       expect(document.presets.any((preset) => preset.id == 'black'), isTrue);
+    });
+
+    test('marks schema 5 text frames for root-isolate layout upgrade', () {
+      final source = jsonEncode(<String, Object?>{
+        'schemaVersion': 5,
+        'id': 'legacy-text',
+        'title': 'Alttext',
+        'createdAt': '2026-01-01T00:00:00Z',
+        'updatedAt': '2026-01-01T00:00:00Z',
+        'currentPageIndex': 0,
+        'pages': <Object?>[
+          <String, Object?>{
+            'id': 'page',
+            'name': 'Seite 1',
+            'objects': <Object?>[
+              <String, Object?>{
+                'id': 'text',
+                'type': 'text',
+                'transform': <String, Object?>{
+                  'x': 10,
+                  'y': 20,
+                  'width': 180,
+                  'height': 40,
+                },
+                'text': 'Ein altes Textfeld',
+                'fontSize': 28,
+              },
+            ],
+          },
+        ],
+      });
+
+      final document = const DocumentCodec().decode(source);
+      final text = document.currentPage.objects.single as TextObject;
+
+      expect(text.textLayoutVersion, 1);
+      expect(
+        jsonDecode(const DocumentCodec().encode(document))['schemaVersion'],
+        DocumentMigrator.currentVersion,
+      );
     });
 
     test('rejects future schema versions and invalid roots', () {

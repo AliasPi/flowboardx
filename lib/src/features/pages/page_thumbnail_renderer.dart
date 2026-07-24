@@ -13,6 +13,7 @@ import '../../domain/model/geometry.dart';
 import '../../domain/model/scene_order.dart';
 import '../board/presentation/board_object_layer.dart';
 import '../board/presentation/ink_painter.dart';
+import '../editor/text_object_layout.dart';
 
 typedef PdfThumbnailRasterizer =
     Future<PdfThumbnailRaster> Function(
@@ -249,22 +250,34 @@ class PageThumbnailRenderer {
       case final CoverObject cover:
         canvas.drawRect(rect, Paint()..color = Color(cover.colorArgb));
       case final TextObject textObject:
-        final text = TextPainter(
-          text: TextSpan(
-            text: textObject.text,
-            style: TextStyle(
-              color: Color(textObject.colorArgb),
-              fontSize: textObject.fontSize,
-              fontWeight: textObject.bold ? FontWeight.bold : FontWeight.normal,
-            ),
-          ),
-          textDirection: TextDirection.ltr,
-        )..layout(maxWidth: rect.width);
-        text.paint(canvas, rect.topLeft);
-        text.dispose();
+        _paintTextObject(canvas, rect, textObject);
     }
     canvas.restore();
     canvas.restore();
+  }
+
+  void _paintTextObject(Canvas canvas, Rect rect, TextObject value) {
+    if (value.text.isEmpty || rect.isEmpty) return;
+    final insets = TextObjectLayout.contentInsetsFor(value);
+    final content = Rect.fromLTRB(
+      rect.left + insets.left,
+      rect.top + insets.top,
+      rect.right - insets.right,
+      rect.bottom - insets.bottom,
+    );
+    if (content.isEmpty) return;
+    final painter = TextObjectLayout.createPainter(value)
+      ..layout(maxWidth: content.width);
+    final x = switch (value.alignment) {
+      BoardTextAlign.left => content.left,
+      BoardTextAlign.center => content.center.dx - painter.width / 2,
+      BoardTextAlign.right => content.right - painter.width,
+    };
+    canvas.save();
+    canvas.clipRect(rect);
+    painter.paint(canvas, Offset(x, content.top));
+    canvas.restore();
+    painter.dispose();
   }
 
   void _applyObjectOrientation(Canvas canvas, ObjectTransform transform) {

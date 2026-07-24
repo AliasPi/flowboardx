@@ -85,11 +85,14 @@ ist.
 - lokale Handschrifterkennung ohne Laufzeit-Download: unter Android mit dem im
   APK gebündelten lateinischen ML-Kit-Modell, unter Windows primär mit Windows
   Ink und bei nicht installiertem Handschrift-Feature mit lokaler Windows OCR
-- erkannter Text erhält automatisch seine gemessene Inhaltsgröße, skaliert
-  Schrift und Rahmen gemeinsam und lässt sich anschließend direkt auf der
-  Fläche mit dem Stift korrigieren: über ein Wort schreiben ersetzt es,
+- erkannter Text erhält automatisch eine exakt vermessene, gepolsterte
+  Inhaltsbox; Messung, Canvas-Darstellung, Export und Inline-Caret verwenden
+  dieselben theme- und zoomunabhängigen Schriftmetriken. Schrift und Rahmen
+  skalieren gemeinsam. Direktes Schreiben über ein Wort ersetzt es,
   waagerechtes Durchstreichen löscht es und Schreiben rechts vom letzten Wort
-  hängt neuen erkannten Text an
+  hängt neuen erkannten Text an und erweitert den Rahmen anhand der realen
+  Glyphbreite. Bereits gespeicherte Textfelder werden beim ersten Öffnen
+  einmalig, verlustfrei und ohne Undo-Eintrag auf die neuen Maße migriert
 - driftfreier Countdown-Timer in der Kopfleiste mit Start, Pause, Zurücksetzen
   und akustischem Signal; die große Timeranzeige ist frei verschiebbar und
   skalierbar, während die übrige Schreibfläche vollständig bedienbar bleibt
