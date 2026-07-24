@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 
+import 'radial_eraser_glyph.dart';
 import 'radial_menu_geometry.dart';
 import 'radial_menu_models.dart';
 
@@ -47,6 +48,7 @@ const List<IconData> _penTypeIcons = <IconData>[
   Icons.highlight_rounded,
   Icons.more_horiz_rounded,
   Icons.horizontal_rule_rounded,
+  Icons.backspace_outlined,
 ];
 
 /// Paints the complete radial surface in a single retained repaint boundary.
@@ -1058,6 +1060,10 @@ class RadialMenuPainter extends CustomPainter {
     required double size,
     required Color color,
   }) {
+    if (type == RadialPenType.eraser) {
+      RadialEraserGlyph.paint(canvas, center: center, size: size, color: color);
+      return;
+    }
     if (type != RadialPenType.marker && type != RadialPenType.straight) {
       _drawIcon(canvas, _penTypeIcons[type.index], center, size, color);
       return;

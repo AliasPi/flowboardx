@@ -58,6 +58,35 @@ class RadialMenuGeometry {
   double get tertiaryInnerRadius => 224 * scale;
   double get tertiaryOuterRadius => 286 * scale;
 
+  /// Constrains the draggable menu center inside [regionSize].
+  ///
+  /// A compact, closed menu only needs its center disc to remain visible.
+  /// Open split-screen menus can instead reserve the complete square surface,
+  /// which keeps every ring on the owning side of the center divider.
+  Offset clampCenterToRegion(
+    Offset requested, {
+    required Size regionSize,
+    required double edgePadding,
+    required bool keepFullSurfaceVisible,
+  }) {
+    if (regionSize.isEmpty) return requested;
+    final safeRequested = requested.dx.isFinite && requested.dy.isFinite
+        ? requested
+        : Offset(regionSize.width / 2, regionSize.height / 2);
+    final contentRadius = keepFullSurfaceVisible
+        ? size.shortestSide / 2
+        : centerRadius;
+    final margin = math.max(0.0, contentRadius + edgePadding);
+    final minX = margin;
+    final maxX = regionSize.width - margin;
+    final minY = margin;
+    final maxY = regionSize.height - margin;
+    return Offset(
+      minX <= maxX ? safeRequested.dx.clamp(minX, maxX) : regionSize.width / 2,
+      minY <= maxY ? safeRequested.dy.clamp(minY, maxY) : regionSize.height / 2,
+    );
+  }
+
   double get primarySegmentSweep => _twoPi / primarySegmentCount;
 
   /// Submenus occupy at most the width of three primary segments. They are
@@ -72,9 +101,9 @@ class RadialMenuGeometry {
       primaryCenterAngle(parentIndex) - compactSubmenuSpan / 2;
 
   /// The thickness gauge intentionally owns most of the outer pen fan. The
-  /// four pen types stay grouped in the remaining compact block, matching the
-  /// visual hierarchy of a wide physical thickness control beside four quick
-  /// mode buttons.
+  /// five drawing tools stay grouped in the remaining compact block, matching
+  /// the visual hierarchy of a wide physical thickness control beside the
+  /// quick mode buttons.
   static const double penThicknessSpanFraction = .58;
   double get thicknessSpan => compactSubmenuSpan * penThicknessSpanFraction;
   double get thicknessStartAngle => compactSubmenuStartAngle(0);

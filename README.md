@@ -24,8 +24,22 @@ ist.
   Stifte, Marker, gestrichelte Tinte und exakte Geraden; der Dash-Renderer ist
   fortschrittsgarantiert, arbeitsbegrenzt und schützt den nativen Rasterizer
   auch vor beschädigten Wiederherstellungsdaten
-- robuste Trennung von Stylus, Finger-Navigation, Palm-Rejection und
-  breitflächiger Stroke-Radiergeste
+- robuste Trennung von Stylus, Finger-Navigation, optionalem Finger-Schreiben,
+  Palm-Rejection sowie partiellem Stift-/Faust-Radierer. Android übergibt die
+  tatsächliche, zur Flutter-View ausgerichtete Kontaktellipse aus Mittelpunkt,
+  Haupt-/Nebenachse und Orientierung; Stift-Radiercursor und Löschpfad
+  entsprechen bei jedem Zoom der eingestellten 1–32-px-Dicke
+- umschaltbarer Ein-/Zwei-Personen-Modus: Im geteilten Betrieb besitzt jede
+  Hälfte ein eigenes Radialmenü, einen eigenen Stiftzustand sowie einen
+  eigenen Eingabebereich, Viewport und aktiven Seitenzustand. Beide Hälften
+  bearbeiten dasselbe unveränderlich modellierte Dokument, ohne Kamera- oder
+  Seitennavigation auf die andere Hälfte zu übertragen. Pointer bleiben ihrer
+  Hälfte zugeordnet; auch Pan, Zoom, Navigator und wiederhergestellte Viewports
+  werden an der stabilen Welt-Mittellinie geklemmt, sodass keine Kamera in den
+  Bereich der anderen Person gelangt. Beide Personen können gleichzeitig
+  schreiben und besitzen getrennte Undo-/Redo-Zweige. Neue Seiten sind sofort
+  Teil des gemeinsamen Dokuments, aber zunächst nur für den Ersteller aktiv;
+  beim Umschalten werden weder Inhalt noch Z-Reihenfolge verändert
 - begrenzte 3×3-Whiteboard-Fläche mit natürlichem Pan und Zwei-Finger-Zoom;
   außerhalb des beschreibbaren Bereichs wird die Fläche abgedunkelt und beim
   Zoomen erscheint ein verschiebbarer, automatisch ausblendender Navigator mit
@@ -35,11 +49,14 @@ ist.
   Subring-Fächern, gebündelten Farb-/Stifttypfeldern, einem großen Regler mit
   realer 1–32-px-Dickenvisualisierung, kreisförmigem Hue-/Sättigungs-Farbwähler
   und eindeutigen Aktivfarben; nicht verfügbare Undo-/Redo-Aktionen sind
-  sichtbar deaktiviert und nicht bedienbar
+  sichtbar deaktiviert und nicht bedienbar. Die zyklische Seitenauswahl lässt
+  sich auch bei geschlossenem Menü mit fünf Fingern drehen, rastet haptisch in
+  18°-Schritten ein und zeigt bis zum Loslassen die echte Zielseiten-Miniatur
 - bis zu 100 Seiten, Undo/Redo, Rechteck-/Lassoauswahl, semantische
   Buchstaben-/Wort-/Zeilen-/Skizzenauswahl, „Alles auswählen“, Verschieben,
-  Skalieren, dauerhaftes Gruppieren bis zum expliziten Entgruppieren,
-  Duplizieren, Kopieren, Ausschneiden und Einfügen
+  freies sowie achsengebundenes Skalieren, freie Rotation, Winkel-Presets,
+  horizontales Spiegeln, dauerhaftes Gruppieren bis zum expliziten
+  Entgruppieren, Duplizieren, Kopieren, Ausschneiden und Einfügen
 - eine gemeinsame Z-Reihenfolge für Tinte und Objekte mit „Eine Ebene nach
   vorn/hinten“ sowie „Ganz nach vorn/hinten“
 - Formen, Bilder, schlüssellose Google-Bildersuche mit SafeSearch und robuster
@@ -50,7 +67,9 @@ ist.
   persistenten zuletzt verwendeten Farben; Tabellen werden in einem direkten
   Zeilen-/Spalten-Dialog konfiguriert, PDFs über echte Seitenvorschauen als
   ganzes Dokument, einzelne oder frei gewählte Seiten importiert und
-  Reveal-Abdeckungen an allen vier Kanten direkt skaliert
+  Reveal-Abdeckungen an allen vier Kanten direkt skaliert. Abdeckungen erhalten
+  dieselben Zwischenablage-, Lösch- und Ebenenaktionen wie andere Objekte und
+  werden beim Erstellen standardmäßig ganz vorn eingeordnet
 - objektlokale Ink-Layer für Bild-, PDF- und Tabellenannotationen; beim
   Verschieben und Skalieren folgt die Tinte dem Objekt, während Eingabe,
   Vorschau und Commit auch auf nicht-quadratischen Tabellen rund und
@@ -71,6 +90,9 @@ ist.
   Fläche mit dem Stift korrigieren: über ein Wort schreiben ersetzt es,
   waagerechtes Durchstreichen löscht es und Schreiben rechts vom letzten Wort
   hängt neuen erkannten Text an
+- driftfreier Countdown-Timer in der Kopfleiste mit Start, Pause, Zurücksetzen
+  und akustischem Signal; die große Timeranzeige ist frei verschiebbar und
+  skalierbar, während die übrige Schreibfläche vollständig bedienbar bleibt
 - Android-Systemwidget mit „Neues Whiteboard“, größenabhängiger Liste und
   Öffnen zuletzt verwendeter Dokumente
 - responsive Dokumentbibliothek mit echten Inhaltsvorschauen, Recovery-Status,
@@ -120,7 +142,10 @@ Das erzeugte APK liegt unter
 
 ## Android-Release und getrennte APKs
 
-Der direkte Flutter-Aufruf erzeugt je Android-ABI eine eigene, kleinere APK:
+Ein Release-Build setzt eine gültige `android/key.properties` voraus. Dadurch
+kann der Build nicht mehr versehentlich formal erzeugte, aber von Android als
+ungültig abgelehnte unsignierte APKs ausliefern. Mit konfigurierter Signatur
+erzeugt der direkte Flutter-Aufruf je Android-ABI eine eigene, kleinere APK:
 
 ```powershell
 flutter build apk --split-per-abi
@@ -146,13 +171,30 @@ app-x86_64-release.apk
 Für aktuelle 64-Bit-Android-Smartboards ist üblicherweise
 `app-arm64-v8a-release.apk` passend. Die ABI des Zielgeräts sollte vor der
 Verteilung geprüft werden, zum Beispiel mit
-`adb shell getprop ro.product.cpu.abilist`. Ohne Release-Key sind diese
-Artefakte nicht für eine Store-Veröffentlichung signiert.
+`adb shell getprop ro.product.cpu.abilist`.
+
+Android akzeptiert ein Update nur, wenn die bereits installierte App mit
+demselben Schlüssel signiert wurde. Wurde zuvor ein Debug-Build, eine
+unsignierte Vorabversion oder ein Build mit einem anderen Release-Schlüssel
+installiert, müssen wichtige Dokumente zuerst exportiert und diese alte App
+einmal deinstalliert werden. Danach lässt sich die signierte APK installieren;
+weitere Updates mit demselben Release-Schlüssel erhalten die App-Daten.
+
+Für einen sofort installierbaren lokalen Test ohne Release-Key kann stattdessen
+ein automatisch mit dem Android-Entwicklerschlüssel signierter Debug-Split
+gebaut werden:
+
+```powershell
+flutter build apk --debug --split-per-abi
+```
+
+Debug-signierte APKs sind nur für Entwicklung und Sideloading gedacht. Sie
+dürfen nicht im Store veröffentlicht werden.
 
 ## Release-Signierung
 
-Debug-Keys werden ausdrücklich nicht für Release verwendet. Für einen
-signierten Store-Build wird eine nicht eingecheckte `android/key.properties`
+Für einen signierten Store-Build wird eine nicht eingecheckte
+`android/key.properties` mit einem dauerhaft gesicherten Upload-/Release-Key
 angelegt:
 
 ```properties
@@ -212,18 +254,62 @@ deshalb einen HTML-Fallback, lehnt aber nicht sicher verifizierbare
 Cross-Origin-Bilddownloads bewusst ab. Android, Windows, iOS, macOS und der
 Linux-HTML-Fallback verwenden dagegen den abgesicherten nativen Downloadpfad.
 
+## SMART Board MX / MX Pro
+
+SMART iQ aktiviert für neu installierte Android-Drittanbieter-Apps
+standardmäßig eine eigene Anmerkungsebene. Diese privilegierte Ebene liegt über
+der App und kann den Stift abfangen, bevor Flowboard X einen Android-Pointer
+erhält. Auf erkannter SMART-Hardware zeigt Flowboard X deshalb einmalig den
+offiziellen Einrichtungsweg an:
+
+1. Am Board **Einstellungen → Annotation** öffnen.
+2. Unter **Alle Apps** beziehungsweise **Installierte Apps** Flowboard X
+   auswählen.
+3. Den Anmerkungsschalter ausschließlich für Flowboard X ausschalten.
+4. Zu Flowboard X zurückkehren und die Einrichtung bestätigen.
+
+Die globale SMART-Anmerkungsfunktion muss nicht abgeschaltet werden. Fehlt die
+App-Liste, benötigt das Board mindestens iQ 3.12. Sind die Einstellungen
+administrativ gesperrt, muss ein Administrator sie entsperren. Es existiert
+keine veröffentlichte SMART-API, mit der eine normale APK diese privilegierte
+Geräteeinstellung selbst verändern darf.
+
+Als zusätzliche Absicherung fordert die Android-App
+`HIDE_OVERLAY_WINDOWS` an und aktiviert ab Android 12
+`Window.setHideOverlayWindows(true)`. Außerdem wird Androids automatische
+Stylus-IME-Handschrift über der Flutter-Zeichenfläche deaktiviert. Diese
+Maßnahmen schützen vor gewöhnlichen App-Overlays und einem konkurrierenden
+Android-Text-Eingabepfad, ersetzen aber nicht den appbezogenen SMART-Schalter
+auf älteren MX286-Pro/iQ-Geräten.
+
+Wird Flowboard X als Windows-App auf einem OPS oder verbundenen Rechner
+ausgeführt, ist stattdessen in den SMART-Ink-Fensterwerkzeugen
+**SMART Ink ausschalten → In dieser Anwendung** zu wählen.
+
 ## Bedienung auf dem Smartboard
 
-- Stylus: schreiben; invertierter Stylus: radieren
-- breite Hand-/Faustkante: kompletter getroffener Stroke wird entfernt
-- ein Finger auf leerem Board: Fläche verschieben
+- Stylus: schreiben; invertierter Stylus oder „Radiergummi“ im Stiftfächer:
+  mit der eingestellten Dicke partiell radieren
+- breite Hand-/Faustkante: nur die überstrichenen Linienabschnitte werden
+  unabhängig vom aktiven Werkzeug und vom Menüstatus entfernt. Androids native
+  Palm-Klassifizierung (`TOOL_TYPE_PALM`, `FLAG_CANCELED` und der ältere
+  `ACTION_CANCEL`-Pfad) wird zusätzlich zum Flutter-Kontaktprofil ausgewertet.
+  Teilt ein Touchpanel die Faust in mehrere kleine Kontakte auf, erkennt die
+  App drei oder mehr kompakte, gemeinsam bewegte Kontakte als eine
+  Radiergeste; der gesamte Wisch bleibt ein einzelner Undo-Schritt
+- Finger-Schalter in der Kopfleiste aus (Standard): ein Finger auf leerem Board
+  verschiebt die Fläche; eingeschaltet schreibt ein einzelner Finger. Ein
+  zweiter Finger übernimmt weiterhin zuverlässig Pan und Zoom
 - zwei Finger ohne aktive Auswahl: pan und zoomen; dabei erscheint kurz der
   verschiebbare Navigator, dessen roter Rahmen auch direkt gezogen werden kann
 - Auswahlmodus: tippen wechselt nachvollziehbar zwischen Stroke, Buchstabe,
   Wort, Zeile und Skizze; ziehen erzeugt Rechteck oder Lasso, „Alles auswählen“
   erfasst den vollständigen Seiteninhalt
 - Auswahl verschieben oder skalieren: Inhalt und objektgebundene Annotationen
-  folgen der Geste live; der Undo-Schritt wird erst beim Loslassen erzeugt
+  folgen der Geste live. Zwei Finger innerhalb des Auswahlrahmens skalieren
+  proportional per Pinch; der Undo-Schritt wird erst beim Loslassen erzeugt
+- Auswahl drehen: Der Griff links unten rotiert frei; langes Drücken bietet
+  30°, 45°, 60°, 90°, Spiegeln und eine manuelle Gradeingabe
 - Auswahl anordnen: eine Ebene oder vollständig nach vorn beziehungsweise
   hinten; Tinte und Objekte teilen dabei dieselbe stabile Reihenfolge
 - Geometrie aufziehen: Rechteck, Kreis, Ellipse oder Dreieck werden bereits
@@ -233,11 +319,18 @@ Linux-HTML-Fallback verwenden dagegen den abgesicherten nativen Downloadpfad.
   Beides funktioniert ohne Slider und ist gegen Mehrfachgesten geschützt
 - Long-Press auf leerer Fläche: alles leeren, Handschrift leeren, einfügen und
   – nach Kopieren/Ausschneiden – Zwischenablage einsetzen
-- Zentrum des Radialmenüs: öffnen/schließen; Drag im Zentrum: frei verschieben;
-  „Menüposition zurücksetzen“ in der Kopfleiste zentriert es im Sichtfeld
+- Zentrum des Radialmenüs: öffnen/schließen; Drag im Zentrum: frei verschieben.
+  Im Zwei-Personen-Modus erreicht ein geschlossenes Menü alle Außen- und
+  Unterkanten seiner Hälfte; beim Öffnen bleiben die Ringe innerhalb der
+  jeweiligen Bedienhälfte und beim Schließen kehrt das Zentrum an seine
+  vorherige Randposition zurück. „Menüposition zurücksetzen“ in der Kopfleiste
+  zentriert es im Sichtfeld
 - bereits aktive Hauptfunktion erneut wählen: deren Außenringe einklappen
 - Stift: Farben bilden Ring 2; der große Dickenbogen und die kompakt gebündelten
-  Typen Normal, Marker, Gestrichelt und Gerade Linie bilden Ring 3
+  Typen Normal, Marker, Gestrichelt, Gerade Linie und Radiergummi bilden Ring 3.
+  Der Dickenbogen steuert auch den Werkzeug-Radierer; dessen eigenes
+  Blockradierer-Glyph zeigt mit einer unterbrochenen Tintenlinie eindeutig die
+  Löschfunktion
 - Vorlagen: Ring 2 enthält die vier eingebauten Vorlagen und „Eigene Vorlagen“;
   der Eintrag öffnet eine Bibliothek mit Vorschau, Auswahl und Löschen
 - das Vorlagensymbol in der Kopfleiste speichert die aktuelle Seite als eigene
@@ -249,6 +342,13 @@ Linux-HTML-Fallback verwenden dagegen den abgesicherten nativen Downloadpfad.
   horizontal wischen oder scrollen, um weitere Seiten direkt anzuwählen
 - Pfeil am rechten Ende der Kopfleiste: Leiste auf Zurück, Logo und
   Ausklapppfeil reduzieren beziehungsweise wieder vollständig anzeigen
+- Personen-Schalter in der Kopfleiste: zwischen voller Arbeitsfläche und zwei
+  strikt getrennten Bedienhälften wechseln. Pan, Zoom, Seitenwechsel und neue
+  Seiten wirken nur auf die auslösende Hälfte; Inhalte bleiben beim Umschalten
+  unverändert erhalten
+- Timer-Symbol in der Kopfleiste: Dauer einstellen, starten, pausieren oder
+  zurücksetzen; die große Anzeige kann ohne Schreibunterbrechung verschoben und
+  in der Größe angepasst werden
 - Info-Symbol in der Kopfleiste: kompakte Hilfe zu Stift, Navigation,
   Radialmenü, Auswahl, Text, Ebenen, Speicherung und Teilen
 - Textobjekt auswählen und „Text mit Stift korrigieren“ wählen: direkt über ein
@@ -279,18 +379,19 @@ Installationen ohne diesen Index bleiben kompatibel; ihre Dokumente erscheinen
 unter „Nicht abgelegt“. Beim Entfernen eines Ordners werden seine Dokumente
 nicht gelöscht, sondern dorthin zurückgelegt.
 
-Das aktuelle Format ist Schema 4. Es speichert Seiten, Viewports, Ink,
+Das aktuelle Format ist Schema 5. Es speichert Seiten, Viewports, Ink,
 Gruppierungen, Objekte, Objektannotationen, Templates, PDF-Seitenzustände,
-Assets, Presets, Auswahlzustände, Metadaten und Menüposition. Assets werden mit
+Assets, Presets, Auswahlzustände, Rotation, Spiegelung, Metadaten und
+Menüposition. Assets werden mit
 SHA-256 und relativen, gegen Path Traversal geprüften Pfaden geführt. Saves
 werden außerhalb des Rendering-Pfads serialisiert, zunächst in eine temporäre
 Datei geschrieben, verifiziert und atomar befördert. Beim Start werden Primary,
 Journal und Backup validiert und die höchste konsistente Revision gewählt.
 Gleichlautende Dokument-, Vorlagen-, Export- und Quelldateinamen sind erlaubt:
 interne UUIDs beziehungsweise eindeutige Exportnamen verhindern Kollisionen.
-Nicht abgefangene Flutter- und Isolate-Fehler werden in
-`FlowboardX/flowboard_crash.log` protokolliert; ab 2 MB wird die vorherige Datei
-rotiert, ohne Auto-Save oder den Startpfad zu blockieren.
+Nicht abgefangene Flutter-, Plattform-, Isolate- und Zonenfehler werden
+datensparsam im rotierenden Ordner `FlowboardX/diagnostics` protokolliert, ohne
+Auto-Save, Rendering oder den Startpfad zu blockieren.
 
 Nutzervorlagen liegen anwendungsweit in einem atomar geschriebenen, geprüften
 Format mit Backup. Bilder und PDFs werden beim Speichern per Dateistream in ein
@@ -344,7 +445,35 @@ Channel `de.flowboardx/handwriting_recognition`. Android rastert die ausgewählt
 Vektortinte außerhalb des UI-Threads und erkennt sie mit
 `com.google.mlkit:text-recognition:16.0.1`. Das lateinische Modell ist statisch
 im APK enthalten und sofort offline verfügbar; die Play-Services-Variante mit
-nachgeladenem Modell wird nicht verwendet. Windows übergibt die Vektorstriche
+nachgeladenem Modell wird nicht verwendet. Der Release-Wrapper prüft nach
+jedem APK-/AAB-Build die tatsächlich gepackten Modelldateien und bricht den
+Build ab, wenn Detector, Layout-, Sprach- oder Latin-CTC-Modell fehlen. In den
+ABI-Split-Artefakten wurden jeweils 21 Modelldateien mit zusammen 1.486.803
+unkomprimierten Bytes nachgewiesen.
+
+Androids geräteunabhängige Vorverarbeitung entfernt dichte
+Sampling-Duplikate, begrenzt Pfadkommandos, skaliert pro erkannter Textzeile
+und probiert glatte, eckentreue sowie unterschiedlich starke Rasterprofile.
+Strichreihenfolge und Zeitstempel unterstützen die räumlich-zeitliche
+Worttrennung; mehrzeilige beziehungsweise klar getrennte Wörter werden bei
+unsicherem Gesamtergebnis separat erkannt und wieder layouttreu
+zusammengesetzt. Ergebnisse werden anhand nativer Zeilen-Confidence,
+Zeichenqualität, erwarteter Zeilen-/Wortstruktur und der Übereinstimmung aller
+Rasterprofile gewählt. Der Platform-Channel ist auf 80.000
+kurvencharakteristische Punkte begrenzt, parallele Aufrufe werden nicht
+aufgestaut und Modell-/Bitmap-Lebenszyklen bleiben auch bei Timeout und
+App-Ende serialisiert. Ein gültiger, aber nicht erkannter Strich ist ein
+`notRecognized`-Ergebnis und keine `FormatException`.
+
+Das gebündelte Modell ist Googles lateinisches **Bild-OCR-Modell**, nicht das
+separate ML-Kit-Digital-Ink-Sprachmodell. Google bietet Digital-Ink-Modelle
+offiziell nur als dynamischen Download an; diese Variante wird bewusst nicht
+verwendet, weil Flowboard X direkt nach einer Offline-Installation
+funktionieren muss. Dadurch ist freie, stark verbundene Kursivschrift
+prinzipbedingt schwieriger als klare Druckschrift beziehungsweise
+halbverbundene Handschrift.
+
+Windows übergibt die Vektorstriche
 zuerst an `Windows.UI.Input.Inking.InkRecognizerContainer`. Fehlt dieses
 optionale Windows-Handschrift-Feature oder liefert es kein Ergebnis, wird die
 Tinte speicherbegrenzt in ein lokales BGRA8-`SoftwareBitmap` gerastert und durch
@@ -372,6 +501,7 @@ bleibt defensiv abgefangen, ist aber keine plattformweite Microsoft-Garantie.
 ```text
 lib/src/
   app/                 App-Shell, Theme, Branding
+  diagnostics/         rotierende, datensparsame Sitzungs- und Fehlerlogs
   domain/              immutable Modelle, Commands, Codec, Gruppierung
   data/                Repository, atomare Dateien, Auto-Save/Recovery
   features/
@@ -396,8 +526,13 @@ Wesentliche Entscheidungen:
   gecachte Segmente zerlegt; committed Ink, Objekte und Preview sind getrennte
   Repaint-Layer.
 - Dokument-Commands tragen alle inhaltlichen Undo/Redo-Schritte. Seitenwechsel
-  und Viewport bleiben persistent, verbrauchen aber keinen Undo-Eintrag; auch
-  die Position des Radialmenüs wird durch Undo/Redo nicht verändert.
+  und Viewports bleiben persistent, verbrauchen aber keinen Undo-Eintrag. Im
+  Zwei-Personen-Modus besitzt jede Hälfte eine lokale Kamera und aktive Seite,
+  während selektives Drei-Wege-Replay pro Teilnehmer nur dessen eigene
+  Command-Folge zurücknimmt und fremde, zeitlich verschachtelte Änderungen
+  erhält. Beide speisen weiterhin eine gemeinsame absturzsichere
+  Dokument-/Auto-Save-Sitzung; auch die Position des Radialmenüs wird durch
+  Undo/Redo nicht verändert.
 - Tinte und Board-Objekte werden anhand einer gemeinsamen, stabilen
   Z-Reihenfolge gerendert, getroffen, exportiert und in Miniaturen dargestellt.
 - Objektannotationen liegen in normalisierten Objektkoordinaten und benötigen
@@ -406,7 +541,37 @@ Wesentliche Entscheidungen:
 - Gruppierung ist eine deterministische, lokal begrenzte Heuristik aus Raum,
   Zeit, Baseline und Bounds; sie benötigt kein Netzwerk und keine KI.
 - Abhängigkeiten bleiben bewusst klein: `path_provider`, `path`, `uuid`,
-  `file_picker`, `pdfrx`, `http`, `crypto` und `qr_flutter`.
+  `file_picker`, `pdfrx`, `http`, `crypto`, `qr_flutter` und
+  `package_info_plus`.
+
+## Diagnose-Logs
+
+Flowboard X schreibt lokal strukturierte, größenbegrenzte JSONL-Logs in den
+Unterordner `FlowboardX/diagnostics` des App-Support-Verzeichnisses. Vier
+Dateien mit jeweils höchstens ungefähr 768 KiB werden rotierend aufbewahrt.
+Erfasst werden Sitzungs-ID, App-/Build-Version, Plattform, Lebenszyklus,
+Speicherdruck und globale Flutter-, Isolate- und Zonenfehler. Fehler werden nur
+mit Typ, datensicherem Quellstellen-Ausschnitt und stabilem Fingerprint
+gespeichert. Handschrift, Strichpunkte, erkannter Text, Dokumentnamen/-IDs,
+lokale Dokument-/Asset-/Dateisystempfade, URLs und Zugangsdaten werden weder
+protokolliert noch in Fehlermeldungen übernommen. Stacktraces behalten nur
+paketrelative Code-Quellstellen.
+
+`DiagnosticLogService.instance` stellt für weitere Features `debug`, `info`,
+`warning` und `recordException` bereit. `flush`, `logFiles` und
+`createExportCopy` bilden eine kleine Service-API für Support-Exporte;
+`shutdown` beendet die Queue idempotent. Der
+Export enthält ausschließlich die bereits bereinigten Einträge. Logging und
+Rotation laufen über eine begrenzte serielle Queue. Der App-Start wartet nicht
+auf Log-Schreibzugriffe; Metadaten- und explizite Flush-Wartezeiten sind
+begrenzt.
+Schreibfehler oder ein volles Dateisystem beeinflussen den Whiteboard-Pfad
+nicht.
+
+Über **Bedienhilfe → Diagnoseprotokoll teilen** kann der Nutzer die bereinigten
+JSONL-Dateien direkt über die Systemfreigabe an den Support übergeben. Dadurch
+bleiben die Logs im privaten App-Speicher, bis der Nutzer den Export bewusst
+auslöst.
 
 `url_launcher_android` ist auf 6.3.24 fixiert, weil neuere Kotlin-DSL-Releases
 mit der hier verwendeten Flutter-3.38/Gradle-8.14-Toolchain einen reproduzierbaren
@@ -427,4 +592,7 @@ Serialisierung/Migration, Auto-Save-Maximallatenz, Crash-Recovery, simultane
 Pointer, Palm-Policy, Spatial Index, Gruppierungsheuristik, Auswahl, Vorlagen,
 PDF-Struktur, atomaren Export, tokenisierten HTTP-Download, QR-Share-State,
 Dokumentbibliothek, Nutzervorlagen, kompakte Radialmenü-Fächer, gemeinsame
-Z-Reihenfolge, Widget-, SAF-, Quick-Share- und Handschrift-Bridge ab.
+  Z-Reihenfolge, freie Rotation, Abdeckungsaktionen, getrennte
+  Zwei-Personen-Viewports und -Seitennavigation, simultane Zwei-Personen-Tinte,
+  Auswahl-Pinch, Timer, Finger-Schreibmodus, partielles Radieren sowie Widget-,
+  SAF-, Quick-Share- und Handschrift-Bridge ab.

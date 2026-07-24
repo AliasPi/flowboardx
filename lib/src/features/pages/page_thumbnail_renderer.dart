@@ -9,6 +9,7 @@ import 'package:pdfrx/pdfrx.dart';
 
 import '../../domain/model/board_object.dart';
 import '../../domain/model/document.dart';
+import '../../domain/model/geometry.dart';
 import '../../domain/model/scene_order.dart';
 import '../board/presentation/board_object_layer.dart';
 import '../board/presentation/ink_painter.dart';
@@ -144,6 +145,7 @@ class PageThumbnailRenderer {
         final layer = activeObjectInkLayer(object, annotations);
         if (layer != null) {
           canvas.save();
+          _applyObjectOrientation(canvas, object.transform);
           canvas.translate(object.transform.x, object.transform.y);
           final objectSize = Size(
             object.transform.width,
@@ -181,6 +183,8 @@ class PageThumbnailRenderer {
   ) {
     final t = object.transform;
     final rect = Rect.fromLTWH(t.x, t.y, t.width, t.height);
+    canvas.save();
+    _applyObjectOrientation(canvas, t);
     canvas.saveLayer(
       rect,
       Paint()..color = Colors.white.withValues(alpha: object.opacity),
@@ -260,6 +264,24 @@ class PageThumbnailRenderer {
         text.dispose();
     }
     canvas.restore();
+    canvas.restore();
+  }
+
+  void _applyObjectOrientation(Canvas canvas, ObjectTransform transform) {
+    if (transform.rotationRadians.abs() < .0000001 &&
+        !transform.flipX &&
+        !transform.flipY) {
+      return;
+    }
+    final center = Offset(
+      transform.x + transform.width / 2,
+      transform.y + transform.height / 2,
+    );
+    canvas
+      ..translate(center.dx, center.dy)
+      ..rotate(transform.rotationRadians)
+      ..scale(transform.flipX ? -1 : 1, transform.flipY ? -1 : 1)
+      ..translate(-center.dx, -center.dy);
   }
 
   void _drawUnavailablePdf(Canvas canvas, Rect rect, double scale) {

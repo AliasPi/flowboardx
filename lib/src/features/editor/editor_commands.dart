@@ -250,10 +250,14 @@ final class AddTemplatePageCommand implements DocumentCommand {
   AddTemplatePageCommand({
     required this.page,
     required Iterable<DocumentAsset> assets,
+    this.insertAt,
+    this.selectNewPage = true,
   }) : assets = List<DocumentAsset>.unmodifiable(assets);
 
   final BoardPage page;
   final List<DocumentAsset> assets;
+  final int? insertAt;
+  final bool selectNewPage;
 
   @override
   String get label => 'Nutzervorlage einfügen';
@@ -281,6 +285,10 @@ final class AddTemplatePageCommand implements DocumentCommand {
     final withAssets = document.copyWith(
       assets: [...document.assets, ...assets],
     );
-    return AddPageCommand(page).apply(withAssets);
+    return AddPageCommand(
+      page,
+      insertAt: insertAt,
+      selectNewPage: selectNewPage,
+    ).apply(withAssets);
   }
 }

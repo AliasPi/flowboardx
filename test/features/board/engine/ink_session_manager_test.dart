@@ -1,10 +1,42 @@
 import 'package:flowboard_x/src/domain/model/ink.dart';
 import 'package:flowboard_x/src/features/board/engine/ink_session_manager.dart';
 import 'package:flutter/gestures.dart';
-import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test('tracks stylus sessions independently from other active pointers', () {
+    final manager = InkSessionManager();
+    addTearDown(manager.dispose);
+    expect(
+      manager.begin(
+        event: const PointerDownEvent(
+          pointer: 1,
+          kind: PointerDeviceKind.mouse,
+        ),
+        worldPosition: Offset.zero,
+        style: const ActivePenStyle(),
+        authorId: 'mouse',
+      ),
+      isTrue,
+    );
+    expect(manager.hasActiveStylus, isFalse);
+    expect(
+      manager.begin(
+        event: const PointerDownEvent(
+          pointer: 2,
+          kind: PointerDeviceKind.stylus,
+        ),
+        worldPosition: const Offset(10, 10),
+        style: const ActivePenStyle(),
+        authorId: 'pen',
+      ),
+      isTrue,
+    );
+    expect(manager.hasActiveStylus, isTrue);
+    manager.cancel(2);
+    expect(manager.hasActiveStylus, isFalse);
+  });
+
   test('keeps simultaneous pen sessions isolated', () {
     final manager = InkSessionManager();
     const style = ActivePenStyle(type: InkToolType.normal);

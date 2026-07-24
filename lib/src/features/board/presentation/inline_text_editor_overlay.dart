@@ -6,8 +6,10 @@ import 'package:flutter/material.dart';
 
 import '../../../app/app_theme.dart';
 import '../../../domain/model/board_object.dart';
+import '../../../domain/model/geometry.dart';
 import '../../editor/editor_controller.dart';
 import '../../editor/inline_text_editing_engine.dart';
+import '../engine/board_viewport.dart';
 
 /// Direct, keyboard-free correction layer for one converted text object.
 ///
@@ -19,12 +21,14 @@ class InlineTextEditorOverlay extends StatefulWidget {
     required this.controller,
     required this.objectId,
     required this.onDone,
+    this.viewport,
     super.key,
   });
 
   final EditorController controller;
   final String objectId;
   final VoidCallback onDone;
+  final BoardViewport? viewport;
 
   @override
   State<InlineTextEditorOverlay> createState() =>
@@ -45,6 +49,7 @@ class _InlineTextEditorOverlayState extends State<InlineTextEditorOverlay> {
   bool _doneSent = false;
 
   EditorController get controller => widget.controller;
+  BoardViewport get boardViewport => widget.viewport ?? controller.viewport;
 
   TextObject? get _value {
     final object = controller.page.objectById(widget.objectId);
@@ -76,16 +81,10 @@ class _InlineTextEditorOverlayState extends State<InlineTextEditorOverlay> {
   Widget build(BuildContext context) {
     final value = _value;
     if (value == null) return const SizedBox.shrink();
+    final bounds = value.transform.bounds;
     final objectRect = Rect.fromPoints(
-      controller.viewport.worldToScreen(
-        Offset(value.transform.x, value.transform.y),
-      ),
-      controller.viewport.worldToScreen(
-        Offset(
-          value.transform.x + value.transform.width,
-          value.transform.y + value.transform.height,
-        ),
-      ),
+      boardViewport.worldToScreen(Offset(bounds.left, bounds.top)),
+      boardViewport.worldToScreen(Offset(bounds.right, bounds.bottom)),
     );
     final viewport = MediaQuery.sizeOf(context);
     // Inline correction is an explicit editing mode, so the transparent
@@ -115,8 +114,7 @@ class _InlineTextEditorOverlayState extends State<InlineTextEditorOverlay> {
     }
     _offscreenExitScheduled = false;
     final captureRect = desiredCaptureRect.intersect(viewportRect);
-    final scale = controller.viewport.scale;
-    final objectOrigin = objectRect.topLeft - captureRect.topLeft;
+    final scale = boardViewport.scale;
     final toolbarWidth = math.max(1.0, math.min(640.0, viewport.width - 16));
     return Stack(
       clipBehavior: Clip.none,
@@ -189,8 +187,10 @@ class _InlineTextEditorOverlayState extends State<InlineTextEditorOverlay> {
                     ..._pendingStrokes,
                     ..._activeStrokes.values,
                   ],
-                  scale: scale,
-                  objectOrigin: objectOrigin,
+                  transform: value.transform,
+                  worldToScreenScale: scale,
+                  worldToScreenOffset: boardViewport.offset,
+                  captureOrigin: captureRect.topLeft,
                   recognizing: _recognizing,
                 ),
                 child: const SizedBox.expand(),
@@ -215,7 +215,7 @@ class _InlineTextEditorOverlayState extends State<InlineTextEditorOverlay> {
     final points = _activeStrokes[event.pointer];
     if (points == null) return;
     final next = _objectLocal(event.localPosition, captureRect);
-    if ((points.last - next).distance >= .75 / controller.viewport.scale) {
+    if ((points.last - next).distance >= .75 / boardViewport.scale) {
       points.add(next);
       setState(() {});
     }
@@ -251,8 +251,9 @@ class _InlineTextEditorOverlayState extends State<InlineTextEditorOverlay> {
     final value = _value;
     if (value == null) return Offset.zero;
     final screen = captureRect.topLeft + eventLocal;
-    final world = controller.viewport.screenToWorld(screen);
-    return Offset(world.dx - value.transform.x, world.dy - value.transform.y);
+    final world = boardViewport.screenToWorld(screen);
+    final local = value.transform.worldToLocal(Vec2(world.dx, world.dy));
+    return Offset(local.x, local.y);
   }
 
   Future<void> _recognizePending() async {
@@ -353,15 +354,28 @@ class _InlineTextEditorOverlayState extends State<InlineTextEditorOverlay> {
 class _InlineCorrectionInkPainter extends CustomPainter {
   const _InlineCorrectionInkPainter({
     required this.strokes,
-    required this.scale,
-    required this.objectOrigin,
+    required this.transform,
+    required this.worldToScreenScale,
+    required this.worldToScreenOffset,
+    required this.captureOrigin,
     required this.recognizing,
   });
 
   final List<List<Offset>> strokes;
-  final double scale;
-  final Offset objectOrigin;
+  final ObjectTransform transform;
+  final double worldToScreenScale;
+  final Offset worldToScreenOffset;
+  final Offset captureOrigin;
   final bool recognizing;
+
+  Offset _toCanvas(Offset local) {
+    final world = transform.localToWorld(Vec2(local.dx, local.dy));
+    return Offset(
+          world.x * worldToScreenScale + worldToScreenOffset.dx,
+          world.y * worldToScreenScale + worldToScreenOffset.dy,
+        ) -
+        captureOrigin;
+  }
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -371,19 +385,14 @@ class _InlineCorrectionInkPainter extends CustomPainter {
       ..style = PaintingStyle.stroke
       ..strokeCap = StrokeCap.round
       ..strokeJoin = StrokeJoin.round
-      ..strokeWidth = math.max(2.5, 4 * scale);
+      ..strokeWidth = math.max(2.5, 4 * worldToScreenScale);
     for (final points in strokes) {
       if (points.isEmpty) continue;
-      final path = Path()
-        ..moveTo(
-          objectOrigin.dx + points.first.dx * scale,
-          objectOrigin.dy + points.first.dy * scale,
-        );
+      final first = _toCanvas(points.first);
+      final path = Path()..moveTo(first.dx, first.dy);
       for (final point in points.skip(1)) {
-        path.lineTo(
-          objectOrigin.dx + point.dx * scale,
-          objectOrigin.dy + point.dy * scale,
-        );
+        final next = _toCanvas(point);
+        path.lineTo(next.dx, next.dy);
       }
       canvas.drawPath(path, paint);
     }
@@ -392,7 +401,9 @@ class _InlineCorrectionInkPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant _InlineCorrectionInkPainter oldDelegate) =>
       oldDelegate.strokes != strokes ||
-      oldDelegate.scale != scale ||
-      oldDelegate.objectOrigin != objectOrigin ||
+      oldDelegate.transform != transform ||
+      oldDelegate.worldToScreenScale != worldToScreenScale ||
+      oldDelegate.worldToScreenOffset != worldToScreenOffset ||
+      oldDelegate.captureOrigin != captureOrigin ||
       oldDelegate.recognizing != recognizing;
 }

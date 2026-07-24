@@ -7,6 +7,7 @@ import 'package:pdfrx/pdfrx.dart';
 
 import '../../domain/model/board_object.dart';
 import '../../domain/model/document.dart';
+import '../../domain/model/geometry.dart';
 import '../../domain/model/scene_order.dart';
 import '../board/presentation/board_object_layer.dart';
 import '../board/presentation/ink_painter.dart';
@@ -241,6 +242,7 @@ class BoardExportFactory {
       final layer = activeObjectInkLayer(object, annotations);
       if (layer != null) {
         canvas.save();
+        _applyObjectOrientation(canvas, object.transform);
         canvas.translate(object.transform.x, object.transform.y);
         final objectSize = ui.Size(
           object.transform.width,
@@ -262,6 +264,8 @@ class BoardExportFactory {
   ) {
     final t = object.transform;
     final rect = ui.Rect.fromLTWH(t.x, t.y, t.width, t.height);
+    canvas.save();
+    _applyObjectOrientation(canvas, t);
     canvas.saveLayer(
       rect,
       ui.Paint()
@@ -382,6 +386,27 @@ class BoardExportFactory {
         );
     }
     canvas.restore();
+    canvas.restore();
+  }
+
+  static void _applyObjectOrientation(
+    ui.Canvas canvas,
+    ObjectTransform transform,
+  ) {
+    if (transform.rotationRadians.abs() < .0000001 &&
+        !transform.flipX &&
+        !transform.flipY) {
+      return;
+    }
+    final center = ui.Offset(
+      transform.x + transform.width / 2,
+      transform.y + transform.height / 2,
+    );
+    canvas
+      ..translate(center.dx, center.dy)
+      ..rotate(transform.rotationRadians)
+      ..scale(transform.flipX ? -1 : 1, transform.flipY ? -1 : 1)
+      ..translate(-center.dx, -center.dy);
   }
 
   static void _paintLabel(

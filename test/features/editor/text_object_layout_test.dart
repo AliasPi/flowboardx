@@ -79,6 +79,43 @@ void main() {
     controller.dispose();
   });
 
+  test(
+    'unrecognized handwriting remains ink and reports a friendly message',
+    () async {
+      final base = WhiteboardDocument.create(id: 'ocr-no-candidate');
+      final stroke = InkStroke(
+        id: 'ink',
+        points: const <InkPoint>[
+          InkPoint(x: 100, y: 100),
+          InkPoint(x: 132, y: 118),
+        ],
+      );
+      final controller = EditorController(
+        document: base.copyWith(
+          pages: <BoardPage>[
+            base.currentPage.copyWith(
+              strokes: <InkStroke>[stroke],
+              selection: SelectionState(selectedItemIds: const <String>['ink']),
+            ),
+          ],
+        ),
+        repository: _MemoryRepository(),
+        assetDirectory: Directory.current,
+        handwritingRecognition: const _NoCandidateRecognition(),
+      );
+      addTearDown(() async {
+        await controller.close();
+        controller.dispose();
+      });
+
+      expect(await controller.convertSelectedHandwritingToText(), isFalse);
+      expect(controller.page.strokeById(stroke.id), same(stroke));
+      expect(controller.page.objects, isEmpty);
+      expect(controller.lastError, isNot(contains('FormatException')));
+      expect(controller.lastError, contains('sicher erkannt'));
+    },
+  );
+
   test('editing text resizes it and remains undoable', () async {
     final base = WhiteboardDocument.create(id: 'edit-layout');
     final original = _text('Alt');
@@ -261,6 +298,20 @@ final class _Recognition implements HandwritingRecognitionService {
   Future<HandwritingRecognitionResult> recognize(
     HandwritingRecognitionRequest request,
   ) async => HandwritingRecognitionResult(text: text);
+}
+
+final class _NoCandidateRecognition implements HandwritingRecognitionService {
+  const _NoCandidateRecognition();
+
+  @override
+  Future<bool> isAvailable() async => true;
+
+  @override
+  Future<HandwritingRecognitionResult> recognize(
+    HandwritingRecognitionRequest request,
+  ) async => const HandwritingRecognitionResult.notRecognized(
+    message: 'Die Handschrift wurde nicht sicher erkannt.',
+  );
 }
 
 final class _MemoryRepository implements DocumentRepository {

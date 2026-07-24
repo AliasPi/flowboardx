@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:developer' as developer;
 import 'dart:io';
 import 'dart:ui';
 
@@ -11,35 +10,56 @@ import 'package:pdfrx/pdfrx.dart';
 import 'src/app/app.dart';
 import 'src/app/app_theme.dart';
 import 'src/data/file_document_repository.dart';
+import 'src/diagnostics/diagnostics.dart';
 import 'src/platform/android_widget_bridge.dart';
 
-File? _crashLogFile;
-Future<void> _crashWrite = Future<void>.value();
+DiagnosticLifecycleObserver? _diagnosticLifecycleObserver;
 
-Future<void> main() async {
-  WidgetsFlutterBinding.ensureInitialized();
+void main() {
+  final diagnostics = DiagnosticLogService.instance;
+  runZonedGuarded(
+    () async {
+      WidgetsFlutterBinding.ensureInitialized();
+      _installGlobalErrorHandlers(diagnostics);
+      _diagnosticLifecycleObserver = DiagnosticLifecycleObserver(diagnostics);
+      WidgetsBinding.instance.addObserver(_diagnosticLifecycleObserver!);
+      _installErrorWidget();
+      await _bootstrapApplication(diagnostics);
+    },
+    (error, stack) {
+      diagnostics.recordException(
+        event: 'zone.unhandled',
+        error: error,
+        stackTrace: stack,
+        fatal: true,
+      );
+    },
+  );
+}
+
+void _installGlobalErrorHandlers(DiagnosticLogService diagnostics) {
+  final previousFlutterHandler = FlutterError.onError;
   FlutterError.onError = (details) {
-    FlutterError.presentError(details);
-    developer.log(
-      'Unbehandelter Flutter-Fehler',
-      name: 'flowboard_x',
-      error: details.exception,
-      stackTrace: details.stack,
-      level: 1000,
-    );
-    _appendCrashLog('Flutter', details.exception, details.stack);
+    diagnostics.recordFlutterError(details);
+    if (previousFlutterHandler != null) {
+      previousFlutterHandler(details);
+    } else {
+      FlutterError.presentError(details);
+    }
   };
+  final previousPlatformHandler = PlatformDispatcher.instance.onError;
   PlatformDispatcher.instance.onError = (error, stack) {
-    developer.log(
-      'Unbehandelter Isolate-Fehler',
-      name: 'flowboard_x',
+    diagnostics.recordException(
+      event: 'platform.unhandled',
       error: error,
       stackTrace: stack,
-      level: 1000,
+      fatal: true,
     );
-    _appendCrashLog('Isolate', error, stack);
-    return true;
+    return previousPlatformHandler?.call(error, stack) ?? true;
   };
+}
+
+void _installErrorWidget() {
   ErrorWidget.builder = (details) => const Material(
     color: FlowboardColors.background,
     child: Center(
@@ -70,12 +90,18 @@ Future<void> main() async {
       ),
     ),
   );
-
-  await _bootstrapApplication();
 }
 
-Future<void> _bootstrapApplication() async {
+Future<void> _bootstrapApplication(DiagnosticLogService diagnostics) async {
   try {
+    final support = await getApplicationSupportDirectory();
+    final storage = Directory(p.join(support.path, 'FlowboardX'));
+    await storage.create(recursive: true);
+    await diagnostics.initialize(
+      directory: Directory(p.join(storage.path, 'diagnostics')),
+      metadata: await DiagnosticSessionMetadata.resolve(),
+    );
+    diagnostics.info('bootstrap.started');
     try {
       await pdfrxFlutterInitialize(dismissPdfiumWasmWarnings: true);
     } catch (error, stack) {
@@ -89,10 +115,6 @@ Future<void> _bootstrapApplication() async {
         ),
       );
     }
-    final support = await getApplicationSupportDirectory();
-    final storage = Directory(p.join(support.path, 'FlowboardX'));
-    await storage.create(recursive: true);
-    _crashLogFile = File(p.join(storage.path, 'flowboard_crash.log'));
     try {
       await AndroidWidgetBridge.instance.initialize();
     } catch (error, stack) {
@@ -106,47 +128,22 @@ Future<void> _bootstrapApplication() async {
         ),
       );
     }
+    diagnostics.info('bootstrap.ready');
     runApp(FlowboardApp(repository: FileDocumentRepository(storage)));
   } catch (error, stack) {
-    developer.log(
-      'Flowboard konnte den lokalen Speicher nicht initialisieren',
-      name: 'flowboard_x',
+    diagnostics.recordException(
+      event: 'bootstrap.failed',
       error: error,
       stackTrace: stack,
-      level: 1000,
+      fatal: true,
     );
     runApp(
       _StartupFailureApp(
         error: error.toString(),
-        onRetry: _bootstrapApplication,
+        onRetry: () => _bootstrapApplication(diagnostics),
       ),
     );
   }
-}
-
-void _appendCrashLog(String source, Object error, StackTrace? stack) {
-  final target = _crashLogFile;
-  if (target == null) return;
-  final entry = StringBuffer()
-    ..writeln('--- ${DateTime.now().toUtc().toIso8601String()} [$source] ---')
-    ..writeln(error)
-    ..writeln(stack ?? 'Kein Stacktrace verfügbar.');
-  _crashWrite = _crashWrite.then((_) async {
-    try {
-      if (await target.exists() && await target.length() > 2 * 1024 * 1024) {
-        final rotated = File('${target.path}.previous');
-        if (await rotated.exists()) await rotated.delete();
-        await target.rename(rotated.path);
-      }
-      await target.writeAsString(
-        entry.toString(),
-        mode: FileMode.append,
-        flush: true,
-      );
-    } catch (_) {
-      // Logging must never turn a recoverable render failure into another one.
-    }
-  });
 }
 
 class _StartupFailureApp extends StatefulWidget {

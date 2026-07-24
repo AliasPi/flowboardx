@@ -14,7 +14,7 @@ import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** Opens Android's system sharesheet (including Quick Share) for an exported PDF. */
-internal class AndroidPdfQuickShareService(
+class AndroidPdfQuickShareService(
     private val activity: Activity,
     messenger: BinaryMessenger,
 ) {

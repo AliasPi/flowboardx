@@ -49,7 +49,7 @@ class SelectionEngine {
       if (object != null) {
         if (memberGroup.containsKey(object.id)) continue;
         if (!object.locked &&
-            object.transform.bounds.inflate(tolerance).contains(point)) {
+            object.transform.containsWorld(point, tolerance: tolerance)) {
           result.add(
             SelectionCandidate(
               id: object.id,

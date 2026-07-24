@@ -59,24 +59,32 @@ class BoardObjectLayer extends StatelessWidget {
             top: offset.dy + object.transform.y * scale,
             width: object.transform.width * scale,
             height: object.transform.height * scale,
-            child: RepaintBoundary(
-              child: IgnorePointer(
-                child: Opacity(
-                  opacity: object.opacity,
-                  child: Stack(
-                    fit: StackFit.expand,
-                    children: [
-                      _ObjectBody(
-                        object: object,
-                        assets: assets,
-                        displayScale: scale,
+            child: Transform.rotate(
+              angle: object.transform.rotationRadians,
+              alignment: Alignment.center,
+              child: Transform.flip(
+                flipX: object.transform.flipX,
+                flipY: object.transform.flipY,
+                child: RepaintBoundary(
+                  child: IgnorePointer(
+                    child: Opacity(
+                      opacity: object.opacity,
+                      child: Stack(
+                        fit: StackFit.expand,
+                        children: [
+                          _ObjectBody(
+                            object: object,
+                            assets: assets,
+                            displayScale: scale,
+                          ),
+                          if (activeObjectInkLayer(object, visibleLayers)
+                              case final layer?)
+                            CustomPaint(
+                              painter: _NormalizedAnnotationPainter(layer),
+                            ),
+                        ],
                       ),
-                      if (activeObjectInkLayer(object, visibleLayers)
-                          case final layer?)
-                        CustomPaint(
-                          painter: _NormalizedAnnotationPainter(layer),
-                        ),
-                    ],
+                    ),
                   ),
                 ),
               ),

@@ -1,15 +1,24 @@
 import 'dart:async';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 
 import '../../../app/app_theme.dart';
+import '../../../diagnostics/diagnostics.dart';
 import '../../../domain/model/board_object.dart';
 import '../../../domain/model/geometry.dart';
+import '../../../platform/android_palm_input.dart';
+import '../../editor/board_participant_controller.dart';
 import '../../editor/editor_controller.dart';
+import '../../input/clustered_touch_eraser.dart';
+import '../../input/eraser_contact_geometry.dart';
+import '../engine/board_viewport.dart';
 import '../engine/input_policy.dart';
 import 'board_background.dart';
 import 'board_navigator.dart';
+import 'board_pointer_indicator.dart';
 import 'inline_text_editor_overlay.dart';
 import 'board_scene_layer.dart';
 import 'ink_painter.dart';
@@ -21,11 +30,64 @@ class BoardSurface extends StatefulWidget {
   const BoardSurface({
     required this.controller,
     this.onEmptyLongPress,
+    this.inputSuppression,
+    this.participant,
+    this.viewport,
+    this.participantId = 'primary',
+    this.confineInputToBounds = false,
+    this.inputBounds,
+    this.horizontalViewportConstraint,
+    this.palmInputSource,
+    this.fingerDrawingEnabled = false,
     super.key,
   });
 
   final EditorController controller;
   final EmptyBoardLongPress? onEmptyLongPress;
+
+  /// External gesture arbitration for interactions which are observed above
+  /// the board without taking over its hit test, such as radial-menu
+  /// five-finger page rotation.
+  final ValueListenable<bool>? inputSuppression;
+
+  /// Optional per-person tool configuration. Omitting it preserves the
+  /// original single-person controller behaviour.
+  final BoardParticipantController? participant;
+
+  /// Optional camera override for isolated board surfaces.
+  ///
+  /// In the normal two-person workspace each participant controller already
+  /// owns an independent viewport. An override remains useful for embedded
+  /// surfaces and deterministic tests.
+  final BoardViewport? viewport;
+
+  /// Stable namespace for pointer authorship and transform arbitration.
+  final String participantId;
+
+  /// Keeps an owned pointer inside its physical split half after it crosses
+  /// the divider while still held down.
+  final bool confineInputToBounds;
+
+  /// Optional interaction region in this surface's local coordinates.
+  ///
+  /// Split workspaces keep both surfaces in the full workspace coordinate
+  /// system, then clip rendering and pointer ownership to this rectangle.
+  /// Their cameras may differ, but neither half rebases screen coordinates at
+  /// the divider, so authored world positions remain stable across modes.
+  final Rect? inputBounds;
+
+  /// Keeps this participant's visible world on its own side of a stable
+  /// split-screen divider while retaining an independent camera.
+  final BoardViewportHorizontalConstraint? horizontalViewportConstraint;
+
+  /// Native Android palm-rejection events. Injectable for deterministic tests.
+  final PalmInputSource? palmInputSource;
+
+  /// Lets a single, narrow touch contact draw with the configured ink tool.
+  ///
+  /// A second finger still promotes the provisional stroke into navigation,
+  /// so two-finger pan/zoom remains available while this option is enabled.
+  final bool fingerDrawingEnabled;
 
   @override
   State<BoardSurface> createState() => _BoardSurfaceState();
@@ -33,43 +95,263 @@ class BoardSurface extends StatefulWidget {
 
 class _BoardSurfaceState extends State<BoardSurface> {
   final Map<int, PointerRole> _roles = {};
+  final Map<int, PointerDeviceKind> _pointerKinds = {};
+  final Map<int, Offset> _pointerLocalPositions = {};
   final Map<int, Offset> _navigationPointers = {};
+  final Map<int, _EraserPointerState> _eraserPointers = {};
+  final Set<int> _priorityEraserPointers = <int>{};
+  final Set<int> _globalTouchStartsInside = <int>{};
+  final Map<int, _ProvisionalTouchTrace> _provisionalTouchTraces =
+      <int, _ProvisionalTouchTrace>{};
+  final ClusteredTouchEraserTracker _clusteredTouchEraser =
+      ClusteredTouchEraserTracker();
   final Map<int, _GesturePreview> _selectionGestures = {};
   final Map<int, Offset> _selectionStarts = {};
   final Map<int, Offset> _selectionMoveStarts = {};
+  final Set<int> _selectionPinchPointers = <int>{};
+  double? _selectionPinchStartDistance;
+  Offset? _selectionPinchAnchor;
   String? _selectionTransformOwner;
   Size _size = Size.zero;
-  Offset? _hoverPosition;
+  final _BoardPointerIndicatorController _pointerIndicators =
+      _BoardPointerIndicatorController();
   late String _activePageId;
   String? _inlineTextObjectId;
   Timer? _navigatorHideTimer;
+  Timer? _nativePalmCommitTimer;
+  StreamSubscription<NativePalmStroke>? _nativePalmSubscription;
+  final Set<String> _handledNativePalmSessions = <String>{};
   bool _navigatorVisible = false;
   Offset? _navigatorPosition;
+  bool _inputSuppressed = false;
+  bool _viewportConstraintScheduled = false;
+  bool _isDisposing = false;
+  double? _viewportGestureStartScale;
+  Offset? _viewportGestureStartOffset;
 
   EditorController get controller => widget.controller;
+  BoardViewport get viewport => widget.viewport ?? controller.viewport;
+  BoardTool get activeTool => widget.participant?.tool ?? controller.tool;
+  ShapeKind get activeShape =>
+      widget.participant?.activeShape ?? controller.activeShape;
+  bool get _selectionActiveForParticipant =>
+      controller.hasSelection &&
+      (widget.participant == null ||
+          activeTool == BoardTool.selectRectangle ||
+          activeTool == BoardTool.selectLasso ||
+          controller.selectedCover != null);
 
   @override
   void initState() {
     super.initState();
     _activePageId = controller.page.id;
     controller.addListener(_handleControllerChange);
+    _inputSuppressed = widget.inputSuppression?.value ?? false;
+    widget.inputSuppression?.addListener(_handleInputSuppressionChange);
+    GestureBinding.instance.pointerRouter.addGlobalRoute(
+      _handleGlobalPriorityPointerEvent,
+    );
+    _subscribeToNativePalmInput();
   }
 
   @override
   void didUpdateWidget(covariant BoardSurface oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.controller == widget.controller) return;
-    oldWidget.controller.removeListener(_handleControllerChange);
-    _clearTransientPointers(oldWidget.controller);
-    _activePageId = controller.page.id;
-    controller.addListener(_handleControllerChange);
+    if (oldWidget.controller != widget.controller) {
+      oldWidget.controller.removeListener(_handleControllerChange);
+      _clearTransientPointers(
+        target: oldWidget.controller,
+        commitOwnedErase: true,
+      );
+      _activePageId = controller.page.id;
+      controller.addListener(_handleControllerChange);
+    }
+    if (oldWidget.viewport != widget.viewport ||
+        oldWidget.participant != widget.participant ||
+        oldWidget.participantId != widget.participantId ||
+        oldWidget.inputBounds != widget.inputBounds) {
+      _clearTransientPointers(commitOwnedErase: true);
+    }
+    if (oldWidget.inputSuppression != widget.inputSuppression) {
+      oldWidget.inputSuppression?.removeListener(_handleInputSuppressionChange);
+      widget.inputSuppression?.addListener(_handleInputSuppressionChange);
+      _handleInputSuppressionChange();
+    }
+    if (oldWidget.palmInputSource != widget.palmInputSource) {
+      _subscribeToNativePalmInput();
+    }
   }
 
   @override
   void dispose() {
+    _isDisposing = true;
     _navigatorHideTimer?.cancel();
+    _nativePalmSubscription?.cancel();
+    GestureBinding.instance.pointerRouter.removeGlobalRoute(
+      _handleGlobalPriorityPointerEvent,
+    );
+    widget.inputSuppression?.removeListener(_handleInputSuppressionChange);
     controller.removeListener(_handleControllerChange);
+    // A mode/page/layout switch may remove this surface while a pointer is
+    // still down. Never leave an ink session or transform preview orphaned in
+    // the shared controller.
+    _clearTransientPointers(commitOwnedErase: true);
+    _pointerIndicators.dispose();
     super.dispose();
+  }
+
+  void _subscribeToNativePalmInput() {
+    _nativePalmSubscription?.cancel();
+    final source = widget.palmInputSource ?? AndroidPalmInputBridge.instance;
+    _nativePalmSubscription = source.strokes.listen(
+      _handleNativePalmStroke,
+      onError: (Object error, StackTrace stackTrace) {
+        DiagnosticLogService.instance.recordException(
+          event: 'input.palm_bridge_error',
+          error: error,
+          stackTrace: stackTrace,
+        );
+      },
+    );
+  }
+
+  void _handleNativePalmStroke(NativePalmStroke stroke) {
+    if (!mounted || _inputSuppressed) return;
+    if (_handledNativePalmSessions.contains(stroke.sessionId)) return;
+    final nativeSamples = stroke.samples.isNotEmpty
+        ? stroke.samples
+        : <NativePalmSample>[
+            for (final point in stroke.points)
+              NativePalmSample(
+                position: point,
+                radiusMajor: stroke.radius,
+                radiusMinor: stroke.radius,
+                orientation: 0,
+              ),
+          ];
+    final localSamples =
+        <({Offset center, List<EraserBrushStamp> footprint})>[];
+    for (var index = 0; index < nativeSamples.length; index++) {
+      final sample = nativeSamples[index];
+      final local = _globalToLocal(sample.position);
+      if (local == null) continue;
+      if (localSamples.isEmpty && !_localBounds.contains(local)) return;
+      final bounded = _boundedLocalPosition(local);
+      localSamples.add((
+        center: bounded,
+        footprint: EraserContactGeometry.touchScreenFootprint(
+          center: bounded,
+          radiusMajor: sample.radiusMajor,
+          radiusMinor: sample.radiusMinor,
+          orientation: sample.orientation,
+          fallbackRadius: stroke.radius,
+        ),
+      ));
+    }
+    if (localSamples.isEmpty ||
+        !_localBounds.contains(localSamples.first.center)) {
+      return;
+    }
+    _handledNativePalmSessions.add(stroke.sessionId);
+    while (_handledNativePalmSessions.length > 64) {
+      _handledNativePalmSessions.remove(_handledNativePalmSessions.first);
+    }
+
+    // Android reports palm rejection only after provisional touch events. The
+    // native signal wins over tools, selection handles, covers and navigator.
+    _cancelSelectionTransientsForEraser(-1);
+    _rollbackNavigationForEraser(-1);
+    List<_WorldEraserStamp>? previous;
+    for (final sample in localSamples) {
+      final current = _screenFootprintToWorld(sample.footprint);
+      _eraseStampTransition(previous, current);
+      previous = current;
+    }
+    _scheduleNativePalmCommit();
+    DiagnosticLogService.instance.info(
+      'input.palm_native',
+      fields: <String, Object?>{
+        'source': stroke.source,
+        'contacts': stroke.contactCount,
+        'samples': localSamples.length,
+        'radius_bucket': stroke.radius < 28
+            ? 'small'
+            : stroke.radius < 48
+            ? 'medium'
+            : 'large',
+      },
+    );
+    if (mounted) setState(() {});
+  }
+
+  Rect get _localBounds {
+    final surfaceBounds = Offset.zero & _size;
+    final requested = widget.inputBounds;
+    if (requested == null) return surfaceBounds;
+    final clipped = requested.intersect(surfaceBounds);
+    return clipped.width > 0 && clipped.height > 0 ? clipped : surfaceBounds;
+  }
+
+  Rect get _viewportVisibleBounds =>
+      widget.confineInputToBounds ? _localBounds : Offset.zero & _size;
+
+  void _scheduleViewportConstraint() {
+    if (_viewportConstraintScheduled ||
+        _size.isEmpty ||
+        widget.horizontalViewportConstraint == null) {
+      return;
+    }
+    _viewportConstraintScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _viewportConstraintScheduled = false;
+      if (!mounted || _size.isEmpty) return;
+      viewport.constrain(
+        viewportSize: _size,
+        visibleScreenBounds: _viewportVisibleBounds,
+        horizontalConstraint: widget.horizontalViewportConstraint,
+      );
+    });
+  }
+
+  Offset? _globalToLocal(Offset globalPosition) {
+    if (!globalPosition.dx.isFinite || !globalPosition.dy.isFinite) return null;
+    final renderObject = context.findRenderObject();
+    if (renderObject is! RenderBox ||
+        !renderObject.attached ||
+        !renderObject.hasSize) {
+      return null;
+    }
+    final local = renderObject.globalToLocal(globalPosition);
+    return local.dx.isFinite && local.dy.isFinite ? local : null;
+  }
+
+  void _scheduleNativePalmCommit() {
+    _nativePalmCommitTimer?.cancel();
+    _nativePalmCommitTimer = Timer(const Duration(milliseconds: 180), () {
+      if (_eraserPointers.isNotEmpty) {
+        _scheduleNativePalmCommit();
+        return;
+      }
+      _nativePalmCommitTimer = null;
+      controller.commitErase();
+    });
+  }
+
+  void _handleInputSuppressionChange() {
+    final next = widget.inputSuppression?.value ?? false;
+    if (_inputSuppressed == next) return;
+    _inputSuppressed = next;
+    if (next) {
+      _inlineTextObjectId = null;
+      // The first fingers reach the board before the fifth finger establishes
+      // the radial command. Roll those provisional pan/zoom changes back
+      // exactly; page rotation must never move the whiteboard underneath it.
+      _cancelViewportPreview();
+      _clearTransientPointers(commitOwnedErase: true);
+      _navigatorHideTimer?.cancel();
+      _navigatorVisible = false;
+    }
+    if (mounted) setState(() {});
   }
 
   void _handleControllerChange() {
@@ -87,22 +369,55 @@ class _BoardSurfaceState extends State<BoardSurface> {
     }
   }
 
-  void _clearTransientPointers([EditorController? target]) {
+  void _clearTransientPointers({
+    EditorController? target,
+    bool commitOwnedErase = false,
+  }) {
     final activeController = target ?? controller;
     for (final entry in _roles.entries) {
       if (entry.value == PointerRole.ink) {
         activeController.cancelInk(entry.key);
       }
     }
-    activeController
-      ..cancelErase()
-      ..cancelSelectionTransform();
+    final ownsErase =
+        _eraserPointers.isNotEmpty || _nativePalmCommitTimer?.isActive == true;
+    _nativePalmCommitTimer?.cancel();
+    _nativePalmCommitTimer = null;
+    if (ownsErase) {
+      if (commitOwnedErase) {
+        activeController.commitErase();
+      } else {
+        activeController.cancelErase();
+      }
+    }
+    if (_selectionTransformOwner != null) {
+      activeController.cancelSelectionTransform();
+    }
     _roles.clear();
+    _pointerKinds.clear();
+    _pointerLocalPositions.clear();
     _navigationPointers.clear();
+    _eraserPointers.clear();
+    _priorityEraserPointers.clear();
+    _globalTouchStartsInside.clear();
+    _provisionalTouchTraces.clear();
+    _clusteredTouchEraser.clear();
     _selectionGestures.clear();
     _selectionStarts.clear();
     _selectionMoveStarts.clear();
+    _selectionPinchPointers.clear();
+    _selectionPinchStartDistance = null;
+    _selectionPinchAnchor = null;
+    _pointerIndicators.clear(notify: !_isDisposing);
+    final owner = _selectionTransformOwner;
+    if (owner != null) {
+      activeController.releaseSelectionInteraction(
+        _globalTransformOwner(owner),
+      );
+    }
     _selectionTransformOwner = null;
+    _viewportGestureStartScale = null;
+    _viewportGestureStartOffset = null;
   }
 
   @override
@@ -110,9 +425,18 @@ class _BoardSurfaceState extends State<BoardSurface> {
     return LayoutBuilder(
       builder: (context, constraints) {
         _size = constraints.biggest;
+        _scheduleViewportConstraint();
         return AnimatedBuilder(
-          animation: Listenable.merge([controller, controller.viewport]),
+          animation: Listenable.merge([
+            controller,
+            viewport,
+            ?widget.participant,
+          ]),
           builder: (context, _) {
+            // Page changes and viewport restores notify the merged listenable
+            // without necessarily rebuilding the surrounding LayoutBuilder.
+            // Re-assert the split constraint after that frame as well.
+            _scheduleViewportConstraint();
             final worldClip = _worldClip();
             return Stack(
               clipBehavior: Clip.hardEdge,
@@ -120,9 +444,10 @@ class _BoardSurfaceState extends State<BoardSurface> {
                 Positioned.fill(
                   child: MouseRegion(
                     cursor: _cursor,
-                    onHover: (event) =>
-                        setState(() => _hoverPosition = event.localPosition),
-                    onExit: (_) => setState(() => _hoverPosition = null),
+                    onHover: (event) => _pointerIndicators.updateHover(
+                      _boundedLocalPosition(event.localPosition),
+                    ),
+                    onExit: (_) => _pointerIndicators.clearHover(),
                     child: GestureDetector(
                       behavior: HitTestBehavior.opaque,
                       onLongPressStart: _handleLongPress,
@@ -138,8 +463,8 @@ class _BoardSurfaceState extends State<BoardSurface> {
                             RepaintBoundary(
                               child: CustomPaint(
                                 painter: BoardBackgroundPainter(
-                                  viewportScale: controller.viewport.scale,
-                                  viewportOffset: controller.viewport.offset,
+                                  viewportScale: viewport.scale,
+                                  viewportOffset: viewport.offset,
                                 ),
                               ),
                             ),
@@ -147,9 +472,9 @@ class _BoardSurfaceState extends State<BoardSurface> {
                               objects: controller.renderObjects,
                               strokes: controller.renderStrokes,
                               annotationLayers:
-                                  controller.page.annotationLayers,
-                              scale: controller.viewport.scale,
-                              offset: controller.viewport.offset,
+                                  controller.renderAnnotationLayers,
+                              scale: viewport.scale,
+                              offset: viewport.offset,
                               assets: controller.assetResolver,
                               selectedIds: controller.selectedSceneItemIds,
                               worldClip: worldClip,
@@ -169,9 +494,9 @@ class _BoardSurfaceState extends State<BoardSurface> {
                                             painter: InkPainter(
                                               strokes: [stroke],
                                               worldToScreenScale:
-                                                  controller.viewport.scale,
+                                                  viewport.scale,
                                               worldToScreenOffset:
-                                                  controller.viewport.offset,
+                                                  viewport.offset,
                                               worldClip: worldClip,
                                             ),
                                           ),
@@ -187,10 +512,28 @@ class _BoardSurfaceState extends State<BoardSurface> {
                                   gestures: _selectionGestures.values.toList(
                                     growable: false,
                                   ),
-                                  viewportScale: controller.viewport.scale,
-                                  viewportOffset: controller.viewport.offset,
-                                  tool: controller.tool,
-                                  hoverPosition: _hoverPosition,
+                                  viewportScale: viewport.scale,
+                                  viewportOffset: viewport.offset,
+                                ),
+                              ),
+                            ),
+                            IgnorePointer(
+                              child: AnimatedBuilder(
+                                animation: _pointerIndicators,
+                                builder: (context, _) => CustomPaint(
+                                  key: const ValueKey<String>(
+                                    'board-pointer-indicator',
+                                  ),
+                                  painter: BoardPointerIndicatorPainter(
+                                    indicators: _pointerIndicators.indicators,
+                                    hoverPosition:
+                                        _pointerIndicators.hoverPosition,
+                                    tool: activeTool,
+                                    brushWidth:
+                                        widget.participant?.penStyle.width ??
+                                        controller.penStyle.width,
+                                    viewportScale: viewport.scale,
+                                  ),
                                 ),
                               ),
                             ),
@@ -201,18 +544,24 @@ class _BoardSurfaceState extends State<BoardSurface> {
                   ),
                 ),
                 if (controller.hasSelection)
-                  _SelectionOverlay(
-                    controller: controller,
-                    inlineTextEditing: _inlineTextObjectId != null,
-                    onEditText: _beginInlineTextEditing,
-                    onClaimTransform: _claimSelectionTransform,
-                    onReleaseTransform: _releaseSelectionTransform,
+                  IgnorePointer(
+                    ignoring: _inputSuppressed || _eraserPointers.isNotEmpty,
+                    child: _SelectionOverlay(
+                      key: ValueKey<bool>(_inputSuppressed),
+                      controller: controller,
+                      viewport: viewport,
+                      inlineTextEditing: _inlineTextObjectId != null,
+                      onEditText: _beginInlineTextEditing,
+                      onClaimTransform: _claimSelectionTransform,
+                      onReleaseTransform: _releaseSelectionTransform,
+                    ),
                   ),
                 if (_inlineTextObjectId case final objectId?)
                   Positioned.fill(
                     child: InlineTextEditorOverlay(
                       key: ValueKey('inline-text-editor-$objectId'),
                       controller: controller,
+                      viewport: viewport,
                       objectId: objectId,
                       onDone: _endInlineTextEditing,
                     ),
@@ -233,16 +582,28 @@ class _BoardSurfaceState extends State<BoardSurface> {
                           child: child,
                         ),
                       ),
-                      child: BoardNavigator(
-                        viewport: controller.viewport,
-                        viewportSize: _size,
-                        objects: controller.renderObjects,
-                        strokes: controller.renderStrokes,
-                        onNavigate: (world) =>
-                            controller.viewport.centerOn(world, _size),
-                        onMovePanel: _moveNavigator,
-                        onInteractionStart: _beginNavigatorInteraction,
-                        onInteractionEnd: _endNavigatorInteraction,
+                      child: IgnorePointer(
+                        ignoring: _eraserPointers.isNotEmpty,
+                        child: BoardNavigator(
+                          viewport: viewport,
+                          viewportSize: _size,
+                          objects: controller.renderObjects,
+                          strokes: controller.renderStrokes,
+                          onNavigate: (world) {
+                            if (_eraserPointers.isEmpty) {
+                              viewport.centerOn(
+                                world,
+                                _size,
+                                visibleScreenBounds: _viewportVisibleBounds,
+                                horizontalConstraint:
+                                    widget.horizontalViewportConstraint,
+                              );
+                            }
+                          },
+                          onMovePanel: _moveNavigator,
+                          onInteractionStart: _beginNavigatorInteraction,
+                          onInteractionEnd: _endNavigatorInteraction,
+                        ),
                       ),
                     ),
                   ),
@@ -254,44 +615,217 @@ class _BoardSurfaceState extends State<BoardSurface> {
     );
   }
 
-  MouseCursor get _cursor => switch (controller.tool) {
+  MouseCursor get _cursor => switch (activeTool) {
     BoardTool.pen ||
     BoardTool.marker ||
     BoardTool.dashedPen ||
-    BoardTool.straightLine => SystemMouseCursors.precise,
+    BoardTool.straightLine ||
+    BoardTool.eraser => SystemMouseCursors.precise,
     BoardTool.selectRectangle ||
     BoardTool.selectLasso => SystemMouseCursors.basic,
     BoardTool.shape => SystemMouseCursors.precise,
   };
 
   bool _claimSelectionTransform(String owner) {
-    if (_selectionTransformOwner != null) return false;
+    if (_inputSuppressed ||
+        _eraserPointers.isNotEmpty ||
+        _nativePalmCommitTimer?.isActive == true ||
+        _selectionTransformOwner != null) {
+      return false;
+    }
+    if (!controller.claimSelectionInteraction(_globalTransformOwner(owner))) {
+      return false;
+    }
     _selectionTransformOwner = owner;
     return true;
   }
 
   void _releaseSelectionTransform(String owner) {
-    if (_selectionTransformOwner == owner) _selectionTransformOwner = null;
+    if (_selectionTransformOwner != owner) return;
+    _selectionTransformOwner = null;
+    controller.releaseSelectionInteraction(_globalTransformOwner(owner));
+  }
+
+  String _globalTransformOwner(String owner) =>
+      '${widget.participantId}:$owner';
+
+  void _handleGlobalPriorityPointerEvent(PointerEvent event) {
+    if (event.kind != PointerDeviceKind.touch) return;
+    final local = _globalToLocal(event.position);
+    if (event is PointerDownEvent) {
+      if (local == null || !_localBounds.contains(local)) return;
+      _globalTouchStartsInside.add(event.pointer);
+      final trace =
+          _ProvisionalTouchTrace(
+            pointer: event.pointer,
+            initialViewportScale: viewport.scale,
+            initialViewportOffset: viewport.offset,
+          )..add(
+            local,
+            controller.pointerPolicy.eraserRadiusFor(event),
+            footprint: controller.pointerPolicy.eraserFootprintFor(
+              event,
+              center: local,
+            ),
+          );
+      trace.routedToBoard = _roles.containsKey(event.pointer);
+      _provisionalTouchTraces[event.pointer] = trace;
+      if (!_inputSuppressed &&
+          !_roles.containsKey(event.pointer) &&
+          controller.pointerPolicy.isEraserContact(event)) {
+        _startPriorityErase(event, local, trace);
+      }
+      return;
+    }
+    if (!_globalTouchStartsInside.contains(event.pointer) || local == null) {
+      return;
+    }
+    final trace = _provisionalTouchTraces[event.pointer];
+    trace?.add(
+      local,
+      controller.pointerPolicy.eraserRadiusFor(event),
+      footprint: controller.pointerPolicy.eraserFootprintFor(
+        event,
+        center: local,
+      ),
+    );
+    if (event is PointerMoveEvent) {
+      if (_priorityEraserPointers.contains(event.pointer)) {
+        _continuePriorityErase(event, local);
+      } else if (!_inputSuppressed &&
+          !_roles.containsKey(event.pointer) &&
+          controller.pointerPolicy.isEraserContact(event) &&
+          trace != null) {
+        _startPriorityErase(event, local, trace);
+      }
+      return;
+    }
+    if (event is! PointerUpEvent && event is! PointerCancelEvent) return;
+
+    if (_priorityEraserPointers.contains(event.pointer)) {
+      _continuePriorityErase(event, local);
+      _roles.remove(event.pointer);
+      _finishErase(event.pointer);
+    } else if (!_inputSuppressed &&
+        trace != null &&
+        !trace.becameEraser &&
+        controller.pointerPolicy.isEraserContact(event)) {
+      _eraseBufferedTouchTrace(trace);
+      _roles[event.pointer] = PointerRole.ignored;
+    }
+    // Global routes can run before or after the hit-tested board route. Keep
+    // the ownership marker through the current dispatch microtask so either
+    // ordering remains idempotent.
+    scheduleMicrotask(() {
+      _priorityEraserPointers.remove(event.pointer);
+      _globalTouchStartsInside.remove(event.pointer);
+      _provisionalTouchTraces.remove(event.pointer);
+      _pointerKinds.remove(event.pointer);
+      _pointerLocalPositions.remove(event.pointer);
+      if (_roles[event.pointer] == PointerRole.ignored) {
+        _roles.remove(event.pointer);
+      }
+    });
+  }
+
+  void _startPriorityErase(
+    PointerEvent event,
+    Offset local,
+    _ProvisionalTouchTrace trace,
+  ) {
+    _priorityEraserPointers.add(event.pointer);
+    _roles[event.pointer] = PointerRole.erase;
+    trace.becameEraser = true;
+    _clusteredTouchEraser.clear();
+    _beginErase(
+      event,
+      viewport.screenToWorld(_boundedLocalPosition(local)),
+      localPosition: local,
+    );
+    if (mounted) setState(() {});
+  }
+
+  void _continuePriorityErase(PointerEvent event, Offset local) {
+    final world = viewport.screenToWorld(_boundedLocalPosition(local));
+    _continueErase(event, world, localPosition: local);
+  }
+
+  void _eraseBufferedTouchTrace(_ProvisionalTouchTrace trace) {
+    if (trace.points.isEmpty) return;
+    _cancelSelectionTransientsForEraser(trace.pointer);
+    _rollbackNavigationForEraser(trace.pointer);
+    final viewportChanged =
+        (viewport.scale - trace.initialViewportScale).abs() > .0001 ||
+        (viewport.offset - trace.initialViewportOffset).distance > .01;
+    if (viewportChanged) {
+      viewport.restore(
+        scale: trace.initialViewportScale,
+        offset: trace.initialViewportOffset,
+      );
+      if (identical(viewport, controller.viewport)) controller.commitViewport();
+    }
+    List<_WorldEraserStamp>? previous;
+    for (var index = 0; index < trace.points.length; index++) {
+      final screenFootprint = index < trace.footprints.length
+          ? trace.footprints[index]
+          : <EraserBrushStamp>[
+              EraserBrushStamp(
+                center: trace.points[index],
+                radius: trace.maximumScreenRadius,
+              ),
+            ];
+      final current = _screenFootprintToWorld(screenFootprint);
+      _eraseStampTransition(previous, current);
+      previous = current;
+    }
+    trace.becameEraser = true;
+    _scheduleNativePalmCommit();
+    if (mounted) setState(() {});
   }
 
   void _onPointerDown(PointerDownEvent event) {
-    final world = controller.viewport.screenToWorld(event.localPosition);
+    if (_roles.containsKey(event.pointer)) return;
+    _pointerKinds[event.pointer] = event.kind;
+    final existingTrace = _provisionalTouchTraces[event.pointer];
+    if (existingTrace != null) existingTrace.routedToBoard = true;
+    if (_inputSuppressed) {
+      _roles[event.pointer] = PointerRole.ignored;
+      return;
+    }
+    final localPosition = _boundedLocalPosition(event.localPosition);
+    _pointerLocalPositions[event.pointer] = localPosition;
+    final world = viewport.screenToWorld(localPosition);
     if (_inlineTextObjectId != null) {
       _inlineTextObjectId = null;
       setState(() {});
     }
+    // Palm/fist classification must precede cover and shape shortcuts. A broad
+    // contact also outranks an existing selection owner: a multi-contact fist
+    // must roll that preview back rather than being ignored behind it.
+    final isReportedEraser = controller.pointerPolicy.isEraserContact(event);
+    if (event.kind == PointerDeviceKind.touch && !isReportedEraser) {
+      _clusteredTouchEraser.add(event, localPosition);
+    }
+    if (isReportedEraser) {
+      _clusteredTouchEraser.clear();
+      _roles[event.pointer] = PointerRole.erase;
+      _beginErase(event, world, localPosition: localPosition);
+      return;
+    }
+    if (_tryBeginSelectionPinch(event, localPosition, world)) return;
     if (_selectionTransformOwner != null) {
-      // Selection transforms are atomic. A second pen/touch must not clear or
-      // overwrite the shared preview while the owning pointer is still down.
+      // Selection transforms are atomic. A second ordinary pen/touch must not
+      // clear or overwrite the shared preview while its owner is still down.
       _roles[event.pointer] = PointerRole.ignored;
       return;
     }
     final selectedCover = controller.selectedCover;
-    if (_isInkTool(controller.tool) &&
+    if (_isInkTool(activeTool) &&
         selectedCover != null &&
-        selectedCover.transform.bounds
-            .inflate(10 / controller.viewport.scale)
-            .contains(Vec2(world.dx, world.dy))) {
+        selectedCover.transform.containsWorld(
+          Vec2(world.dx, world.dy),
+          tolerance: 10 / viewport.scale,
+        )) {
       // A newly inserted cover is a transient direct selection: its body and
       // handles stay manipulable even though the pen is already the active
       // tool. A pointer outside follows the normal ink path, whose beginInk
@@ -304,40 +838,68 @@ class _BoardSurfaceState extends State<BoardSurface> {
       _roles[event.pointer] = PointerRole.select;
       _selectionStarts[event.pointer] = world;
       _selectionMoveStarts[event.pointer] = world;
-      setState(() {});
-      return;
-    }
-    if (controller.tool == BoardTool.shape) {
-      _roles[event.pointer] = PointerRole.select;
-      _selectionStarts[event.pointer] = world;
-      _selectionGestures[event.pointer] = _GesturePreview(
-        tool: BoardTool.shape,
-        shape: controller.activeShape,
-        points: <Offset>[world, world],
+      _trackPointerIndicator(
+        event,
+        localPosition,
+        BoardPointerIndicatorKind.selection,
       );
       setState(() {});
       return;
     }
+    if (activeTool == BoardTool.shape) {
+      _roles[event.pointer] = PointerRole.select;
+      _selectionStarts[event.pointer] = world;
+      _selectionGestures[event.pointer] = _GesturePreview(
+        tool: BoardTool.shape,
+        shape: activeShape,
+        points: <Offset>[world, world],
+      );
+      _trackPointerIndicator(
+        event,
+        localPosition,
+        BoardPointerIndicatorKind.shape,
+      );
+      setState(() {});
+      return;
+    }
+    if (event.kind == PointerDeviceKind.touch && widget.fingerDrawingEnabled) {
+      _promoteFingerInkToNavigation();
+    }
     final role = controller.pointerPolicy.classifyDown(
       event,
-      tool: controller.tool,
-      selectionActive: controller.hasSelection,
-      stylusCurrentlyActive: controller.inkSessions.sessions.isNotEmpty,
+      tool: activeTool,
+      selectionActive: _selectionActiveForParticipant,
+      stylusCurrentlyActive: controller.inkSessions.hasActiveStylus,
       activeNavigationTouches: _navigationPointers.length,
+      fingerDrawingEnabled: widget.fingerDrawingEnabled,
     );
     _roles[event.pointer] = role;
     switch (role) {
       case PointerRole.ink:
-        if (!controller.beginInk(event, world)) {
+        if (!controller.beginInk(
+          event,
+          world,
+          style: widget.participant?.penStyle,
+          authorId: widget.participant == null
+              ? null
+              : '${widget.participantId}-device-${event.device}',
+        )) {
           _roles[event.pointer] = PointerRole.ignored;
+        } else {
+          _trackPointerIndicator(
+            event,
+            localPosition,
+            BoardPointerIndicatorKind.ink,
+          );
         }
       case PointerRole.erase:
-        controller.eraseAt(
-          world,
-          radius: math.max(18, event.radiusMajor) / controller.viewport.scale,
-        );
+        _beginErase(event, world, localPosition: localPosition);
       case PointerRole.navigate:
-        _navigationPointers[event.pointer] = event.localPosition;
+        if (_navigationPointers.isEmpty) {
+          _viewportGestureStartScale = viewport.scale;
+          _viewportGestureStartOffset = viewport.offset;
+        }
+        _navigationPointers[event.pointer] = localPosition;
       case PointerRole.select:
         if (_selectionTransformOwner != null) {
           _roles[event.pointer] = PointerRole.ignored;
@@ -346,9 +908,7 @@ class _BoardSurfaceState extends State<BoardSurface> {
         _selectionStarts[event.pointer] = world;
         final insideSelection =
             controller.hasSelection &&
-            controller.selectionBounds
-                .inflate(12 / controller.viewport.scale)
-                .contains(Vec2(world.dx, world.dy));
+            controller.selectionContains(world, tolerance: 12 / viewport.scale);
         if (insideSelection) {
           final owner = 'body-${event.pointer}';
           if (_claimSelectionTransform(owner)) {
@@ -359,14 +919,164 @@ class _BoardSurfaceState extends State<BoardSurface> {
           }
         } else {
           _selectionGestures[event.pointer] = _GesturePreview(
-            tool: controller.tool,
-            shape: controller.activeShape,
+            tool: activeTool,
+            shape: activeShape,
             points: <Offset>[world, world],
+          );
+        }
+        if (_roles[event.pointer] == PointerRole.select) {
+          _trackPointerIndicator(
+            event,
+            localPosition,
+            BoardPointerIndicatorKind.selection,
           );
         }
         setState(() {});
       case PointerRole.ignored:
         break;
+    }
+  }
+
+  bool _tryBeginSelectionPinch(
+    PointerDownEvent event,
+    Offset localPosition,
+    Offset worldPosition,
+  ) {
+    if (event.kind != PointerDeviceKind.touch ||
+        !controller.hasSelection ||
+        !controller.selectionContains(
+          worldPosition,
+          tolerance: 12 / viewport.scale,
+        )) {
+      return false;
+    }
+    int? firstPointer;
+    for (final entry in _roles.entries) {
+      if (entry.value != PointerRole.select ||
+          _pointerKinds[entry.key] != PointerDeviceKind.touch) {
+        continue;
+      }
+      final firstLocal = _pointerLocalPositions[entry.key];
+      if (firstLocal == null) continue;
+      final firstWorld = viewport.screenToWorld(firstLocal);
+      if (controller.selectionContains(
+        firstWorld,
+        tolerance: 12 / viewport.scale,
+      )) {
+        firstPointer = entry.key;
+        break;
+      }
+    }
+    if (firstPointer == null) return false;
+    final firstLocal = _pointerLocalPositions[firstPointer];
+    if (firstLocal == null) return false;
+    final distance = (localPosition - firstLocal).distance;
+    if (!distance.isFinite || distance < 12) return false;
+
+    // The first finger may already own a provisional move. Convert that
+    // gesture atomically into one uniform scale operation before the second
+    // pointer is routed through the ordinary selection path.
+    final previousOwner = _selectionTransformOwner;
+    if (previousOwner != null) {
+      controller.cancelSelectionTransform();
+      _releaseSelectionTransform(previousOwner);
+    }
+    _selectionMoveStarts.remove(firstPointer);
+    _selectionStarts.remove(firstPointer);
+    _selectionGestures.remove(firstPointer);
+    if (!_claimSelectionTransform('selection-pinch')) return false;
+
+    _roles[firstPointer] = PointerRole.select;
+    _roles[event.pointer] = PointerRole.select;
+    _selectionPinchPointers
+      ..clear()
+      ..add(firstPointer)
+      ..add(event.pointer);
+    _selectionPinchStartDistance = distance;
+    final bounds = controller.selectionBounds;
+    _selectionPinchAnchor = Offset(bounds.center.x, bounds.center.y);
+    _trackPointerIndicator(
+      event,
+      localPosition,
+      BoardPointerIndicatorKind.selection,
+    );
+    if (mounted) setState(() {});
+    return true;
+  }
+
+  void _updateSelectionPinch() {
+    if (_selectionPinchPointers.length != 2) return;
+    final pointers = _selectionPinchPointers.toList(growable: false);
+    final first = _pointerLocalPositions[pointers[0]];
+    final second = _pointerLocalPositions[pointers[1]];
+    final baseline = _selectionPinchStartDistance;
+    final anchor = _selectionPinchAnchor;
+    if (first == null ||
+        second == null ||
+        baseline == null ||
+        baseline < 12 ||
+        anchor == null) {
+      return;
+    }
+    final current = (second - first).distance;
+    if (!current.isFinite || current <= 0) return;
+    controller.previewScaleSelection(
+      (current / baseline).clamp(.05, 20.0),
+      anchor: anchor,
+    );
+    if (mounted) setState(() {});
+  }
+
+  void _finishSelectionPinch({
+    required bool commit,
+    required int liftedPointer,
+  }) {
+    if (_selectionPinchPointers.isEmpty) return;
+    final pointers = _selectionPinchPointers.toList(growable: false);
+    if (commit) {
+      controller.commitSelectionTransform();
+    } else {
+      controller.cancelSelectionTransform();
+    }
+    _releaseSelectionTransform('selection-pinch');
+    for (final pointer in pointers) {
+      _selectionStarts.remove(pointer);
+      _selectionMoveStarts.remove(pointer);
+      _selectionGestures.remove(pointer);
+      _pointerIndicators.removePointer(pointer);
+      if (pointer == liftedPointer) {
+        _roles.remove(pointer);
+      } else {
+        // The remaining finger must lift before it can start another gesture;
+        // otherwise the just-committed pinch would immediately become a move.
+        _roles[pointer] = PointerRole.ignored;
+      }
+    }
+    _selectionPinchPointers.clear();
+    _selectionPinchStartDistance = null;
+    _selectionPinchAnchor = null;
+    if (mounted) setState(() {});
+  }
+
+  void _promoteFingerInkToNavigation() {
+    if (_navigationPointers.isNotEmpty) return;
+    final inkPointers = _roles.entries
+        .where(
+          (entry) =>
+              entry.value == PointerRole.ink &&
+              _pointerKinds[entry.key] == PointerDeviceKind.touch,
+        )
+        .map((entry) => entry.key)
+        .toList(growable: false);
+    if (inkPointers.isEmpty) return;
+    _viewportGestureStartScale ??= viewport.scale;
+    _viewportGestureStartOffset ??= viewport.offset;
+    for (final pointer in inkPointers) {
+      controller.cancelInk(pointer);
+      _roles[pointer] = PointerRole.navigate;
+      _pointerIndicators.removePointer(pointer);
+      final local = _pointerLocalPositions[pointer];
+      if (local != null) _navigationPointers[pointer] = local;
     }
   }
 
@@ -376,17 +1086,112 @@ class _BoardSurfaceState extends State<BoardSurface> {
       tool == BoardTool.dashedPen ||
       tool == BoardTool.straightLine;
 
+  void _trackPointerIndicator(
+    PointerEvent event,
+    Offset localPosition,
+    BoardPointerIndicatorKind kind,
+  ) {
+    final radius = switch (kind) {
+      BoardPointerIndicatorKind.ink => EraserContactGeometry.cursorScreenRadius(
+        logicalWidth:
+            widget.participant?.penStyle.width ?? controller.penStyle.width,
+        viewportScale: viewport.scale,
+      ),
+      BoardPointerIndicatorKind.eraser =>
+        event.kind == PointerDeviceKind.touch
+            ? controller.pointerPolicy.eraserRadiusFor(event)
+            : EraserContactGeometry.cursorScreenRadius(
+                logicalWidth:
+                    widget.participant?.penStyle.width ??
+                    controller.penStyle.width,
+                viewportScale: viewport.scale,
+              ),
+      BoardPointerIndicatorKind.selection ||
+      BoardPointerIndicatorKind.shape => 7.0,
+    };
+    _pointerIndicators.updatePointer(
+      BoardPointerIndicator(
+        pointer: event.pointer,
+        position: _boundedLocalPosition(localPosition),
+        kind: kind,
+        radius: radius,
+      ),
+    );
+  }
+
+  void _updatePointerIndicator(
+    PointerMoveEvent event,
+    Offset localPosition,
+    PointerRole? role,
+  ) {
+    final kind = switch (role) {
+      PointerRole.ink => BoardPointerIndicatorKind.ink,
+      PointerRole.erase => BoardPointerIndicatorKind.eraser,
+      PointerRole.select =>
+        _selectionGestures[event.pointer]?.tool == BoardTool.shape
+            ? BoardPointerIndicatorKind.shape
+            : BoardPointerIndicatorKind.selection,
+      PointerRole.navigate || PointerRole.ignored || null => null,
+    };
+    if (kind != null) {
+      _trackPointerIndicator(event, localPosition, kind);
+    }
+  }
+
   void _onPointerMove(PointerMoveEvent event) {
-    final role = _roles[event.pointer];
-    final world = controller.viewport.screenToWorld(event.localPosition);
+    if (_priorityEraserPointers.contains(event.pointer)) return;
+    if (_inputSuppressed) return;
+    var role = _roles[event.pointer];
+    final localPosition = _boundedLocalPosition(event.localPosition);
+    _pointerLocalPositions[event.pointer] = localPosition;
+    _updatePointerIndicator(event, localPosition, role);
+    var world = viewport.screenToWorld(localPosition);
+    if (_selectionPinchPointers.contains(event.pointer)) {
+      _updateSelectionPinch();
+      return;
+    }
+    if (event.kind == PointerDeviceKind.touch && role != PointerRole.erase) {
+      final cluster = _clusteredTouchEraser.update(event, localPosition);
+      if (cluster != null) {
+        _promoteTouchClusterToEraser(cluster);
+        return;
+      }
+    }
+    if (role != null &&
+        controller.pointerPolicy.shouldPromoteToEraser(
+          event,
+          currentRole: role,
+          activeNavigationTouches: _navigationPointers.length,
+        )) {
+      if (role == PointerRole.navigate) {
+        // A fist can initially look like two or more ordinary fingertips and
+        // therefore begin a pinch. Once one contact becomes unambiguously
+        // broad, the whole provisional navigation loses arbitration: restore
+        // the persisted viewport and neutralise its companion contacts.
+        _rollbackNavigationForEraser(event.pointer);
+        world = viewport.screenToWorld(localPosition);
+      }
+      if (role == PointerRole.select) {
+        final ownedMove = _selectionMoveStarts.remove(event.pointer) != null;
+        _selectionGestures.remove(event.pointer);
+        _selectionStarts.remove(event.pointer);
+        if (ownedMove) {
+          controller.cancelSelectionTransform();
+          _releaseSelectionTransform('body-${event.pointer}');
+        }
+        if (mounted) setState(() {});
+      }
+      role = PointerRole.erase;
+      _roles[event.pointer] = role;
+      _clusteredTouchEraser.clear();
+      _beginErase(event, world, localPosition: localPosition);
+      return;
+    }
     switch (role) {
       case PointerRole.ink:
         controller.updateInk(event, world);
       case PointerRole.erase:
-        controller.eraseAt(
-          world,
-          radius: math.max(18, event.radiusMajor) / controller.viewport.scale,
-        );
+        _continueErase(event, world, localPosition: localPosition);
       case PointerRole.navigate:
         _updateNavigation(event);
       case PointerRole.select:
@@ -398,8 +1203,7 @@ class _BoardSurfaceState extends State<BoardSurface> {
         final preview = _selectionGestures[event.pointer];
         if (preview == null) break;
         if (preview.tool == BoardTool.selectLasso) {
-          if ((preview.points.last - world).distance >
-              1.5 / controller.viewport.scale) {
+          if ((preview.points.last - world).distance > 1.5 / viewport.scale) {
             if (preview.points.length < 4096) {
               preview.points.add(world);
             } else {
@@ -422,17 +1226,31 @@ class _BoardSurfaceState extends State<BoardSurface> {
   }
 
   void _onPointerUp(PointerUpEvent event) {
+    if (_priorityEraserPointers.contains(event.pointer)) return;
+    _clusteredTouchEraser.remove(event.pointer);
+    _pointerLocalPositions[event.pointer] = _boundedLocalPosition(
+      event.localPosition,
+    );
+    if (_selectionPinchPointers.contains(event.pointer)) {
+      _finishSelectionPinch(commit: true, liftedPointer: event.pointer);
+      _pointerKinds.remove(event.pointer);
+      _pointerLocalPositions.remove(event.pointer);
+      _pointerIndicators.removePointer(event.pointer);
+      return;
+    }
     final role = _roles.remove(event.pointer);
-    final world = controller.viewport.screenToWorld(event.localPosition);
+    final world = viewport.screenToWorld(
+      _boundedLocalPosition(event.localPosition),
+    );
     switch (role) {
       case PointerRole.ink:
         controller.endInk(event, world);
       case PointerRole.erase:
-        controller.commitErase();
+        _finishErase(event.pointer);
       case PointerRole.navigate:
         _navigationPointers.remove(event.pointer);
         if (_navigationPointers.isEmpty) {
-          controller.commitViewport();
+          _commitViewportPreview();
           _scheduleNavigatorHide();
         }
       case PointerRole.select:
@@ -440,16 +1258,30 @@ class _BoardSurfaceState extends State<BoardSurface> {
       case PointerRole.ignored || null:
         break;
     }
+    _pointerKinds.remove(event.pointer);
+    _pointerLocalPositions.remove(event.pointer);
+    _pointerIndicators.removePointer(event.pointer);
   }
 
   void _onPointerCancel(PointerCancelEvent event) {
+    if (_priorityEraserPointers.contains(event.pointer)) return;
+    _clusteredTouchEraser.remove(event.pointer);
+    if (_selectionPinchPointers.contains(event.pointer)) {
+      _finishSelectionPinch(commit: false, liftedPointer: event.pointer);
+      _pointerKinds.remove(event.pointer);
+      _pointerLocalPositions.remove(event.pointer);
+      _pointerIndicators.removePointer(event.pointer);
+      return;
+    }
     final role = _roles.remove(event.pointer);
     if (role == PointerRole.ink) controller.cancelInk(event.pointer);
-    if (role == PointerRole.erase) controller.commitErase();
+    if (role == PointerRole.erase) _finishErase(event.pointer);
     if (role == PointerRole.navigate) {
       _navigationPointers.remove(event.pointer);
       if (_navigationPointers.isEmpty) {
-        controller.commitViewport();
+        // Android palm rejection and interrupted system gestures surface as a
+        // cancellation. A canceled provisional camera must never be persisted.
+        _cancelViewportPreview();
         _scheduleNavigatorHide();
       }
     }
@@ -459,15 +1291,24 @@ class _BoardSurfaceState extends State<BoardSurface> {
     }
     _selectionGestures.remove(event.pointer);
     _selectionStarts.remove(event.pointer);
+    _pointerKinds.remove(event.pointer);
+    _pointerLocalPositions.remove(event.pointer);
+    _pointerIndicators.removePointer(event.pointer);
     if (mounted) setState(() {});
   }
 
   void _updateNavigation(PointerMoveEvent event) {
     final previous = _navigationPointers[event.pointer];
     if (previous == null) return;
+    final localPosition = _boundedLocalPosition(event.localPosition);
     if (_navigationPointers.length == 1) {
-      controller.viewport.panBy(event.localPosition - previous, _size);
-      _navigationPointers[event.pointer] = event.localPosition;
+      viewport.panBy(
+        localPosition - previous,
+        _size,
+        visibleScreenBounds: _viewportVisibleBounds,
+        horizontalConstraint: widget.horizontalViewportConstraint,
+      );
+      _navigationPointers[event.pointer] = localPosition;
       return;
     }
     final entries = _navigationPointers.entries.take(2).toList();
@@ -475,40 +1316,308 @@ class _BoardSurfaceState extends State<BoardSurface> {
     final secondId = entries[1].key;
     final oldFirst = entries[0].value;
     final oldSecond = entries[1].value;
-    final newFirst = firstId == event.pointer ? event.localPosition : oldFirst;
-    final newSecond = secondId == event.pointer
-        ? event.localPosition
-        : oldSecond;
+    final newFirst = firstId == event.pointer ? localPosition : oldFirst;
+    final newSecond = secondId == event.pointer ? localPosition : oldSecond;
     final oldCentroid = (oldFirst + oldSecond) / 2;
     final newCentroid = (newFirst + newSecond) / 2;
-    controller.viewport.panBy(newCentroid - oldCentroid, _size);
+    viewport.panBy(
+      newCentroid - oldCentroid,
+      _size,
+      visibleScreenBounds: _viewportVisibleBounds,
+      horizontalConstraint: widget.horizontalViewportConstraint,
+    );
     final oldDistance = (oldFirst - oldSecond).distance;
     final newDistance = (newFirst - newSecond).distance;
-    if (oldDistance > 4 && newDistance > 4 && !controller.hasSelection) {
-      controller.viewport.zoomAt(
+    if (oldDistance > 4 && newDistance > 4 && !_selectionActiveForParticipant) {
+      viewport.zoomAt(
         factor: newDistance / oldDistance,
         focalPoint: newCentroid,
         viewportSize: _size,
+        visibleScreenBounds: _viewportVisibleBounds,
+        horizontalConstraint: widget.horizontalViewportConstraint,
       );
       _showNavigatorDuringGesture();
     }
-    _navigationPointers[event.pointer] = event.localPosition;
+    _navigationPointers[event.pointer] = localPosition;
+  }
+
+  Offset _boundedLocalPosition(Offset value) {
+    if (!widget.confineInputToBounds || _size.isEmpty) return value;
+    final bounds = _localBounds;
+    return Offset(
+      value.dx.clamp(bounds.left, bounds.right),
+      value.dy.clamp(bounds.top, bounds.bottom),
+    );
+  }
+
+  void _commitViewportPreview() {
+    if (identical(viewport, controller.viewport)) controller.commitViewport();
+    _viewportGestureStartScale = null;
+    _viewportGestureStartOffset = null;
+  }
+
+  void _cancelViewportPreview() {
+    final scale = _viewportGestureStartScale;
+    final offset = _viewportGestureStartOffset;
+    if (scale != null && offset != null) {
+      viewport.restore(scale: scale, offset: offset);
+    } else if (identical(viewport, controller.viewport)) {
+      controller.cancelViewportPreview();
+    }
+    _viewportGestureStartScale = null;
+    _viewportGestureStartOffset = null;
+  }
+
+  void _beginErase(PointerEvent event, Offset world, {Offset? localPosition}) {
+    final trace = _provisionalTouchTraces[event.pointer];
+    if (trace != null) trace.becameEraser = true;
+    _cancelSelectionTransientsForEraser(event.pointer);
+    var effectiveWorld = world;
+    if (_rollbackNavigationForEraser(event.pointer)) {
+      effectiveWorld = viewport.screenToWorld(
+        _boundedLocalPosition(localPosition ?? event.localPosition),
+      );
+    }
+    final effectiveLocal = _boundedLocalPosition(
+      localPosition ?? event.localPosition,
+    );
+    _trackPointerIndicator(
+      event,
+      effectiveLocal,
+      BoardPointerIndicatorKind.eraser,
+    );
+    final stamps = _worldEraserStamps(
+      event,
+      localPosition: effectiveLocal,
+      fallbackWorld: effectiveWorld,
+    );
+    _eraserPointers[event.pointer] = _EraserPointerState(stamps: stamps);
+    _eraseStampTransition(null, stamps);
+    if (mounted) setState(() {});
+  }
+
+  void _promoteTouchClusterToEraser(ClusteredTouchEraserMatch cluster) {
+    final pointers = cluster.positions.keys
+        .where(_roles.containsKey)
+        .toList(growable: false);
+    if (pointers.length < 3) return;
+    _clusteredTouchEraser.removeAll(pointers);
+
+    // The first contacts may already have produced a provisional pan, zoom,
+    // lasso, shape, or selection move. The cluster wins arbitration as one
+    // physical fist, so every transient preview must be rolled back first.
+    _cancelSelectionTransientsForEraser(pointers.first);
+    _rollbackNavigationForEraser(pointers.first);
+
+    final scale = viewport.scale;
+    final worldRadius =
+        cluster.brushRadius / (scale.isFinite && scale > 0 ? scale : 1);
+    for (final pointer in pointers) {
+      final previousRole = _roles[pointer];
+      if (previousRole == PointerRole.ink) controller.cancelInk(pointer);
+      _roles[pointer] = PointerRole.erase;
+      _navigationPointers.remove(pointer);
+      _selectionStarts.remove(pointer);
+      _selectionMoveStarts.remove(pointer);
+      _selectionGestures.remove(pointer);
+      final local = cluster.positions[pointer];
+      if (local == null) continue;
+      final boundedLocal = _boundedLocalPosition(local);
+      final world = viewport.screenToWorld(boundedLocal);
+      _pointerIndicators.updatePointer(
+        BoardPointerIndicator(
+          pointer: pointer,
+          position: boundedLocal,
+          kind: BoardPointerIndicatorKind.eraser,
+          radius: cluster.brushRadius,
+        ),
+      );
+      _eraserPointers[pointer] = _EraserPointerState(
+        stamps: <_WorldEraserStamp>[
+          _WorldEraserStamp(center: world, radius: worldRadius),
+        ],
+      );
+      controller.eraseAt(world, radius: worldRadius);
+    }
+    if (mounted) setState(() {});
+  }
+
+  void _cancelSelectionTransientsForEraser(int eraserPointer) {
+    var changed =
+        _selectionTransformOwner != null ||
+        _selectionGestures.isNotEmpty ||
+        _selectionStarts.isNotEmpty ||
+        _selectionMoveStarts.isNotEmpty;
+    for (final entry in _roles.entries.toList(growable: false)) {
+      if (entry.key != eraserPointer && entry.value == PointerRole.select) {
+        _roles[entry.key] = PointerRole.ignored;
+        _pointerIndicators.removePointer(entry.key);
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    controller.cancelSelectionTransform();
+    _selectionGestures.clear();
+    _selectionStarts.clear();
+    _selectionMoveStarts.clear();
+    final owner = _selectionTransformOwner;
+    if (owner != null) _releaseSelectionTransform(owner);
+    if (mounted) setState(() {});
+  }
+
+  bool _rollbackNavigationForEraser(int eraserPointer) {
+    if (_navigationPointers.isEmpty) return false;
+    for (final pointer in _navigationPointers.keys) {
+      if (pointer != eraserPointer) _roles[pointer] = PointerRole.ignored;
+    }
+    _navigationPointers.clear();
+    _cancelViewportPreview();
+    _navigatorHideTimer?.cancel();
+    _navigatorVisible = false;
+    if (mounted) setState(() {});
+    return true;
+  }
+
+  void _continueErase(
+    PointerEvent event,
+    Offset world, {
+    Offset? localPosition,
+  }) {
+    final previous = _eraserPointers[event.pointer];
+    if (previous == null) {
+      _beginErase(event, world, localPosition: localPosition);
+      return;
+    }
+    final current = _worldEraserStamps(
+      event,
+      localPosition: _boundedLocalPosition(
+        localPosition ?? event.localPosition,
+      ),
+      fallbackWorld: world,
+    );
+    _trackPointerIndicator(
+      event,
+      localPosition ?? event.localPosition,
+      BoardPointerIndicatorKind.eraser,
+    );
+    _eraseStampTransition(previous.stamps, current);
+    _eraserPointers[event.pointer] = _EraserPointerState(stamps: current);
+  }
+
+  List<_WorldEraserStamp> _worldEraserStamps(
+    PointerEvent event, {
+    required Offset localPosition,
+    required Offset fallbackWorld,
+  }) {
+    if (activeTool == BoardTool.eraser &&
+        event.kind != PointerDeviceKind.touch) {
+      final width =
+          widget.participant?.penStyle.width ?? controller.penStyle.width;
+      return <_WorldEraserStamp>[
+        _WorldEraserStamp(
+          center: fallbackWorld,
+          radius: EraserContactGeometry.stylusWorldRadius(width),
+        ),
+      ];
+    }
+    return _screenFootprintToWorld(
+      controller.pointerPolicy.eraserFootprintFor(event, center: localPosition),
+    );
+  }
+
+  List<_WorldEraserStamp> _screenFootprintToWorld(
+    List<EraserBrushStamp> footprint,
+  ) {
+    final safeScale = viewport.scale.isFinite && viewport.scale > 0
+        ? viewport.scale
+        : 1.0;
+    return <_WorldEraserStamp>[
+      for (final stamp in footprint)
+        if (stamp.center.dx.isFinite &&
+            stamp.center.dy.isFinite &&
+            stamp.radius.isFinite &&
+            stamp.radius > 0)
+          _WorldEraserStamp(
+            center: viewport.screenToWorld(stamp.center),
+            radius: (stamp.radius / safeScale).clamp(.25, 96.0),
+          ),
+    ];
+  }
+
+  void _eraseStampTransition(
+    List<_WorldEraserStamp>? previous,
+    List<_WorldEraserStamp> current,
+  ) {
+    if (current.isEmpty) return;
+    if (previous == null || previous.isEmpty) {
+      for (final stamp in current) {
+        controller.eraseAt(stamp.center, radius: stamp.radius);
+      }
+      return;
+    }
+    if (previous.length == current.length) {
+      for (var index = 0; index < current.length; index++) {
+        final from = previous[index];
+        final to = current[index];
+        controller.eraseAlong(
+          from.center,
+          to.center,
+          radius: math.max(from.radius, to.radius),
+        );
+      }
+      return;
+    }
+    // Hardware can start reporting calibrated axes midway through a gesture,
+    // changing a circular fallback into an ellipse. Stamp the new footprint
+    // and bridge its centre so coalesced move events cannot leave a gap.
+    for (final stamp in current) {
+      controller.eraseAt(stamp.center, radius: stamp.radius);
+    }
+    final from = previous[previous.length ~/ 2];
+    final to = current[current.length ~/ 2];
+    controller.eraseAlong(
+      from.center,
+      to.center,
+      radius: math.max(from.radius, to.radius),
+    );
+  }
+
+  void _finishErase(int pointer) {
+    _eraserPointers.remove(pointer);
+    _pointerIndicators.removePointer(pointer);
+    // A fist/hand edge can be reported as multiple neighbouring contacts.
+    // Commit only after the last one lifts so the whole wipe is one Undo and
+    // one Auto-Save operation.
+    if (_eraserPointers.isEmpty) {
+      _nativePalmCommitTimer?.cancel();
+      _nativePalmCommitTimer = null;
+      controller.commitErase();
+      if (mounted) setState(() {});
+    }
   }
 
   Offset get _navigatorTopLeft {
     final panel = BoardNavigator.preferredSize;
+    final bounds = _localBounds;
     final fallback = Offset(
-      _size.width - panel.width - 18,
-      _size.height - panel.height - 18,
+      bounds.right - panel.width - 18,
+      bounds.bottom - panel.height - 18,
     );
     return _clampNavigatorPosition(_navigatorPosition ?? fallback);
   }
 
   Offset _clampNavigatorPosition(Offset value) {
     final panel = BoardNavigator.preferredSize;
+    final bounds = _localBounds;
     return Offset(
-      value.dx.clamp(8.0, math.max(8.0, _size.width - panel.width - 8)),
-      value.dy.clamp(8.0, math.max(8.0, _size.height - panel.height - 8)),
+      value.dx.clamp(
+        bounds.left + 8,
+        math.max(bounds.left + 8, bounds.right - panel.width - 8),
+      ),
+      value.dy.clamp(
+        bounds.top + 8,
+        math.max(bounds.top + 8, bounds.bottom - panel.height - 8),
+      ),
     );
   }
 
@@ -535,15 +1644,23 @@ class _BoardSurfaceState extends State<BoardSurface> {
   }
 
   void _beginNavigatorInteraction() {
+    if (_eraserPointers.isNotEmpty) return;
     _navigatorHideTimer?.cancel();
+    _viewportGestureStartScale ??= viewport.scale;
+    _viewportGestureStartOffset ??= viewport.offset;
   }
 
   void _endNavigatorInteraction() {
-    controller.commitViewport();
+    if (_eraserPointers.isNotEmpty) {
+      _cancelViewportPreview();
+      return;
+    }
+    _commitViewportPreview();
     _showNavigator();
   }
 
   void _moveNavigator(Offset delta) {
+    if (_eraserPointers.isNotEmpty) return;
     if (!delta.dx.isFinite || !delta.dy.isFinite) return;
     setState(() {
       _navigatorPosition = _clampNavigatorPosition(_navigatorTopLeft + delta);
@@ -562,18 +1679,18 @@ class _BoardSurfaceState extends State<BoardSurface> {
     final distance = (end - start).distance;
     if (moveStart != null) {
       try {
-        if (distance > 3 / controller.viewport.scale) {
+        if (distance > 3 / viewport.scale) {
           controller.commitSelectionTransform();
         } else {
           controller.cancelSelectionTransform();
-          controller.selectAt(end);
+          controller.selectAt(end, viewportScale: viewport.scale);
         }
       } finally {
         _releaseSelectionTransform('body-$pointer');
       }
     } else if (preview?.tool == BoardTool.shape) {
       var shapeEnd = end;
-      final shape = preview?.shape ?? controller.activeShape;
+      final shape = preview?.shape ?? activeShape;
       if (shape == ShapeKind.circle) {
         final delta = end - start;
         final side = math.max(delta.dx.abs(), delta.dy.abs());
@@ -583,8 +1700,9 @@ class _BoardSurfaceState extends State<BoardSurface> {
         );
       }
       controller.addShape(shape, Rect.fromPoints(start, shapeEnd));
-    } else if (distance < 8 / controller.viewport.scale) {
-      controller.selectAt(end);
+      widget.participant?.setTool(BoardTool.selectRectangle);
+    } else if (distance < 8 / viewport.scale) {
+      controller.selectAt(end, viewportScale: viewport.scale);
     } else if (preview?.tool == BoardTool.selectLasso) {
       controller.selectLasso([...path, end]);
     } else {
@@ -594,13 +1712,19 @@ class _BoardSurfaceState extends State<BoardSurface> {
   }
 
   void _handleLongPress(LongPressStartDetails details) {
-    if (controller.inkSessions.isWriting) return;
-    final world = controller.viewport.screenToWorld(details.localPosition);
+    if (_inputSuppressed ||
+        controller.inkSessions.isWriting ||
+        _eraserPointers.isNotEmpty) {
+      return;
+    }
+    final world = viewport.screenToWorld(
+      _boundedLocalPosition(details.localPosition),
+    );
     if (controller.selectionEngine
         .candidatesAt(
           controller.page,
           Vec2(world.dx, world.dy),
-          tolerance: 12 / controller.viewport.scale,
+          tolerance: 12 / viewport.scale,
         )
         .isEmpty) {
       widget.onEmptyLongPress?.call(details.localPosition, world);
@@ -608,16 +1732,15 @@ class _BoardSurfaceState extends State<BoardSurface> {
   }
 
   Rect2 _worldClip() {
-    final topLeft = controller.viewport.screenToWorld(Offset.zero);
-    final bottomRight = controller.viewport.screenToWorld(
-      Offset(_size.width, _size.height),
-    );
+    final bounds = _localBounds;
+    final topLeft = viewport.screenToWorld(bounds.topLeft);
+    final bottomRight = viewport.screenToWorld(bounds.bottomRight);
     return Rect2(
       left: topLeft.dx,
       top: topLeft.dy,
       width: bottomRight.dx - topLeft.dx,
       height: bottomRight.dy - topLeft.dy,
-    ).inflate(80 / controller.viewport.scale);
+    ).inflate(80 / viewport.scale);
   }
 
   void _beginInlineTextEditing() {
@@ -635,12 +1758,15 @@ class _BoardSurfaceState extends State<BoardSurface> {
 class _SelectionOverlay extends StatefulWidget {
   const _SelectionOverlay({
     required this.controller,
+    required this.viewport,
     required this.inlineTextEditing,
     required this.onEditText,
     required this.onClaimTransform,
     required this.onReleaseTransform,
+    super.key,
   });
   final EditorController controller;
+  final BoardViewport viewport;
   final bool inlineTextEditing;
   final VoidCallback onEditText;
   final bool Function(String owner) onClaimTransform;
@@ -654,6 +1780,9 @@ class _SelectionOverlayState extends State<_SelectionOverlay> {
   double _pendingScale = 1;
   Offset? _scaleAnchor;
   bool _ownsDiagonalScale = false;
+  Offset? _rotationAnchor;
+  double? _rotationStartAngle;
+  bool _ownsRotation = false;
 
   bool _claimCoverControl(String owner) =>
       widget.onClaimTransform('cover-$owner');
@@ -668,6 +1797,10 @@ class _SelectionOverlayState extends State<_SelectionOverlay> {
       widget.controller.cancelSelectionTransform();
       widget.onReleaseTransform('selection-diagonal');
     }
+    if (_ownsRotation) {
+      widget.controller.cancelSelectionTransform();
+      widget.onReleaseTransform('selection-rotation');
+    }
     super.dispose();
   }
 
@@ -676,10 +1809,10 @@ class _SelectionOverlayState extends State<_SelectionOverlay> {
     final controller = widget.controller;
     final world = controller.selectionBounds;
     if (world.isEmpty) return const SizedBox.shrink();
-    final topLeft = controller.viewport.worldToScreen(
+    final topLeft = widget.viewport.worldToScreen(
       Offset(world.left, world.top),
     );
-    final bottomRight = controller.viewport.worldToScreen(
+    final bottomRight = widget.viewport.worldToScreen(
       Offset(world.right, world.bottom),
     );
     final rect = Rect.fromPoints(topLeft, bottomRight).inflate(5);
@@ -704,13 +1837,50 @@ class _SelectionOverlayState extends State<_SelectionOverlay> {
             ),
           ),
         ),
-        if (!widget.inlineTextEditing && controller.selectedCover == null)
+        if (!widget.inlineTextEditing)
           Positioned(
             left: rect.left,
             top: math.max(8, rect.top - 62),
             child: _SelectionActions(
               controller: controller,
               onEditText: widget.onEditText,
+            ),
+          ),
+        if (!widget.inlineTextEditing)
+          Positioned(
+            key: const ValueKey('selection-rotation-handle'),
+            left: rect.left - 24,
+            top: rect.bottom - 24,
+            child: Semantics(
+              label: 'Auswahl drehen',
+              button: true,
+              hint: 'Ziehen zum freien Drehen, halten für feste Winkel',
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                dragStartBehavior: DragStartBehavior.down,
+                onPanStart: _beginRotation,
+                onPanUpdate: _updateRotation,
+                onPanEnd: (_) => _finishRotation(commit: true),
+                onPanCancel: () => _finishRotation(commit: false),
+                onLongPressStart: _showRotationMenu,
+                child: Container(
+                  width: 48,
+                  height: 48,
+                  decoration: BoxDecoration(
+                    color: FlowboardColors.panel,
+                    shape: BoxShape.circle,
+                    border: Border.all(color: FlowboardColors.mint, width: 3),
+                    boxShadow: const [
+                      BoxShadow(color: Colors.black26, blurRadius: 8),
+                    ],
+                  ),
+                  child: const Icon(
+                    Icons.rotate_left_rounded,
+                    size: 24,
+                    color: FlowboardColors.mint,
+                  ),
+                ),
+              ),
             ),
           ),
         // Covers have one dedicated resize handle in the centre of each edge.
@@ -788,6 +1958,7 @@ class _SelectionOverlayState extends State<_SelectionOverlay> {
           Positioned.fill(
             child: _SelectionEdgeResizeHandles(
               controller: controller,
+              viewport: widget.viewport,
               objectRect: rect,
               onClaim: (edge) =>
                   widget.onClaimTransform('selection-edge-${edge.name}'),
@@ -803,10 +1974,10 @@ class _SelectionOverlayState extends State<_SelectionOverlay> {
               onClaim: () => _claimCoverControl('reveal-${cover.id}'),
               onRelease: () => _releaseCoverControl('reveal-${cover.id}'),
               objectRect: Rect.fromPoints(
-                controller.viewport.worldToScreen(
+                widget.viewport.worldToScreen(
                   Offset(cover.transform.x, cover.transform.y),
                 ),
-                controller.viewport.worldToScreen(
+                widget.viewport.worldToScreen(
                   Offset(
                     cover.transform.x + cover.transform.width,
                     cover.transform.y + cover.transform.height,
@@ -820,22 +1991,12 @@ class _SelectionOverlayState extends State<_SelectionOverlay> {
             Positioned.fill(
               child: _CoverResizeHandles(
                 controller: controller,
+                viewport: widget.viewport,
                 cover: cover,
                 onClaim: (edge) =>
                     _claimCoverControl('resize-${cover.id}-${edge.name}'),
                 onRelease: (edge) =>
                     _releaseCoverControl('resize-${cover.id}-${edge.name}'),
-                objectRect: Rect.fromPoints(
-                  controller.viewport.worldToScreen(
-                    Offset(cover.transform.x, cover.transform.y),
-                  ),
-                  controller.viewport.worldToScreen(
-                    Offset(
-                      cover.transform.x + cover.transform.width,
-                      cover.transform.y + cover.transform.height,
-                    ),
-                  ),
-                ),
               ),
             ),
         if (controller.selectedPdf case final pdf?)
@@ -847,6 +2008,203 @@ class _SelectionOverlayState extends State<_SelectionOverlay> {
       ],
     );
   }
+
+  Offset _worldFromGlobal(Offset global) {
+    final box = context.findRenderObject()! as RenderBox;
+    return widget.viewport.screenToWorld(box.globalToLocal(global));
+  }
+
+  void _beginRotation(DragStartDetails details) {
+    _ownsRotation = widget.onClaimTransform('selection-rotation');
+    if (!_ownsRotation) return;
+    final bounds = widget.controller.selectionBounds;
+    final center = Offset(bounds.center.x, bounds.center.y);
+    final pointer = _worldFromGlobal(details.globalPosition);
+    _rotationAnchor = center;
+    _rotationStartAngle = math.atan2(
+      pointer.dy - center.dy,
+      pointer.dx - center.dx,
+    );
+  }
+
+  void _updateRotation(DragUpdateDetails details) {
+    if (!_ownsRotation) return;
+    final center = _rotationAnchor;
+    final start = _rotationStartAngle;
+    if (center == null || start == null) return;
+    final pointer = _worldFromGlobal(details.globalPosition);
+    final current = math.atan2(pointer.dy - center.dy, pointer.dx - center.dx);
+    widget.controller.previewRotateSelection(
+      _normalizedAngle(current - start),
+      anchor: center,
+    );
+  }
+
+  void _finishRotation({required bool commit}) {
+    if (!_ownsRotation) return;
+    if (commit) {
+      widget.controller.commitSelectionTransform();
+    } else {
+      widget.controller.cancelSelectionTransform();
+    }
+    _rotationAnchor = null;
+    _rotationStartAngle = null;
+    _ownsRotation = false;
+    widget.onReleaseTransform('selection-rotation');
+  }
+
+  Future<void> _showRotationMenu(LongPressStartDetails details) async {
+    final overlay =
+        Overlay.of(context).context.findRenderObject()! as RenderBox;
+    final position = overlay.globalToLocal(details.globalPosition);
+    final action = await showMenu<_SelectionRotationAction>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        position.dx,
+        position.dy,
+        overlay.size.width - position.dx,
+        overlay.size.height - position.dy,
+      ),
+      items: const <PopupMenuEntry<_SelectionRotationAction>>[
+        PopupMenuItem(
+          value: _SelectionRotationAction.degrees30,
+          child: Text('30°'),
+        ),
+        PopupMenuItem(
+          value: _SelectionRotationAction.degrees45,
+          child: Text('45°'),
+        ),
+        PopupMenuItem(
+          value: _SelectionRotationAction.degrees60,
+          child: Text('60°'),
+        ),
+        PopupMenuItem(
+          value: _SelectionRotationAction.degrees90,
+          child: Text('90°'),
+        ),
+        PopupMenuDivider(),
+        PopupMenuItem(
+          value: _SelectionRotationAction.mirror,
+          child: ListTile(
+            leading: Icon(Icons.flip_rounded),
+            title: Text('Horizontal spiegeln'),
+          ),
+        ),
+        PopupMenuItem(
+          value: _SelectionRotationAction.manual,
+          child: ListTile(
+            leading: Icon(Icons.tune_rounded),
+            title: Text('Winkel manuell festlegen'),
+          ),
+        ),
+      ],
+    );
+    if (!mounted || action == null) return;
+    switch (action) {
+      case _SelectionRotationAction.degrees30:
+        widget.controller.setSelectionRotationDegrees(30);
+      case _SelectionRotationAction.degrees45:
+        widget.controller.setSelectionRotationDegrees(45);
+      case _SelectionRotationAction.degrees60:
+        widget.controller.setSelectionRotationDegrees(60);
+      case _SelectionRotationAction.degrees90:
+        widget.controller.setSelectionRotationDegrees(90);
+      case _SelectionRotationAction.mirror:
+        widget.controller.mirrorSelectionHorizontally();
+      case _SelectionRotationAction.manual:
+        await _showManualRotationDialog();
+    }
+  }
+
+  Future<void> _showManualRotationDialog() async {
+    var value = widget.controller.selectionRotationDegrees
+        .clamp(-180.0, 180.0)
+        .roundToDouble();
+    final selected = await showDialog<double>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: const Text('Drehwinkel'),
+          content: SizedBox(
+            width: 420,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  '${value.round()}°',
+                  style: Theme.of(context).textTheme.headlineMedium,
+                ),
+                Slider(
+                  value: value,
+                  min: -180,
+                  max: 180,
+                  divisions: 360,
+                  label: '${value.round()}°',
+                  onChanged: (next) => setDialogState(() => value = next),
+                ),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    IconButton(
+                      tooltip: 'Ein Grad zurück',
+                      onPressed: () => setDialogState(
+                        () => value = (value - 1).clamp(-180, 180),
+                      ),
+                      icon: const Icon(Icons.remove_rounded),
+                    ),
+                    TextButton(
+                      onPressed: () => setDialogState(() => value = 0),
+                      child: const Text('0°'),
+                    ),
+                    IconButton(
+                      tooltip: 'Ein Grad vor',
+                      onPressed: () => setDialogState(
+                        () => value = (value + 1).clamp(-180, 180),
+                      ),
+                      icon: const Icon(Icons.add_rounded),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('Abbrechen'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, value),
+              child: const Text('Übernehmen'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (mounted && selected != null) {
+      widget.controller.setSelectionRotationDegrees(selected);
+    }
+  }
+}
+
+enum _SelectionRotationAction {
+  degrees30,
+  degrees45,
+  degrees60,
+  degrees90,
+  mirror,
+  manual,
+}
+
+double _normalizedAngle(double value) {
+  var angle = value;
+  while (angle > math.pi) {
+    angle -= math.pi * 2;
+  }
+  while (angle < -math.pi) {
+    angle += math.pi * 2;
+  }
+  return angle;
 }
 
 enum _CoverResizeEdge { left, top, right, bottom }
@@ -854,12 +2212,14 @@ enum _CoverResizeEdge { left, top, right, bottom }
 class _SelectionEdgeResizeHandles extends StatefulWidget {
   const _SelectionEdgeResizeHandles({
     required this.controller,
+    required this.viewport,
     required this.objectRect,
     required this.onClaim,
     required this.onRelease,
   });
 
   final EditorController controller;
+  final BoardViewport viewport;
   final Rect objectRect;
   final bool Function(_CoverResizeEdge edge) onClaim;
   final void Function(_CoverResizeEdge edge) onRelease;
@@ -909,7 +2269,7 @@ class _SelectionEdgeResizeHandlesState
           onPanUpdate: (details) {
             if (_activeEdge != edge) return;
             final base = _baseBounds;
-            final viewportScale = widget.controller.viewport.scale;
+            final viewportScale = widget.viewport.scale;
             if (base == null ||
                 base.isEmpty ||
                 !viewportScale.isFinite ||
@@ -1001,15 +2361,15 @@ class _SelectionEdgeResizeHandlesState
 class _CoverResizeHandles extends StatelessWidget {
   const _CoverResizeHandles({
     required this.controller,
+    required this.viewport,
     required this.cover,
-    required this.objectRect,
     required this.onClaim,
     required this.onRelease,
   });
 
   final EditorController controller;
+  final BoardViewport viewport;
   final CoverObject cover;
-  final Rect objectRect;
   final bool Function(_CoverResizeEdge edge) onClaim;
   final void Function(_CoverResizeEdge edge) onRelease;
 
@@ -1021,8 +2381,8 @@ class _CoverResizeHandles extends StatelessWidget {
         _CoverResizeHandle(
           key: ValueKey('cover-resize-${edge.name}-${cover.id}'),
           controller: controller,
+          viewport: viewport,
           cover: cover,
-          objectRect: objectRect,
           edge: edge,
           onClaim: () => onClaim(edge),
           onRelease: () => onRelease(edge),
@@ -1034,8 +2394,8 @@ class _CoverResizeHandles extends StatelessWidget {
 class _CoverResizeHandle extends StatefulWidget {
   const _CoverResizeHandle({
     required this.controller,
+    required this.viewport,
     required this.cover,
-    required this.objectRect,
     required this.edge,
     required this.onClaim,
     required this.onRelease,
@@ -1043,8 +2403,8 @@ class _CoverResizeHandle extends StatefulWidget {
   });
 
   final EditorController controller;
+  final BoardViewport viewport;
   final CoverObject cover;
-  final Rect objectRect;
   final _CoverResizeEdge edge;
   final ValueGetter<bool> onClaim;
   final VoidCallback onRelease;
@@ -1054,7 +2414,7 @@ class _CoverResizeHandle extends StatefulWidget {
 }
 
 class _CoverResizeHandleState extends State<_CoverResizeHandle> {
-  Rect2? _baseBounds;
+  ObjectTransform? _baseTransform;
   Offset _accumulatedWorldDelta = Offset.zero;
   bool _ownsGesture = false;
 
@@ -1062,12 +2422,16 @@ class _CoverResizeHandleState extends State<_CoverResizeHandle> {
       widget.edge == _CoverResizeEdge.left ||
       widget.edge == _CoverResizeEdge.right;
 
-  Offset get _screenCenter => switch (widget.edge) {
-    _CoverResizeEdge.left => widget.objectRect.centerLeft,
-    _CoverResizeEdge.top => widget.objectRect.topCenter,
-    _CoverResizeEdge.right => widget.objectRect.centerRight,
-    _CoverResizeEdge.bottom => widget.objectRect.bottomCenter,
-  };
+  Offset get _screenCenter {
+    final transform = widget.cover.transform;
+    final local = switch (widget.edge) {
+      _CoverResizeEdge.left => Offset(0, transform.height / 2),
+      _CoverResizeEdge.top => Offset(transform.width / 2, 0),
+      _CoverResizeEdge.right => Offset(transform.width, transform.height / 2),
+      _CoverResizeEdge.bottom => Offset(transform.width / 2, transform.height),
+    };
+    return widget.viewport.worldToScreen(_framePointToWorld(transform, local));
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1085,21 +2449,18 @@ class _CoverResizeHandleState extends State<_CoverResizeHandle> {
           onPanStart: (_) {
             _ownsGesture = widget.onClaim();
             if (!_ownsGesture) return;
-            final transform = widget.cover.transform;
-            _baseBounds = Rect2(
-              left: transform.x,
-              top: transform.y,
-              width: transform.width,
-              height: transform.height,
-            );
+            _baseTransform = widget.cover.transform;
             _accumulatedWorldDelta = Offset.zero;
           },
           onPanUpdate: (details) {
             if (!_ownsGesture) return;
-            final base = _baseBounds;
-            final scale = widget.controller.viewport.scale;
+            final base = _baseTransform;
+            final scale = widget.viewport.scale;
             if (base == null || !scale.isFinite || scale <= 0) return;
-            _accumulatedWorldDelta += details.delta / scale;
+            _accumulatedWorldDelta += _worldVectorToFrame(
+              details.delta / scale,
+              base.rotationRadians,
+            );
             final minWidth = math.min(48.0, base.width);
             final minHeight = math.min(48.0, base.height);
             var scaleX = 1.0;
@@ -1109,26 +2470,33 @@ class _CoverResizeHandleState extends State<_CoverResizeHandle> {
               case _CoverResizeEdge.left:
                 scaleX = ((base.width - _accumulatedWorldDelta.dx) / base.width)
                     .clamp(minWidth / base.width, 20.0);
-                anchor = Offset(base.right, base.top);
+                anchor = _framePointToWorld(
+                  base,
+                  Offset(base.width, base.height / 2),
+                );
               case _CoverResizeEdge.top:
                 scaleY =
                     ((base.height - _accumulatedWorldDelta.dy) / base.height)
                         .clamp(minHeight / base.height, 20.0);
-                anchor = Offset(base.left, base.bottom);
+                anchor = _framePointToWorld(
+                  base,
+                  Offset(base.width / 2, base.height),
+                );
               case _CoverResizeEdge.right:
                 scaleX = ((base.width + _accumulatedWorldDelta.dx) / base.width)
                     .clamp(minWidth / base.width, 20.0);
-                anchor = Offset(base.left, base.top);
+                anchor = _framePointToWorld(base, Offset(0, base.height / 2));
               case _CoverResizeEdge.bottom:
                 scaleY =
                     ((base.height + _accumulatedWorldDelta.dy) / base.height)
                         .clamp(minHeight / base.height, 20.0);
-                anchor = Offset(base.left, base.top);
+                anchor = _framePointToWorld(base, Offset(base.width / 2, 0));
             }
             widget.controller.previewResizeSelection(
               scaleX: scaleX,
               scaleY: scaleY,
               anchor: anchor,
+              scaleAxisRadians: base.rotationRadians,
             );
           },
           onPanEnd: (_) => _finish(commit: true),
@@ -1159,7 +2527,7 @@ class _CoverResizeHandleState extends State<_CoverResizeHandle> {
     } else {
       widget.controller.cancelSelectionTransform();
     }
-    _baseBounds = null;
+    _baseTransform = null;
     _accumulatedWorldDelta = Offset.zero;
     _ownsGesture = false;
     widget.onRelease();
@@ -1181,6 +2549,31 @@ String _edgeLabel(_CoverResizeEdge edge) => switch (edge) {
   _CoverResizeEdge.right => 'rechts',
   _CoverResizeEdge.bottom => 'unten',
 };
+
+Offset _framePointToWorld(ObjectTransform transform, Offset local) {
+  final unrotated = Offset(transform.x + local.dx, transform.y + local.dy);
+  final center = Offset(
+    transform.x + transform.width / 2,
+    transform.y + transform.height / 2,
+  );
+  final cosine = math.cos(transform.rotationRadians);
+  final sine = math.sin(transform.rotationRadians);
+  final delta = unrotated - center;
+  return center +
+      Offset(
+        delta.dx * cosine - delta.dy * sine,
+        delta.dx * sine + delta.dy * cosine,
+      );
+}
+
+Offset _worldVectorToFrame(Offset vector, double rotationRadians) {
+  final cosine = math.cos(rotationRadians);
+  final sine = math.sin(rotationRadians);
+  return Offset(
+    vector.dx * cosine + vector.dy * sine,
+    -vector.dx * sine + vector.dy * cosine,
+  );
+}
 
 class _CoverRevealControl extends StatefulWidget {
   const _CoverRevealControl({
@@ -1214,22 +2607,23 @@ class _CoverRevealControlState extends State<_CoverRevealControl> {
         cover.direction == RevealDirection.leftToRight ||
         cover.direction == RevealDirection.rightToLeft;
     final value = controller.coverRevealValue(cover.id, cover.reveal);
+    final localRect = Offset.zero & objectRect.size;
     final guidePosition = switch (cover.direction) {
       RevealDirection.leftToRight => Offset(
-        objectRect.left + objectRect.width * value,
-        objectRect.center.dy,
+        localRect.left + localRect.width * value,
+        localRect.center.dy,
       ),
       RevealDirection.rightToLeft => Offset(
-        objectRect.right - objectRect.width * value,
-        objectRect.center.dy,
+        localRect.right - localRect.width * value,
+        localRect.center.dy,
       ),
       RevealDirection.topToBottom => Offset(
-        objectRect.center.dx,
-        objectRect.top + objectRect.height * value,
+        localRect.center.dx,
+        localRect.top + localRect.height * value,
       ),
       RevealDirection.bottomToTop => Offset(
-        objectRect.center.dx,
-        objectRect.bottom - objectRect.height * value,
+        localRect.center.dx,
+        localRect.bottom - localRect.height * value,
       ),
     };
     // The blue reveal boundary itself is the drag target. It deliberately has
@@ -1240,11 +2634,11 @@ class _CoverRevealControlState extends State<_CoverRevealControl> {
         ? Rect.fromCenter(
             center: guidePosition,
             width: 44,
-            height: objectRect.height,
+            height: localRect.height,
           )
         : Rect.fromCenter(
             center: guidePosition,
-            width: objectRect.width,
+            width: localRect.width,
             height: 44,
           );
     return Stack(
@@ -1252,62 +2646,76 @@ class _CoverRevealControlState extends State<_CoverRevealControl> {
       children: [
         Positioned.fromRect(
           rect: objectRect,
-          child: IgnorePointer(
-            child: CustomPaint(
-              painter: _CoverRevealGuidePainter(
-                direction: cover.direction,
-                reveal: value,
-              ),
-            ),
-          ),
-        ),
-        Positioned(
-          key: ValueKey('cover-reveal-guide-${cover.id}'),
-          left: guideHitRect.left,
-          top: guideHitRect.top,
-          width: guideHitRect.width,
-          height: guideHitRect.height,
-          child: Semantics(
-            label: 'Abdeckung freilegen',
-            slider: true,
-            value: '${(value * 100).round()} Prozent',
-            increasedValue:
-                '${((value + .1).clamp(0.0, 1.0) * 100).round()} Prozent',
-            decreasedValue:
-                '${((value - .1).clamp(0.0, 1.0) * 100).round()} Prozent',
-            onIncrease: () => _adjustSemantics(.1),
-            onDecrease: () => _adjustSemantics(-.1),
-            child: MouseRegion(
-              cursor: horizontal
-                  ? SystemMouseCursors.resizeLeftRight
-                  : SystemMouseCursors.resizeUpDown,
-              child: GestureDetector(
-                behavior: HitTestBehavior.translucent,
-                onPanStart: (_) => _ownsGesture = widget.onClaim(),
-                onPanUpdate: (details) {
-                  if (!_ownsGesture) return;
-                  final extent = horizontal
-                      ? objectRect.width
-                      : objectRect.height;
-                  if (!extent.isFinite || extent <= 0) return;
-                  final signedDelta = switch (cover.direction) {
-                    RevealDirection.leftToRight => details.delta.dx,
-                    RevealDirection.rightToLeft => -details.delta.dx,
-                    RevealDirection.topToBottom => details.delta.dy,
-                    RevealDirection.bottomToTop => -details.delta.dy,
-                  };
-                  final current = controller.coverRevealValue(
-                    cover.id,
-                    cover.reveal,
-                  );
-                  controller.previewCoverReveal(
-                    cover.id,
-                    (current + signedDelta / extent).clamp(0.0, 1.0),
-                  );
-                },
-                onPanEnd: (_) => _finish(commit: true),
-                onPanCancel: () => _finish(commit: false),
-                child: const SizedBox.expand(),
+          child: Transform.rotate(
+            angle: cover.transform.rotationRadians,
+            child: Transform.flip(
+              flipX: cover.transform.flipX,
+              flipY: cover.transform.flipY,
+              child: Stack(
+                clipBehavior: Clip.none,
+                children: [
+                  Positioned.fill(
+                    child: IgnorePointer(
+                      child: CustomPaint(
+                        painter: _CoverRevealGuidePainter(
+                          direction: cover.direction,
+                          reveal: value,
+                        ),
+                      ),
+                    ),
+                  ),
+                  Positioned(
+                    key: ValueKey('cover-reveal-guide-${cover.id}'),
+                    left: guideHitRect.left,
+                    top: guideHitRect.top,
+                    width: guideHitRect.width,
+                    height: guideHitRect.height,
+                    child: Semantics(
+                      label: 'Abdeckung freilegen',
+                      slider: true,
+                      value: '${(value * 100).round()} Prozent',
+                      increasedValue:
+                          '${((value + .1).clamp(0.0, 1.0) * 100).round()} Prozent',
+                      decreasedValue:
+                          '${((value - .1).clamp(0.0, 1.0) * 100).round()} Prozent',
+                      onIncrease: () => _adjustSemantics(.1),
+                      onDecrease: () => _adjustSemantics(-.1),
+                      child: MouseRegion(
+                        cursor: horizontal
+                            ? SystemMouseCursors.resizeLeftRight
+                            : SystemMouseCursors.resizeUpDown,
+                        child: GestureDetector(
+                          behavior: HitTestBehavior.translucent,
+                          onPanStart: (_) => _ownsGesture = widget.onClaim(),
+                          onPanUpdate: (details) {
+                            if (!_ownsGesture) return;
+                            final extent = horizontal
+                                ? localRect.width
+                                : localRect.height;
+                            if (!extent.isFinite || extent <= 0) return;
+                            final signedDelta = switch (cover.direction) {
+                              RevealDirection.leftToRight => details.delta.dx,
+                              RevealDirection.rightToLeft => -details.delta.dx,
+                              RevealDirection.topToBottom => details.delta.dy,
+                              RevealDirection.bottomToTop => -details.delta.dy,
+                            };
+                            final current = controller.coverRevealValue(
+                              cover.id,
+                              cover.reveal,
+                            );
+                            controller.previewCoverReveal(
+                              cover.id,
+                              (current + signedDelta / extent).clamp(0.0, 1.0),
+                            );
+                          },
+                          onPanEnd: (_) => _finish(commit: true),
+                          onPanCancel: () => _finish(commit: false),
+                          child: const SizedBox.expand(),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
               ),
             ),
           ),
@@ -1602,6 +3010,72 @@ class _SelectionActions extends StatelessWidget {
   }
 }
 
+final class _ProvisionalTouchTrace {
+  _ProvisionalTouchTrace({
+    required this.pointer,
+    required this.initialViewportScale,
+    required this.initialViewportOffset,
+  });
+
+  static const int _maximumSamples = 128;
+  final int pointer;
+  final double initialViewportScale;
+  final Offset initialViewportOffset;
+  final List<Offset> points = <Offset>[];
+  final List<List<EraserBrushStamp>> footprints = <List<EraserBrushStamp>>[];
+  double maximumScreenRadius = 18;
+  bool routedToBoard = false;
+  bool becameEraser = false;
+
+  void add(
+    Offset point,
+    double screenRadius, {
+    required List<EraserBrushStamp> footprint,
+  }) {
+    if (!point.dx.isFinite || !point.dy.isFinite) return;
+    if (screenRadius.isFinite && screenRadius > maximumScreenRadius) {
+      maximumScreenRadius = screenRadius.clamp(18.0, 96.0);
+    }
+    final previous = points.lastOrNull;
+    if (previous != null && (previous - point).distance < .75) {
+      points[points.length - 1] = point;
+      footprints[footprints.length - 1] = footprint;
+      return;
+    }
+    if (points.length >= _maximumSamples) {
+      final compacted = <Offset>[points.first];
+      final compactedFootprints = <List<EraserBrushStamp>>[footprints.first];
+      for (var index = 2; index < points.length - 1; index += 2) {
+        compacted.add(points[index]);
+        compactedFootprints.add(footprints[index]);
+      }
+      compacted.add(points.last);
+      compactedFootprints.add(footprints.last);
+      points
+        ..clear()
+        ..addAll(compacted);
+      footprints
+        ..clear()
+        ..addAll(compactedFootprints);
+    }
+    points.add(point);
+    footprints.add(List<EraserBrushStamp>.unmodifiable(footprint));
+  }
+}
+
+final class _EraserPointerState {
+  const _EraserPointerState({required this.stamps});
+
+  final List<_WorldEraserStamp> stamps;
+}
+
+final class _WorldEraserStamp {
+  const _WorldEraserStamp({required this.center, required this.radius});
+
+  final Offset center;
+  final double radius;
+}
+
 final class _GesturePreview {
   _GesturePreview({
     required this.tool,
@@ -1614,20 +3088,65 @@ final class _GesturePreview {
   final List<Offset> points;
 }
 
+final class _BoardPointerIndicatorController extends ChangeNotifier {
+  final Map<int, BoardPointerIndicator> _active =
+      <int, BoardPointerIndicator>{};
+  Offset? _hoverPosition;
+
+  List<BoardPointerIndicator> get indicators =>
+      List<BoardPointerIndicator>.unmodifiable(_active.values);
+
+  Offset? get hoverPosition => _active.isEmpty ? _hoverPosition : null;
+
+  void updateHover(Offset position) {
+    if (!position.dx.isFinite ||
+        !position.dy.isFinite ||
+        _hoverPosition == position) {
+      return;
+    }
+    _hoverPosition = position;
+    if (_active.isEmpty) notifyListeners();
+  }
+
+  void clearHover() {
+    if (_hoverPosition == null) return;
+    _hoverPosition = null;
+    if (_active.isEmpty) notifyListeners();
+  }
+
+  void updatePointer(BoardPointerIndicator indicator) {
+    if (!indicator.position.dx.isFinite || !indicator.position.dy.isFinite) {
+      return;
+    }
+    if (_active[indicator.pointer] == indicator) return;
+    _active[indicator.pointer] = indicator;
+    notifyListeners();
+  }
+
+  void removePointer(int pointer) {
+    if (_active.remove(pointer) == null) return;
+    if (_active.isEmpty) _hoverPosition = null;
+    notifyListeners();
+  }
+
+  void clear({bool notify = true}) {
+    if (_active.isEmpty && _hoverPosition == null) return;
+    _active.clear();
+    _hoverPosition = null;
+    if (notify) notifyListeners();
+  }
+}
+
 class _GestureOverlayPainter extends CustomPainter {
   const _GestureOverlayPainter({
     required this.gestures,
     required this.viewportScale,
     required this.viewportOffset,
-    required this.tool,
-    required this.hoverPosition,
   });
 
   final List<_GesturePreview> gestures;
   final double viewportScale;
   final Offset viewportOffset;
-  final BoardTool tool;
-  final Offset? hoverPosition;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -1660,18 +3179,6 @@ class _GestureOverlayPainter extends CustomPainter {
         } else {
           canvas.drawRect(Rect.fromPoints(first, last), paint);
         }
-      }
-    }
-    if (hoverPosition case final position?) {
-      if (tool == BoardTool.pen ||
-          tool == BoardTool.marker ||
-          tool == BoardTool.dashedPen ||
-          tool == BoardTool.straightLine) {
-        canvas.drawCircle(
-          position,
-          4,
-          paint..color = FlowboardColors.mint.withValues(alpha: .7),
-        );
       }
     }
   }

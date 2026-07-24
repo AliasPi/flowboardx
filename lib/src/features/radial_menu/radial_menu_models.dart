@@ -19,7 +19,7 @@ enum RadialMenuAction {
 /// The single secondary branch which is currently visible.
 enum RadialMenuBranch { pen, selection, templates, pages, insert, export }
 
-enum RadialPenType { normal, marker, dashed, straight }
+enum RadialPenType { normal, marker, dashed, straight, eraser }
 
 enum RadialSelectionTool { rectangle, lasso, selectAll }
 
@@ -167,6 +167,7 @@ class RadialTableSize {
 class RadialMenuCallbacks {
   const RadialMenuCallbacks({
     this.onMenuOpenChanged,
+    this.onFiveFingerPageGestureChanged,
     this.onPositionChanged,
     this.onPrimaryAction,
     this.onPenSettingsChanged,
@@ -183,6 +184,11 @@ class RadialMenuCallbacks {
   });
 
   final ValueChanged<bool>? onMenuOpenChanged;
+
+  /// Signals the complete lifetime of a five-touch page rotation. The board
+  /// can cancel transient ink/selection/navigation state at `true` and keep
+  /// processing suspended until all participating fingers are released.
+  final ValueChanged<bool>? onFiveFingerPageGestureChanged;
   final ValueChanged<Offset>? onPositionChanged;
   final ValueChanged<RadialMenuAction>? onPrimaryAction;
   final ValueChanged<RadialPenSettings>? onPenSettingsChanged;
@@ -246,6 +252,7 @@ class RadialMenuLabels {
       RadialPenType.marker: 'Marker',
       RadialPenType.dashed: 'Gestrichelt',
       RadialPenType.straight: 'Gerade Linie',
+      RadialPenType.eraser: 'Radiergummi',
     },
     selectionTools: <RadialSelectionTool, String>{
       RadialSelectionTool.rectangle: 'Auswahlrechteck',

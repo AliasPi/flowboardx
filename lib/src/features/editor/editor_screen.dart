@@ -10,13 +10,16 @@ import 'package:flutter/scheduler.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:pdfrx/pdfrx.dart';
+import 'package:share_plus/share_plus.dart';
 
 import '../../data/document_repository.dart';
+import '../../diagnostics/diagnostics.dart';
 import '../../domain/model/board_object.dart';
 import '../../domain/model/document.dart';
 import '../../domain/model/ink.dart';
 import '../assets/google_image_browser_dialog.dart';
 import '../assets/web_image_search_service.dart';
+import '../board/engine/board_viewport.dart';
 import '../board/engine/input_policy.dart';
 import '../board/presentation/board_surface.dart';
 import '../export_share/export_share.dart';
@@ -24,13 +27,16 @@ import '../library/document_preview.dart';
 import '../pages/page_thumbnail_renderer.dart';
 import '../radial_menu/radial_menu.dart';
 import '../templates/templates.dart';
+import '../timer/countdown_timer.dart';
 import '../../app/app_theme.dart';
 import '../../app/brand_mark.dart';
 import '../../platform/android_pdf_file_saver.dart';
 import '../../platform/android_pdf_quick_share.dart';
 import 'board_export_factory.dart';
+import 'board_participant_controller.dart';
 import 'editor_controller.dart';
 import 'editor_help_dialog.dart';
+import 'participant_mode_toggle.dart';
 import 'pdf_import_dialog.dart';
 import 'pdf_import_coordinator.dart';
 import 'pen_color_picker_dialog.dart';
@@ -41,6 +47,19 @@ final class _OpenedPdfPreview {
 
   final String path;
   final PdfDocument document;
+}
+
+final class _WorkspaceRegionClipper extends CustomClipper<Rect> {
+  const _WorkspaceRegionClipper(this.region);
+
+  final Rect region;
+
+  @override
+  Rect getClip(Size size) => region.intersect(Offset.zero & size);
+
+  @override
+  bool shouldReclip(covariant _WorkspaceRegionClipper oldClipper) =>
+      oldClipper.region != region;
 }
 
 class EditorScreen extends StatefulWidget {
@@ -62,7 +81,13 @@ class EditorScreen extends StatefulWidget {
 class _EditorScreenState extends State<EditorScreen>
     with WidgetsBindingObserver {
   late final EditorController _editor;
+  late final EditorController _secondaryEditor;
   late final RadialMenuController _radial;
+  late final RadialMenuController _secondaryRadial;
+  late final BoardParticipantController _primaryParticipant;
+  late final BoardParticipantController _secondaryParticipant;
+  EditorParticipantMode _participantMode = EditorParticipantMode.onePerson;
+  bool _secondaryParticipantInitialized = false;
   final PdfShareController _shareController = PdfShareController();
   final PageThumbnailRenderer _thumbnailRenderer = PageThumbnailRenderer();
   final Map<String, ui.Image> _thumbnails = {};
@@ -77,14 +102,23 @@ class _EditorScreenState extends State<EditorScreen>
   double? _exportProgress;
   bool _leaving = false;
   bool _topBarCollapsed = false;
+  bool _fingerDrawingEnabled = false;
+  late final CountdownTimerController _countdownTimer;
+  bool _largeTimerVisible = false;
+  Rect? _largeTimerRect;
   Size _layoutSize = Size.zero;
   int _radialPositionResetToken = 0;
+  int _secondaryRadialPositionResetToken = 0;
   Future<UserTemplateStore>? _userTemplateStore;
   Future<List<UserTemplate>>? _userTemplateLoad;
   List<UserTemplate> _userTemplates = const <UserTemplate>[];
   bool _templateMutationRunning = false;
   bool _insertConfigurationOpen = false;
   final PdfImportCoordinator _pdfImportCoordinator = PdfImportCoordinator();
+  final ValueNotifier<bool> _radialPageGestureActive = ValueNotifier(false);
+  final ValueNotifier<bool> _secondaryRadialPageGestureActive = ValueNotifier(
+    false,
+  );
 
   @override
   void initState() {
@@ -94,7 +128,26 @@ class _EditorScreenState extends State<EditorScreen>
       document: widget.document,
       repository: widget.repository,
       assetDirectory: widget.assetDirectory,
-    )..addListener(_onEditorChanged);
+    );
+    _countdownTimer = CountdownTimerController(
+      onAlarm: playSystemCountdownAlarm,
+    );
+    _secondaryEditor = EditorController.participantView(
+      _editor,
+      participantId: 'right',
+    );
+    _primaryParticipant = BoardParticipantController(
+      id: 'left',
+      tool: _editor.tool,
+      activeShape: _editor.activeShape,
+      penStyle: _editor.penStyle,
+    );
+    _secondaryParticipant = BoardParticipantController(
+      id: 'right',
+      tool: _editor.tool,
+      activeShape: _editor.activeShape,
+      penStyle: _editor.penStyle,
+    );
     _radial = RadialMenuController(
       isOpen: false,
       activeBranch: null,
@@ -104,6 +157,17 @@ class _EditorScreenState extends State<EditorScreen>
         type: _radialType(_editor.penStyle.type),
       ),
     );
+    _secondaryRadial = RadialMenuController(
+      isOpen: false,
+      activeBranch: null,
+      penSettings: RadialPenSettings(
+        color: Color(_secondaryParticipant.penStyle.colorArgb),
+        thickness: _secondaryParticipant.penStyle.width.clamp(1, 32),
+        type: _radialType(_secondaryParticipant.penStyle.type),
+      ),
+    );
+    _editor.addListener(_onEditorChanged);
+    _secondaryEditor.addListener(_onSecondaryEditorChanged);
     _onEditorChanged();
     unawaited(_reloadUserTemplates());
     if (widget.document.metadata.recoveredFromCrash) {
@@ -123,6 +187,9 @@ class _EditorScreenState extends State<EditorScreen>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _countdownTimer.refresh();
+    }
     if (state == AppLifecycleState.inactive ||
         state == AppLifecycleState.paused ||
         state == AppLifecycleState.detached ||
@@ -135,8 +202,16 @@ class _EditorScreenState extends State<EditorScreen>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _editor.removeListener(_onEditorChanged);
-    _editor.dispose();
+    _secondaryEditor.removeListener(_onSecondaryEditorChanged);
     _radial.dispose();
+    _secondaryRadial.dispose();
+    _primaryParticipant.dispose();
+    _secondaryParticipant.dispose();
+    _countdownTimer.dispose();
+    _radialPageGestureActive.dispose();
+    _secondaryRadialPageGestureActive.dispose();
+    _secondaryEditor.dispose();
+    _editor.dispose();
     _shareController.dispose();
     _thumbnailRenderer.dispose();
     _thumbnailDebounce?.cancel();
@@ -160,10 +235,7 @@ class _EditorScreenState extends State<EditorScreen>
             return Stack(
               children: [
                 Positioned.fill(
-                  child: BoardSurface(
-                    controller: _editor,
-                    onEmptyLongPress: _showEmptyMenu,
-                  ),
+                  child: _buildBoardWorkspace(constraints.biggest),
                 ),
                 Positioned(
                   left: 16,
@@ -180,44 +252,38 @@ class _EditorScreenState extends State<EditorScreen>
                     onSaveCurrentPageAsTemplate: () =>
                         unawaited(_saveCurrentPageAsTemplate()),
                     onResetMenuPosition: _resetRadialMenuPosition,
-                    onHelp: () => FlowboardHelpDialog.show(context),
+                    onHelp: () => FlowboardHelpDialog.show(
+                      context,
+                      onExportDiagnostics: _shareDiagnosticLog,
+                    ),
+                    participantMode: _participantMode,
+                    onParticipantModeChanged: _setParticipantMode,
+                    fingerDrawingEnabled: _fingerDrawingEnabled,
+                    onFingerDrawingChanged: (enabled) =>
+                        setState(() => _fingerDrawingEnabled = enabled),
+                    countdownTimer: _countdownTimer,
+                    onShowLargeTimer: () =>
+                        setState(() => _largeTimerVisible = true),
                     onToggleCollapsed: () =>
                         setState(() => _topBarCollapsed = !_topBarCollapsed),
                   ),
                 ),
-                Positioned.fill(
-                  child: RadialMenu(
-                    controller: _radial,
-                    initialPosition: _initialRadialPosition(
-                      constraints.biggest,
+                ..._buildRadialMenus(constraints.biggest),
+                if (_largeTimerVisible)
+                  CountdownTimerOverlay(
+                    controller: _countdownTimer,
+                    bounds: Rect.fromLTWH(
+                      12,
+                      84,
+                      math.max(0, constraints.maxWidth - 24),
+                      math.max(0, constraints.maxHeight - 96),
                     ),
-                    maxDiameter: math
-                        .max(360, math.min(610, constraints.maxHeight * .92))
-                        .toDouble(),
-                    centerLogo: const FlowboardMark(size: 62),
-                    positionResetToken: _radialPositionResetToken,
-                    currentPageIndex: _editor.document.currentPageIndex,
-                    templateEntries: _radialTemplateEntries,
-                    pagePreviews: [
-                      for (
-                        var index = 0;
-                        index < _editor.document.pages.length;
-                        index++
-                      )
-                        RadialPagePreview(
-                          pageIndex: index,
-                          pageNumber: index + 1,
-                          thumbnail:
-                              _thumbnails[_editor.document.pages[index].id],
-                          semanticLabel: _editor.document.pages[index].name,
-                        ),
-                    ],
-                    callbacks: _radialCallbacks(),
-                    canUndo: _editor.canUndo,
-                    canRedo: _editor.canRedo,
+                    initialRect: _largeTimerRect,
+                    onRectChanged: (value) => _largeTimerRect = value,
+                    onClose: () => setState(() => _largeTimerVisible = false),
                   ),
-                ),
-                if (_editor.lastError case final message?)
+                if ((_editor.lastError ?? _secondaryEditor.lastError)
+                    case final message?)
                   Positioned(
                     left: constraints.maxWidth / 2 - 250,
                     top: 82,
@@ -269,84 +335,311 @@ class _EditorScreenState extends State<EditorScreen>
     );
   }
 
-  RadialMenuCallbacks _radialCallbacks() => RadialMenuCallbacks(
-    onPositionChanged: (position) {
-      if (_layoutSize.isEmpty) return;
-      _editor.updateRadialMenuPosition(
-        Offset(
-          position.dx / _layoutSize.width,
-          position.dy / _layoutSize.height,
+  Widget _buildBoardWorkspace(Size size) {
+    if (_participantMode == EditorParticipantMode.onePerson) {
+      return BoardSurface(
+        key: const ValueKey('solo-board-surface'),
+        controller: _editor,
+        participant: _primaryParticipant,
+        participantId: _primaryParticipant.id,
+        onEmptyLongPress: (screen, world) => _showEmptyMenu(
+          screen,
+          world,
+          editor: _editor,
+          participant: _primaryParticipant,
         ),
+        inputSuppression: _radialPageGestureActive,
+        fingerDrawingEnabled: _fingerDrawingEnabled,
       );
+    }
+    const dividerWidth = 3.0;
+    final halfWidth = math.max(0.0, (size.width - dividerWidth) / 2);
+    final leftRegion = Rect.fromLTWH(0, 0, halfWidth, size.height);
+    final rightRegion = Rect.fromLTWH(
+      halfWidth + dividerWidth,
+      0,
+      halfWidth,
+      size.height,
+    );
+    // The logical 3x3 board is split through the centre of its middle page.
+    // Keeping this divider in world coordinates makes the partition stable
+    // while both participants retain independent cameras and active pages.
+    final splitWorldBoundary = _editor.viewport.worldBounds.center.dx;
+    return Stack(
+      children: [
+        Positioned.fill(
+          child: ClipRect(
+            clipper: _WorkspaceRegionClipper(leftRegion),
+            child: BoardSurface(
+              key: const ValueKey('left-board-surface'),
+              controller: _editor,
+              participant: _primaryParticipant,
+              participantId: _primaryParticipant.id,
+              onEmptyLongPress: (screen, world) => _showEmptyMenu(
+                screen,
+                world,
+                editor: _editor,
+                participant: _primaryParticipant,
+              ),
+              inputSuppression: _radialPageGestureActive,
+              confineInputToBounds: true,
+              inputBounds: leftRegion,
+              horizontalViewportConstraint: BoardViewportHorizontalConstraint(
+                side: BoardViewportPartitionSide.left,
+                worldBoundaryX: splitWorldBoundary,
+              ),
+              fingerDrawingEnabled: _fingerDrawingEnabled,
+            ),
+          ),
+        ),
+        Positioned.fill(
+          child: ClipRect(
+            clipper: _WorkspaceRegionClipper(rightRegion),
+            child: BoardSurface(
+              key: const ValueKey('right-board-surface'),
+              controller: _secondaryEditor,
+              participant: _secondaryParticipant,
+              participantId: _secondaryParticipant.id,
+              onEmptyLongPress: (screen, world) => _showEmptyMenu(
+                screen,
+                world,
+                editor: _secondaryEditor,
+                participant: _secondaryParticipant,
+              ),
+              inputSuppression: _secondaryRadialPageGestureActive,
+              confineInputToBounds: true,
+              inputBounds: rightRegion,
+              horizontalViewportConstraint: BoardViewportHorizontalConstraint(
+                side: BoardViewportPartitionSide.right,
+                worldBoundaryX: splitWorldBoundary,
+              ),
+              fingerDrawingEnabled: _fingerDrawingEnabled,
+            ),
+          ),
+        ),
+        Center(
+          child: IgnorePointer(
+            child: Container(
+              key: const ValueKey('two-person-divider'),
+              width: dividerWidth,
+              color: FlowboardColors.mint.withValues(alpha: .72),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  List<Widget> _buildRadialMenus(Size size) {
+    if (_participantMode == EditorParticipantMode.onePerson) {
+      return <Widget>[
+        Positioned.fill(
+          child: _buildRadialMenu(
+            key: const ValueKey('solo-radial-menu'),
+            regionSize: size,
+            radial: _radial,
+            participant: _primaryParticipant,
+            participantEditor: _editor,
+            suppression: _radialPageGestureActive,
+            resetToken: _radialPositionResetToken,
+            persistPosition: true,
+          ),
+        ),
+      ];
+    }
+    const dividerWidth = 3.0;
+    final halfWidth = math.max(0.0, (size.width - dividerWidth) / 2);
+    final regionSize = Size(halfWidth, size.height);
+    return <Widget>[
+      Positioned(
+        left: 0,
+        top: 0,
+        bottom: 0,
+        width: halfWidth,
+        child: ClipRect(
+          child: _buildRadialMenu(
+            key: const ValueKey('left-radial-menu'),
+            regionSize: regionSize,
+            radial: _radial,
+            participant: _primaryParticipant,
+            participantEditor: _editor,
+            suppression: _radialPageGestureActive,
+            resetToken: _radialPositionResetToken,
+            confineToBounds: true,
+          ),
+        ),
+      ),
+      Positioned(
+        right: 0,
+        top: 0,
+        bottom: 0,
+        width: halfWidth,
+        child: ClipRect(
+          child: _buildRadialMenu(
+            key: const ValueKey('right-radial-menu'),
+            regionSize: regionSize,
+            radial: _secondaryRadial,
+            participant: _secondaryParticipant,
+            participantEditor: _secondaryEditor,
+            suppression: _secondaryRadialPageGestureActive,
+            resetToken: _secondaryRadialPositionResetToken,
+            confineToBounds: true,
+          ),
+        ),
+      ),
+    ];
+  }
+
+  Widget _buildRadialMenu({
+    required Key key,
+    required Size regionSize,
+    required RadialMenuController radial,
+    required BoardParticipantController participant,
+    required EditorController participantEditor,
+    required ValueNotifier<bool> suppression,
+    required int resetToken,
+    bool confineToBounds = false,
+    bool persistPosition = false,
+  }) {
+    final split = _participantMode == EditorParticipantMode.twoPeople;
+    final initialPosition = split
+        ? Offset(regionSize.width / 2, regionSize.height * .62)
+        : _initialRadialPosition(regionSize);
+    final maximum = math.min(
+      610.0,
+      math.min(regionSize.width - 16, regionSize.height * .92),
+    );
+    return RadialMenu(
+      key: key,
+      controller: radial,
+      initialPosition: initialPosition,
+      maxDiameter: math.max(360, maximum),
+      centerLogo: const FlowboardMark(size: 62),
+      positionResetToken: resetToken,
+      currentPageIndex: participantEditor.currentPageIndex,
+      templateEntries: _radialTemplateEntries,
+      pagePreviews: _radialPagePreviews,
+      callbacks: _radialCallbacks(
+        radial: radial,
+        participant: participant,
+        participantEditor: participantEditor,
+        suppression: suppression,
+        persistPosition: persistPosition,
+      ),
+      confineToBounds: confineToBounds,
+      canUndo: participantEditor.canUndo,
+      canRedo: participantEditor.canRedo,
+    );
+  }
+
+  List<RadialPagePreview> get _radialPagePreviews => [
+    for (var index = 0; index < _editor.document.pages.length; index++)
+      RadialPagePreview(
+        pageIndex: index,
+        pageNumber: index + 1,
+        thumbnail: _thumbnails[_editor.document.pages[index].id],
+        semanticLabel: _editor.document.pages[index].name,
+      ),
+  ];
+
+  RadialMenuCallbacks _radialCallbacks({
+    required RadialMenuController radial,
+    required BoardParticipantController participant,
+    required EditorController participantEditor,
+    required ValueNotifier<bool> suppression,
+    required bool persistPosition,
+  }) => RadialMenuCallbacks(
+    onFiveFingerPageGestureChanged: (active) {
+      if (suppression.value != active) suppression.value = active;
     },
+    onPositionChanged: persistPosition
+        ? (position) {
+            if (_layoutSize.isEmpty) return;
+            _editor.updateRadialMenuPosition(
+              Offset(
+                position.dx / _layoutSize.width,
+                position.dy / _layoutSize.height,
+              ),
+            );
+          }
+        : null,
     onPrimaryAction: (action) {
       switch (action) {
         case RadialMenuAction.pen:
-          _editor.setTool(BoardTool.pen);
-        case RadialMenuAction.redo:
-          _editor.redo();
-        case RadialMenuAction.selection:
-          _editor.setTool(BoardTool.selectRectangle);
-        case RadialMenuAction.templates:
-          if (_editor.tool == BoardTool.shape) {
-            _editor.resumeConfiguredInkTool();
+          if (radial.activeBranch == RadialMenuBranch.pen) {
+            _setParticipantTool(participant, BoardTool.pen);
           }
+        case RadialMenuAction.redo:
+          participantEditor.redo();
+        case RadialMenuAction.selection:
+          if (radial.activeBranch == RadialMenuBranch.selection) {
+            _setParticipantTool(participant, BoardTool.selectRectangle);
+          }
+        case RadialMenuAction.templates:
+          _resumeParticipantAfterShape(participant);
           unawaited(_reloadUserTemplates(reportErrors: true));
         case RadialMenuAction.nextPage:
-          if (_editor.tool == BoardTool.shape) {
-            _editor.resumeConfiguredInkTool();
-          }
-          _editor.nextPage();
+          _resumeParticipantAfterShape(participant);
+          participantEditor.nextPage();
         case RadialMenuAction.newPage:
-          if (_editor.tool == BoardTool.shape) {
-            _editor.resumeConfiguredInkTool();
-          }
-          _addPageAndShowWheel();
+          _resumeParticipantAfterShape(participant);
+          _addPageAndShowWheel(source: radial, editor: participantEditor);
         case RadialMenuAction.previousPage:
-          if (_editor.tool == BoardTool.shape) {
-            _editor.resumeConfiguredInkTool();
-          }
-          _editor.previousPage();
+          _resumeParticipantAfterShape(participant);
+          participantEditor.previousPage();
         case RadialMenuAction.insert:
           break;
         case RadialMenuAction.export:
-          if (_editor.tool == BoardTool.shape) {
-            _editor.resumeConfiguredInkTool();
-          }
+          _resumeParticipantAfterShape(participant);
         case RadialMenuAction.undo:
-          _editor.undo();
+          participantEditor.undo();
       }
     },
-    onPenSettingsChanged: (settings) => _editor.updatePen(
-      colorArgb: settings.color.toARGB32(),
-      width: settings.thickness,
-      type: _inkType(settings.type),
-    ),
+    onPenSettingsChanged: (settings) =>
+        _updateParticipantDrawingSettings(participant, settings),
     onCustomColorRequested: _chooseCustomPenColor,
     onSelectionToolChanged: (tool) {
       switch (tool) {
         case RadialSelectionTool.rectangle:
-          _editor.setTool(BoardTool.selectRectangle);
+          _setParticipantTool(participant, BoardTool.selectRectangle);
         case RadialSelectionTool.lasso:
-          _editor.setTool(BoardTool.selectLasso);
+          _setParticipantTool(participant, BoardTool.selectLasso);
         case RadialSelectionTool.selectAll:
-          _editor.setTool(BoardTool.selectRectangle);
-          _editor.selectAll();
+          _setParticipantTool(participant, BoardTool.selectRectangle);
+          participantEditor.selectAll();
       }
     },
-    onPageSelected: _editor.goToPage,
-    onTemplateSelected: _useRadialTemplate,
-    onShapeRequested: (shape) => _editor.armShape(_shapeKind(shape)),
+    onPageSelected: participantEditor.goToPage,
+    onTemplateSelected: (entry) =>
+        _useRadialTemplate(entry, editor: participantEditor),
+    onShapeRequested: (shape) =>
+        _armParticipantShape(participant, _shapeKind(shape)),
     onImageRequested: (source) => unawaited(
-      source == RadialImageSource.device ? _pickImage() : _searchImage(),
+      source == RadialImageSource.device
+          ? _pickImage(participant: participant)
+          : _searchImage(participant: participant),
     ),
-    onTableRequested: (size) => unawaited(_configureAndInsertTable(size)),
-    onPdfRequested: (_) => unawaited(_pickPdf()),
-    onCoverRequested: (direction) => _editor.addCover(
-      direction: direction == RadialCoverDirection.horizontal
-          ? RevealDirection.leftToRight
-          : RevealDirection.topToBottom,
+    onTableRequested: (size) => unawaited(
+      _configureAndInsertTable(
+        size,
+        at: _participantInsertOrigin(participant),
+        participant: participant,
+        editor: participantEditor,
+        radial: radial,
+      ),
     ),
+    onPdfRequested: (_) => unawaited(
+      _pickPdf(participant: participant, editor: participantEditor),
+    ),
+    onCoverRequested: (direction) {
+      participantEditor.addCover(
+        at: _participantInsertOrigin(participant),
+        direction: direction == RadialCoverDirection.horizontal
+            ? RevealDirection.leftToRight
+            : RevealDirection.topToBottom,
+      );
+      participant.setTool(BoardTool.selectRectangle);
+    },
     onExportRequested: (action) => unawaited(switch (action) {
       RadialExportAction.savePdf => _savePdf(),
       RadialExportAction.shareLocal => _sharePdf(),
@@ -370,8 +663,164 @@ class _EditorScreenState extends State<EditorScreen>
     return selected;
   }
 
+  bool _isPrimaryParticipant(BoardParticipantController participant) =>
+      identical(participant, _primaryParticipant);
+
+  EditorController _editorFor(BoardParticipantController participant) =>
+      _isPrimaryParticipant(participant) ? _editor : _secondaryEditor;
+
+  void _setParticipantTool(
+    BoardParticipantController participant,
+    BoardTool tool,
+  ) {
+    _editorFor(participant).setTool(tool);
+    participant.setTool(tool);
+  }
+
+  void _updateParticipantPen(
+    BoardParticipantController participant, {
+    required int colorArgb,
+    required double width,
+    required InkToolType type,
+  }) {
+    _editorFor(
+      participant,
+    ).updatePen(colorArgb: colorArgb, width: width, type: type);
+    participant.updatePen(colorArgb: colorArgb, width: width, type: type);
+  }
+
+  void _updateParticipantDrawingSettings(
+    BoardParticipantController participant,
+    RadialPenSettings settings,
+  ) {
+    final inkType = _inkType(settings.type);
+    if (inkType == null) {
+      _editorFor(participant)
+        ..updatePen(width: settings.thickness)
+        ..setTool(BoardTool.eraser);
+      participant.updateEraserWidth(settings.thickness);
+      return;
+    }
+    _updateParticipantPen(
+      participant,
+      colorArgb: settings.color.toARGB32(),
+      width: settings.thickness,
+      type: inkType,
+    );
+  }
+
+  void _armParticipantShape(
+    BoardParticipantController participant,
+    ShapeKind shape,
+  ) {
+    _editorFor(participant).armShape(shape);
+    participant.armShape(shape);
+  }
+
+  void _resumeParticipantAfterShape(BoardParticipantController participant) {
+    if (participant.tool != BoardTool.shape) return;
+    _editorFor(participant).resumeConfiguredInkTool();
+    final style = participant.penStyle;
+    participant.updatePen(
+      colorArgb: style.colorArgb,
+      width: style.width,
+      type: style.type,
+    );
+  }
+
+  Offset _participantInsertOrigin(BoardParticipantController participant) {
+    final isSplit = _participantMode == EditorParticipantMode.twoPeople;
+    final regionWidth = isSplit
+        ? math.max(1.0, (_layoutSize.width - 3) / 2)
+        : math.max(1.0, _layoutSize.width);
+    final regionHeight = math.max(1.0, _layoutSize.height);
+    final regionCenterX = isSplit && !_isPrimaryParticipant(participant)
+        ? regionWidth * 1.5 + 3
+        : regionWidth / 2;
+    return _editorFor(
+      participant,
+    ).viewport.screenToWorld(Offset(regionCenterX, regionHeight / 2));
+  }
+
+  void _setParticipantMode(EditorParticipantMode mode) {
+    if (_participantMode == mode) return;
+    DiagnosticLogService.instance.info(
+      'editor.participant_mode_changed',
+      fields: {'mode': mode.name},
+    );
+    _radial
+      ..setBranch(null)
+      ..setOpen(false);
+    _secondaryRadial
+      ..setBranch(null)
+      ..setOpen(false);
+    _radialPageGestureActive.value = false;
+    _secondaryRadialPageGestureActive.value = false;
+
+    if (mode == EditorParticipantMode.twoPeople) {
+      _secondaryEditor.synchronizeParticipantViewFrom(_editor);
+      _primaryParticipant.synchronize(
+        tool: _editor.tool,
+        activeShape: _editor.activeShape,
+        penStyle: _editor.penStyle,
+      );
+      if (!_secondaryParticipantInitialized) {
+        _secondaryParticipant.synchronize(
+          tool: _primaryParticipant.tool,
+          activeShape: _primaryParticipant.activeShape,
+          penStyle: _primaryParticipant.penStyle,
+        );
+        _secondaryEditor.updatePen(
+          colorArgb: _primaryParticipant.penStyle.colorArgb,
+          width: _primaryParticipant.penStyle.width,
+          type: _primaryParticipant.penStyle.type,
+        );
+        if (_primaryParticipant.tool == BoardTool.shape) {
+          _secondaryEditor.armShape(_primaryParticipant.activeShape);
+        } else {
+          _secondaryEditor.setTool(_primaryParticipant.tool);
+        }
+        _secondaryRadial.setPenSettings(
+          RadialPenSettings(
+            color: Color(_secondaryParticipant.penStyle.colorArgb),
+            thickness: _secondaryParticipant.penStyle.width,
+            type: _secondaryParticipant.tool == BoardTool.eraser
+                ? RadialPenType.eraser
+                : _radialType(_secondaryParticipant.penStyle.type),
+          ),
+        );
+        _secondaryParticipantInitialized = true;
+      }
+    } else {
+      // Right-side insertions legitimately update the shared controller's
+      // transient tool so their new object can be resized. When the split is
+      // removed, restore the left/primary participant's tool before the solo
+      // surface starts listening again; otherwise the first pen-down can
+      // clear a selection and immediately synchronize back to the stale
+      // right-side tool.
+      if (_primaryParticipant.tool == BoardTool.shape) {
+        _editor.armShape(_primaryParticipant.activeShape);
+      } else {
+        _editor.setTool(_primaryParticipant.tool);
+      }
+    }
+
+    setState(() {
+      _participantMode = mode;
+      _radialPositionResetToken++;
+      _secondaryRadialPositionResetToken++;
+    });
+  }
+
   void _onEditorChanged() {
     if (!mounted) return;
+    if (_participantMode == EditorParticipantMode.onePerson) {
+      _primaryParticipant.synchronize(
+        tool: _editor.tool,
+        activeShape: _editor.activeShape,
+        penStyle: _editor.penStyle,
+      );
+    }
     final thumbnailIdentity = Object.hashAll(
       _editor.document.pages.map(identityHashCode),
     );
@@ -379,6 +828,11 @@ class _EditorScreenState extends State<EditorScreen>
       _lastThumbnailIdentity = thumbnailIdentity;
       _scheduleThumbnailRefresh();
     }
+    setState(() {});
+  }
+
+  void _onSecondaryEditorChanged() {
+    if (!mounted) return;
     setState(() {});
   }
 
@@ -394,7 +848,12 @@ class _EditorScreenState extends State<EditorScreen>
   }
 
   void _resetRadialMenuPosition() {
-    setState(() => _radialPositionResetToken++);
+    setState(() {
+      _radialPositionResetToken++;
+      if (_participantMode == EditorParticipantMode.twoPeople) {
+        _secondaryRadialPositionResetToken++;
+      }
+    });
   }
 
   void _scheduleThumbnailRefresh() {
@@ -588,7 +1047,11 @@ class _EditorScreenState extends State<EditorScreen>
     }
   }
 
-  void _useRadialTemplate(RadialTemplateEntry entry) {
+  void _useRadialTemplate(
+    RadialTemplateEntry entry, {
+    EditorController? editor,
+  }) {
+    final targetEditor = editor ?? _editor;
     if (entry.source == RadialTemplateSource.builtIn) {
       TemplateKind? selected;
       for (final kind in TemplateKind.values) {
@@ -601,12 +1064,12 @@ class _EditorScreenState extends State<EditorScreen>
         _showError('Die gewählte Vorlage ist nicht mehr verfügbar.');
         return;
       }
-      _editor.addTemplate(selected);
+      targetEditor.addTemplate(selected);
       return;
     }
 
     if (entry.id == 'user-library') {
-      unawaited(_showUserTemplateLibrary());
+      unawaited(_showUserTemplateLibrary(editor: targetEditor));
       return;
     }
 
@@ -625,10 +1088,10 @@ class _EditorScreenState extends State<EditorScreen>
       unawaited(_reloadUserTemplates());
       return;
     }
-    unawaited(_insertUserTemplate(selected));
+    unawaited(_insertUserTemplate(selected, editor: targetEditor));
   }
 
-  Future<void> _showUserTemplateLibrary() async {
+  Future<void> _showUserTemplateLibrary({EditorController? editor}) async {
     await _reloadUserTemplates(reportErrors: true);
     if (!mounted) return;
     final selected = await UserTemplateLibraryDialog.show(
@@ -637,7 +1100,7 @@ class _EditorScreenState extends State<EditorScreen>
       onDelete: _deleteUserTemplate,
     );
     if (selected == null || !mounted) return;
-    await _insertUserTemplate(selected);
+    await _insertUserTemplate(selected, editor: editor);
   }
 
   Future<bool> _deleteUserTemplate(UserTemplate template) async {
@@ -669,7 +1132,10 @@ class _EditorScreenState extends State<EditorScreen>
     return deleted;
   }
 
-  Future<void> _insertUserTemplate(UserTemplate template) async {
+  Future<void> _insertUserTemplate(
+    UserTemplate template, {
+    EditorController? editor,
+  }) async {
     if (!mounted) return;
     if (_templateMutationRunning) {
       _showError('Eine Vorlage wird bereits verarbeitet.');
@@ -685,7 +1151,7 @@ class _EditorScreenState extends State<EditorScreen>
     Object? failure;
     try {
       final store = await _templateStore();
-      await _editor.addUserTemplate(store, template);
+      await (editor ?? _editor).addUserTemplate(store, template);
     } catch (error) {
       failure = error;
     }
@@ -765,12 +1231,17 @@ class _EditorScreenState extends State<EditorScreen>
     }
   }
 
-  void _addPageAndShowWheel() {
-    final previousCount = _editor.document.pages.length;
-    _editor.addPage();
-    if (_editor.document.pages.length == previousCount) return;
-    _radial.setOpen(true);
-    _radial.setBranch(RadialMenuBranch.pages);
+  void _addPageAndShowWheel({
+    RadialMenuController? source,
+    EditorController? editor,
+  }) {
+    final targetEditor = editor ?? _editor;
+    final previousCount = targetEditor.document.pages.length;
+    targetEditor.addPage();
+    if (targetEditor.document.pages.length == previousCount) return;
+    final radial = source ?? _radial;
+    radial.setOpen(true);
+    radial.setBranch(RadialMenuBranch.pages);
   }
 
   Future<void> _showPagesSheet() async {
@@ -808,7 +1279,14 @@ class _EditorScreenState extends State<EditorScreen>
     }
   }
 
-  void _showEmptyMenu(Offset screen, Offset world) {
+  void _showEmptyMenu(
+    Offset screen,
+    Offset world, {
+    EditorController? editor,
+    BoardParticipantController? participant,
+  }) {
+    final targetEditor = editor ?? _editor;
+    final targetParticipant = participant ?? _primaryParticipant;
     showMenu<String>(
       context: context,
       position: RelativeRect.fromLTRB(
@@ -818,7 +1296,7 @@ class _EditorScreenState extends State<EditorScreen>
         screen.dy,
       ),
       items: [
-        if (_editor.canPaste)
+        if (targetEditor.canPaste)
           const PopupMenuItem(
             value: 'paste',
             child: ListTile(
@@ -850,14 +1328,27 @@ class _EditorScreenState extends State<EditorScreen>
       ],
     ).then((value) {
       if (!mounted) return;
-      if (value == 'clearAll') _confirmClear(handwritingOnly: false);
-      if (value == 'clearInk') _confirmClear(handwritingOnly: true);
-      if (value == 'insert') _showQuickInsert(world);
-      if (value == 'paste') _editor.pasteAt(world);
+      if (value == 'clearAll') {
+        _confirmClear(handwritingOnly: false, editor: targetEditor);
+      }
+      if (value == 'clearInk') {
+        _confirmClear(handwritingOnly: true, editor: targetEditor);
+      }
+      if (value == 'insert') {
+        _showQuickInsert(
+          world,
+          editor: targetEditor,
+          participant: targetParticipant,
+        );
+      }
+      if (value == 'paste') targetEditor.pasteAt(world);
     });
   }
 
-  Future<void> _confirmClear({required bool handwritingOnly}) async {
+  Future<void> _confirmClear({
+    required bool handwritingOnly,
+    EditorController? editor,
+  }) async {
     final confirmed =
         await showDialog<bool>(
           context: context,
@@ -884,11 +1375,17 @@ class _EditorScreenState extends State<EditorScreen>
         ) ??
         false;
     if (confirmed && mounted) {
-      _editor.clearPage(handwritingOnly: handwritingOnly);
+      (editor ?? _editor).clearPage(handwritingOnly: handwritingOnly);
     }
   }
 
-  Future<void> _showQuickInsert(Offset world) async {
+  Future<void> _showQuickInsert(
+    Offset world, {
+    EditorController? editor,
+    BoardParticipantController? participant,
+  }) async {
+    final targetEditor = editor ?? _editor;
+    final targetParticipant = participant ?? _primaryParticipant;
     final action = await showModalBottomSheet<String>(
       context: context,
       showDragHandle: true,
@@ -914,26 +1411,36 @@ class _EditorScreenState extends State<EditorScreen>
     if (!mounted) return;
     switch (action) {
       case 'shape':
-        _editor.addShape(
+        targetEditor.addShape(
           ShapeKind.rectangle,
           Rect.fromLTWH(world.dx, world.dy, 420, 260),
         );
+        targetParticipant.setTool(BoardTool.selectRectangle);
       case 'image':
-        await _pickImage();
+        await _pickImage(participant: targetParticipant);
       case 'table':
-        await _configureAndInsertTable(const RadialTableSize(3, 4), at: world);
+        await _configureAndInsertTable(
+          const RadialTableSize(3, 4),
+          at: world,
+          participant: targetParticipant,
+          editor: targetEditor,
+        );
       case 'pdf':
-        await _pickPdf();
+        await _pickPdf(participant: targetParticipant, editor: targetEditor);
       case 'cover':
-        _editor.addCover(at: world);
+        targetEditor.addCover(at: world);
+        targetParticipant.setTool(BoardTool.selectRectangle);
       case null:
         break;
     }
   }
 
-  Future<void> _pickImage() async {
+  Future<void> _pickImage({BoardParticipantController? participant}) async {
+    final targetParticipant = participant ?? _primaryParticipant;
+    final targetEditor = _editorFor(targetParticipant);
+    final insertionOrigin = _participantInsertOrigin(targetParticipant);
     try {
-      _editor.resumeConfiguredInkTool();
+      _resumeParticipantAfterShape(targetParticipant);
       final picked = await FilePicker.pickFiles(
         dialogTitle: 'Bild einfügen',
         type: FileType.custom,
@@ -961,16 +1468,20 @@ class _EditorScreenState extends State<EditorScreen>
         '.heic' => 'image/heic',
         _ => 'image/jpeg',
       };
-      await _editor.importImage(path, mimeType: mime);
+      await targetEditor.importImage(path, mimeType: mime, at: insertionOrigin);
+      targetParticipant.setTool(BoardTool.selectRectangle);
     } catch (error) {
       if (mounted) _showError('Bild konnte nicht eingefügt werden: $error');
     }
   }
 
-  Future<void> _searchImage() async {
+  Future<void> _searchImage({BoardParticipantController? participant}) async {
+    final targetParticipant = participant ?? _primaryParticipant;
+    final targetEditor = _editorFor(targetParticipant);
+    final insertionOrigin = _participantInsertOrigin(targetParticipant);
     final service = WebImageSearchService();
     try {
-      _editor.resumeConfiguredInkTool();
+      _resumeParticipantAfterShape(targetParticipant);
       final result = await showDialog<ImageSearchResult>(
         context: context,
         builder: (context) => GoogleImageBrowserDialog(service: service),
@@ -989,11 +1500,13 @@ class _EditorScreenState extends State<EditorScreen>
         'image/bmp' => '.bmp',
         _ => '.jpg',
       };
-      await _editor.importImageBytes(
+      await targetEditor.importImageBytes(
         bytes,
         fileName: 'google-image$extension',
         mimeType: mimeType,
+        at: insertionOrigin,
       );
+      targetParticipant.setTool(BoardTool.selectRectangle);
     } catch (error) {
       if (mounted) _showError('Web-Bild konnte nicht eingefügt werden: $error');
     } finally {
@@ -1004,26 +1517,42 @@ class _EditorScreenState extends State<EditorScreen>
   Future<void> _configureAndInsertTable(
     RadialTableSize initialSize, {
     Offset? at,
+    BoardParticipantController? participant,
+    EditorController? editor,
+    RadialMenuController? radial,
   }) async {
+    final targetParticipant = participant ?? _primaryParticipant;
+    final targetEditor = editor ?? _editorFor(targetParticipant);
     if (_insertConfigurationOpen) return;
     _insertConfigurationOpen = true;
     try {
       // Opening Insert arms the rectangle preview by default. A category
       // switch must disarm it immediately, including when this is cancelled.
-      _editor.resumeConfiguredInkTool();
+      _resumeParticipantAfterShape(targetParticipant);
       final selected = await TableInsertDialog.show(
         context,
         initialSize: initialSize,
       );
       if (!mounted || selected == null) return;
-      _radial.setTableSize(selected);
-      _editor.addTable(rows: selected.rows, columns: selected.columns, at: at);
+      (radial ?? _radial).setTableSize(selected);
+      targetEditor.addTable(
+        rows: selected.rows,
+        columns: selected.columns,
+        at: at,
+      );
+      targetParticipant.setTool(BoardTool.selectRectangle);
     } finally {
       _insertConfigurationOpen = false;
     }
   }
 
-  Future<void> _pickPdf() async {
+  Future<void> _pickPdf({
+    BoardParticipantController? participant,
+    EditorController? editor,
+  }) async {
+    final targetParticipant = participant ?? _primaryParticipant;
+    final targetEditor = editor ?? _editorFor(targetParticipant);
+    final insertionOrigin = _participantInsertOrigin(targetParticipant);
     if (_pdfImportCoordinator.isRunning) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -1035,7 +1564,7 @@ class _EditorScreenState extends State<EditorScreen>
       return;
     }
     try {
-      _editor.resumeConfiguredInkTool();
+      _resumeParticipantAfterShape(targetParticipant);
       await _pdfImportCoordinator.run<
         _OpenedPdfPreview,
         PdfImportSelection,
@@ -1083,12 +1612,14 @@ class _EditorScreenState extends State<EditorScreen>
           };
           // The coordinator has disposed the preview before this copy starts.
           // That avoids intermittent source-file locking on Windows.
-          await _editor.importPdf(
+          await targetEditor.importPdf(
             preview.path,
             mode: mode,
             placement: selection.placement,
             pageIndices: selection.pageIndices,
+            at: insertionOrigin,
           );
+          targetParticipant.setTool(BoardTool.selectRectangle);
         },
       );
     } catch (error) {
@@ -1284,6 +1815,44 @@ class _EditorScreenState extends State<EditorScreen>
     }
   }
 
+  Future<void> _shareDiagnosticLog() async {
+    try {
+      final directory = await getTemporaryDirectory();
+      final file = await DiagnosticLogService.instance.createExportCopy(
+        directory,
+      );
+      if (!mounted) return;
+      if (file == null) {
+        _showError('Es ist noch kein Diagnoseprotokoll verfügbar.');
+        return;
+      }
+      DiagnosticLogService.instance.info('diagnostics.export_requested');
+      await SharePlus.instance.share(
+        ShareParams(
+          files: <XFile>[XFile(file.path, mimeType: 'application/x-ndjson')],
+          title: 'Flowboard-X-Diagnoseprotokoll',
+          subject: 'Flowboard-X-Diagnoseprotokoll',
+          sharePositionOrigin: _shareOrigin(),
+        ),
+      );
+    } catch (error, stack) {
+      DiagnosticLogService.instance.recordException(
+        event: 'diagnostics.export_failed',
+        error: error,
+        stackTrace: stack,
+      );
+      if (mounted) {
+        _showError('Das Diagnoseprotokoll konnte nicht geteilt werden.');
+      }
+    }
+  }
+
+  Rect? _shareOrigin() {
+    final renderObject = context.findRenderObject();
+    if (renderObject is! RenderBox || !renderObject.hasSize) return null;
+    return renderObject.localToGlobal(Offset.zero) & renderObject.size;
+  }
+
   void _showError(String message) {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text(message), backgroundColor: FlowboardColors.danger),
@@ -1302,11 +1871,12 @@ class _EditorScreenState extends State<EditorScreen>
     InkToolType.straightLine => RadialPenType.straight,
   };
 
-  static InkToolType _inkType(RadialPenType type) => switch (type) {
+  static InkToolType? _inkType(RadialPenType type) => switch (type) {
     RadialPenType.normal => InkToolType.normal,
     RadialPenType.marker => InkToolType.marker,
     RadialPenType.dashed => InkToolType.dashed,
     RadialPenType.straight => InkToolType.straightLine,
+    RadialPenType.eraser => null,
   };
 
   static ShapeKind _shapeKind(RadialShapeKind kind) => switch (kind) {
@@ -1328,6 +1898,12 @@ class _EditorTopBar extends StatelessWidget {
     required this.onSaveCurrentPageAsTemplate,
     required this.onResetMenuPosition,
     required this.onHelp,
+    required this.participantMode,
+    required this.onParticipantModeChanged,
+    required this.fingerDrawingEnabled,
+    required this.onFingerDrawingChanged,
+    required this.countdownTimer,
+    required this.onShowLargeTimer,
     required this.onToggleCollapsed,
   });
 
@@ -1340,11 +1916,24 @@ class _EditorTopBar extends StatelessWidget {
   final VoidCallback onSaveCurrentPageAsTemplate;
   final VoidCallback onResetMenuPosition;
   final VoidCallback onHelp;
+  final EditorParticipantMode participantMode;
+  final ValueChanged<EditorParticipantMode> onParticipantModeChanged;
+  final bool fingerDrawingEnabled;
+  final ValueChanged<bool> onFingerDrawingChanged;
+  final CountdownTimerController countdownTimer;
+  final VoidCallback onShowLargeTimer;
   final VoidCallback onToggleCollapsed;
 
   @override
   Widget build(BuildContext context) {
-    final showResetLabel = MediaQuery.sizeOf(context).width >= 1100;
+    final textScaler = MediaQuery.textScalerOf(context);
+    final compactSystemText = textScaler.scale(14) <= 18;
+    final showResetLabel = width >= 1450 && compactSystemText;
+    final showAuxiliaryActions = width >= 760;
+    final showTitle = width >= 620;
+    final showInteractionControls = width >= 620;
+    final showHistoryActions = width >= 430;
+    final showPageCounter = width >= 820 && compactSystemText;
     return AnimatedContainer(
       duration: const Duration(milliseconds: 190),
       curve: Curves.easeOutCubic,
@@ -1380,73 +1969,243 @@ class _EditorTopBar extends StatelessWidget {
                     icon: const Icon(Icons.arrow_back_rounded),
                   ),
                   const FlowboardMark(size: 36),
-                  const SizedBox(width: 12),
-                  Flexible(
-                    child: InkWell(
-                      borderRadius: BorderRadius.circular(10),
-                      onTap: onRename,
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 8,
-                          vertical: 6,
-                        ),
-                        child: Text(
-                          controller.document.title,
-                          overflow: TextOverflow.ellipsis,
-                          style: Theme.of(context).textTheme.titleLarge,
+                  if (showTitle) ...[
+                    const SizedBox(width: 12),
+                    Flexible(
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(10),
+                        onTap: onRename,
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 6,
+                          ),
+                          child: Text(
+                            controller.document.title,
+                            overflow: TextOverflow.ellipsis,
+                            style: Theme.of(context).textTheme.titleLarge,
+                          ),
                         ),
                       ),
                     ),
-                  ),
-                  const SizedBox(width: 12),
-                  if (onPages != null)
+                    const SizedBox(width: 12),
+                  ] else
+                    const SizedBox(width: 8),
+                  if (showInteractionControls) ...[
+                    ParticipantModeToggle(
+                      mode: participantMode,
+                      onChanged: onParticipantModeChanged,
+                    ),
+                    const SizedBox(width: 4),
+                    IconButton(
+                      key: const ValueKey('finger-drawing-toggle'),
+                      tooltip: fingerDrawingEnabled
+                          ? 'Schreiben mit Finger ausschalten'
+                          : 'Schreiben mit Finger einschalten',
+                      onPressed: () =>
+                          onFingerDrawingChanged(!fingerDrawingEnabled),
+                      isSelected: fingerDrawingEnabled,
+                      selectedIcon: const Icon(
+                        Icons.fingerprint_rounded,
+                        color: FlowboardColors.mint,
+                      ),
+                      icon: const Icon(Icons.fingerprint_rounded),
+                    ),
+                    CountdownTimerToolbarButton(
+                      controller: countdownTimer,
+                      onShowLarge: onShowLargeTimer,
+                      showLabel: showResetLabel,
+                    ),
+                  ],
+                  if (showAuxiliaryActions && onPages != null)
                     IconButton(
                       tooltip: 'Seiten',
                       onPressed: onPages,
                       icon: const Icon(Icons.view_carousel_outlined),
                     ),
-                  IconButton(
-                    tooltip: 'Aktuelle Seite als Vorlage speichern',
-                    onPressed: onSaveCurrentPageAsTemplate,
-                    icon: const Icon(Icons.bookmark_add_outlined),
-                  ),
-                  if (showResetLabel)
-                    TextButton.icon(
-                      onPressed: onResetMenuPosition,
-                      icon: const Icon(Icons.center_focus_strong_rounded),
-                      label: const Text('Menüposition zurücksetzen'),
-                    )
-                  else
+                  if (showAuxiliaryActions) ...[
                     IconButton(
-                      tooltip: 'Menüposition zurücksetzen',
-                      onPressed: onResetMenuPosition,
-                      icon: const Icon(Icons.center_focus_strong_rounded),
+                      tooltip: 'Aktuelle Seite als Vorlage speichern',
+                      onPressed: onSaveCurrentPageAsTemplate,
+                      icon: const Icon(Icons.bookmark_add_outlined),
                     ),
-                  IconButton(
-                    tooltip: 'Bedienhilfe',
-                    onPressed: onHelp,
-                    icon: const Icon(Icons.help_outline_rounded),
-                  ),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 12),
-                    child: Text(
-                      '${controller.document.currentPageIndex + 1} / ${controller.document.pages.length}',
-                      style: const TextStyle(
-                        color: FlowboardColors.textSecondary,
-                        fontWeight: FontWeight.w600,
+                    if (showResetLabel)
+                      TextButton.icon(
+                        onPressed: onResetMenuPosition,
+                        icon: const Icon(Icons.center_focus_strong_rounded),
+                        label: const Text('Menüposition zurücksetzen'),
+                      )
+                    else
+                      IconButton(
+                        tooltip: 'Menüposition zurücksetzen',
+                        onPressed: onResetMenuPosition,
+                        icon: const Icon(Icons.center_focus_strong_rounded),
+                      ),
+                    IconButton(
+                      tooltip: 'Bedienhilfe',
+                      onPressed: onHelp,
+                      icon: const Icon(Icons.help_outline_rounded),
+                    ),
+                  ] else
+                    PopupMenuButton<_EditorTopBarAction>(
+                      tooltip: 'Weitere Aktionen',
+                      icon: const Icon(Icons.more_vert_rounded),
+                      onSelected: (action) {
+                        switch (action) {
+                          case _EditorTopBarAction.pages:
+                            onPages?.call();
+                          case _EditorTopBarAction.saveTemplate:
+                            onSaveCurrentPageAsTemplate();
+                          case _EditorTopBarAction.resetMenu:
+                            onResetMenuPosition();
+                          case _EditorTopBarAction.help:
+                            onHelp();
+                          case _EditorTopBarAction.undo:
+                            controller.undo();
+                          case _EditorTopBarAction.redo:
+                            controller.redo();
+                          case _EditorTopBarAction.toggleParticipantMode:
+                            onParticipantModeChanged(
+                              participantMode == EditorParticipantMode.onePerson
+                                  ? EditorParticipantMode.twoPeople
+                                  : EditorParticipantMode.onePerson,
+                            );
+                          case _EditorTopBarAction.toggleFingerDrawing:
+                            onFingerDrawingChanged(!fingerDrawingEnabled);
+                          case _EditorTopBarAction.timer:
+                            showCountdownTimerSetup(
+                              context,
+                              controller: countdownTimer,
+                              onShowLarge: onShowLargeTimer,
+                            );
+                        }
+                      },
+                      itemBuilder: (_) => <PopupMenuEntry<_EditorTopBarAction>>[
+                        if (!showInteractionControls) ...[
+                          PopupMenuItem(
+                            value: _EditorTopBarAction.toggleParticipantMode,
+                            child: ListTile(
+                              leading: Icon(
+                                participantMode ==
+                                        EditorParticipantMode.onePerson
+                                    ? Icons.people_alt_rounded
+                                    : Icons.person_rounded,
+                              ),
+                              title: Text(
+                                participantMode ==
+                                        EditorParticipantMode.onePerson
+                                    ? 'Zwei-Personen-Modus'
+                                    : 'Ein-Personen-Modus',
+                              ),
+                            ),
+                          ),
+                          PopupMenuItem(
+                            value: _EditorTopBarAction.toggleFingerDrawing,
+                            child: ListTile(
+                              leading: Icon(
+                                Icons.fingerprint_rounded,
+                                color: fingerDrawingEnabled
+                                    ? FlowboardColors.mint
+                                    : null,
+                              ),
+                              title: Text(
+                                fingerDrawingEnabled
+                                    ? 'Finger-Schreiben ausschalten'
+                                    : 'Finger-Schreiben einschalten',
+                              ),
+                            ),
+                          ),
+                          PopupMenuItem(
+                            value: _EditorTopBarAction.timer,
+                            child: ListTile(
+                              leading: Icon(
+                                countdownTimer.isRunning
+                                    ? Icons.timer_rounded
+                                    : Icons.timer_outlined,
+                              ),
+                              title: const Text('Timer'),
+                              subtitle:
+                                  countdownTimer.status ==
+                                      CountdownTimerStatus.idle
+                                  ? const Text('Zeit einstellen')
+                                  : Text(
+                                      formatCountdown(countdownTimer.remaining),
+                                    ),
+                            ),
+                          ),
+                        ],
+                        if (onPages != null)
+                          const PopupMenuItem(
+                            value: _EditorTopBarAction.pages,
+                            child: ListTile(
+                              leading: Icon(Icons.view_carousel_outlined),
+                              title: Text('Seiten'),
+                            ),
+                          ),
+                        const PopupMenuItem(
+                          value: _EditorTopBarAction.saveTemplate,
+                          child: ListTile(
+                            leading: Icon(Icons.bookmark_add_outlined),
+                            title: Text('Seite als Vorlage speichern'),
+                          ),
+                        ),
+                        const PopupMenuItem(
+                          value: _EditorTopBarAction.resetMenu,
+                          child: ListTile(
+                            leading: Icon(Icons.center_focus_strong_rounded),
+                            title: Text('Menüposition zurücksetzen'),
+                          ),
+                        ),
+                        const PopupMenuItem(
+                          value: _EditorTopBarAction.help,
+                          child: ListTile(
+                            leading: Icon(Icons.help_outline_rounded),
+                            title: Text('Bedienhilfe'),
+                          ),
+                        ),
+                        if (!showHistoryActions) ...[
+                          PopupMenuItem(
+                            value: _EditorTopBarAction.undo,
+                            enabled: controller.canUndo,
+                            child: const ListTile(
+                              leading: Icon(Icons.undo_rounded),
+                              title: Text('Rückgängig'),
+                            ),
+                          ),
+                          PopupMenuItem(
+                            value: _EditorTopBarAction.redo,
+                            enabled: controller.canRedo,
+                            child: const ListTile(
+                              leading: Icon(Icons.redo_rounded),
+                              title: Text('Wiederholen'),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  if (showPageCounter)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      child: Text(
+                        '${controller.document.currentPageIndex + 1} / ${controller.document.pages.length}',
+                        style: const TextStyle(
+                          color: FlowboardColors.textSecondary,
+                          fontWeight: FontWeight.w600,
+                        ),
                       ),
                     ),
-                  ),
-                  IconButton(
-                    tooltip: 'Undo',
-                    onPressed: controller.canUndo ? controller.undo : null,
-                    icon: const Icon(Icons.undo_rounded),
-                  ),
-                  IconButton(
-                    tooltip: 'Redo',
-                    onPressed: controller.canRedo ? controller.redo : null,
-                    icon: const Icon(Icons.redo_rounded),
-                  ),
+                  if (showHistoryActions) ...[
+                    IconButton(
+                      tooltip: 'Undo',
+                      onPressed: controller.canUndo ? controller.undo : null,
+                      icon: const Icon(Icons.undo_rounded),
+                    ),
+                    IconButton(
+                      tooltip: 'Redo',
+                      onPressed: controller.canRedo ? controller.redo : null,
+                      icon: const Icon(Icons.redo_rounded),
+                    ),
+                  ],
                   IconButton(
                     tooltip: 'Leiste einklappen',
                     onPressed: onToggleCollapsed,
@@ -1458,6 +2217,18 @@ class _EditorTopBar extends StatelessWidget {
       ),
     );
   }
+}
+
+enum _EditorTopBarAction {
+  pages,
+  saveTemplate,
+  resetMenu,
+  help,
+  undo,
+  redo,
+  toggleParticipantMode,
+  toggleFingerDrawing,
+  timer,
 }
 
 /// Owns the page tray's scroll controller for the complete route lifetime.

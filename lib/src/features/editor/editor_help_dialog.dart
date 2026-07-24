@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../../app/app_theme.dart';
@@ -5,11 +7,17 @@ import '../../app/app_theme.dart';
 /// Central, scrollable in-app guide. Kept as a reusable component so the
 /// top-bar info button and future first-run onboarding show identical help.
 class FlowboardHelpDialog extends StatelessWidget {
-  const FlowboardHelpDialog({super.key});
+  const FlowboardHelpDialog({this.onExportDiagnostics, super.key});
 
-  static Future<void> show(BuildContext context) => showDialog<void>(
+  final Future<void> Function()? onExportDiagnostics;
+
+  static Future<void> show(
+    BuildContext context, {
+    Future<void> Function()? onExportDiagnostics,
+  }) => showDialog<void>(
     context: context,
-    builder: (_) => const FlowboardHelpDialog(),
+    builder: (_) =>
+        FlowboardHelpDialog(onExportDiagnostics: onExportDiagnostics),
   );
 
   @override
@@ -56,9 +64,11 @@ class FlowboardHelpDialog extends StatelessWidget {
                       title: 'Schreiben und navigieren',
                       lines: [
                         'Mit dem Stift schreiben; mehrere Stifte können gleichzeitig arbeiten.',
-                        'Auf leerer Fläche ziehen verschiebt das Board. Mit zwei Fingern zoomen.',
+                        'Finger-Schreiben ist standardmäßig aus: Ein Finger verschiebt dann das Board. Der Finger-Schalter in der Kopfleiste aktiviert das Schreiben mit einem Finger.',
+                        'Zwei Finger übernehmen weiterhin Pan und Zoom, auch wenn Finger-Schreiben aktiv ist.',
                         'Beim Zoomen erscheint rechts unten ein verschiebbarer Navigator. Im roten Rahmen ziehen oder tippen navigiert; ohne Interaktion blendet er sich aus.',
-                        'Handkante oder breiter Kontakt radiert, während Stifte weiter schreiben können.',
+                        'Handkante oder breiter Kontakt radiert nur die überstrichenen Linienabschnitte, während Stifte weiter schreiben können.',
+                        'Der Radiergummi im Stiftfächer radiert mit dem Stift; derselbe Dickenregler bestimmt seine Breite.',
                       ],
                     ),
                     _HelpCard(
@@ -76,8 +86,38 @@ class FlowboardHelpDialog extends StatelessWidget {
                       title: 'Auswählen und gruppieren',
                       lines: [
                         'Rechteck, Lasso oder „Alles auswählen“ verwenden.',
-                        'Am Rahmen verschieben oder am Griff proportional skalieren.',
+                        'Am Rahmen verschieben, am Griff proportional skalieren oder mit zwei Fingern direkt auf der Auswahl per Pinch vergrößern und verkleinern.',
+                        'Der Griff links unten dreht frei. Gedr\u00fcckt halten \u00f6ffnet 30\u00b0, 45\u00b0, 60\u00b0, 90\u00b0, Spiegeln und den manuellen Winkel.',
                         'Gruppen bleiben zusammen, bis „Gruppierung aufheben“ gewählt wird.',
+                      ],
+                    ),
+                    _HelpCard(
+                      icon: Icons.people_alt_rounded,
+                      title: 'Eine oder zwei Personen',
+                      lines: [
+                        'Der Personen-Schalter in der Kopfleiste teilt die Arbeitsfl\u00e4che in zwei unabh\u00e4ngige Bedienseiten.',
+                        'Jede Seite besitzt ein eigenes Radialmen\u00fc, Werkzeug, eine eigene Kamera und eine eigene aktive Seite.',
+                        'Beide Personen schreiben gleichzeitig in dasselbe Dokument; die Mittellinie ordnet Ber\u00fchrungen stabil einer Seite zu. Pan, Zoom und Seitenwechsel wirken nur auf die jeweilige H\u00e4lfte.',
+                        'Beim Zur\u00fcckschalten verschwinden nur Mittellinie und zweites Men\u00fc. Dokumentinhalt und Ebenen bleiben unver\u00e4ndert; die einzelne Ansicht verwendet wieder die linke aktive Seite und Kamera.',
+                      ],
+                    ),
+                    _HelpCard(
+                      icon: Icons.timer_outlined,
+                      title: 'Timer',
+                      lines: [
+                        'Über das Timer-Symbol eine Dauer einstellen, starten, pausieren oder zurücksetzen.',
+                        'Bei null ertönt einmal ein Signal.',
+                        'Die große Anzeige lässt sich verschieben und skalieren. Außerhalb ihres Rechtecks kann ohne Unterbrechung weitergeschrieben werden.',
+                      ],
+                    ),
+                    _HelpCard(
+                      icon: Icons.developer_board_rounded,
+                      title: 'SMART Board MX / iQ',
+                      lines: [
+                        'F\u00e4ngt SMARTs eigene Anmerkungsebene den Stift ab, am Board Einstellungen \u2192 Annotation \u2192 Alle Apps beziehungsweise Installierte Apps \u00f6ffnen.',
+                        'Dort Flowboard X ausw\u00e4hlen und nur dessen Anmerkungsschalter ausschalten. Danach erh\u00e4lt Flowboard X die Stifteingabe direkt.',
+                        'Fehlt die App-Liste, iQ aktualisieren. Bei gesperrten Einstellungen muss ein Administrator die \u00c4nderung freigeben.',
+                        'Bei Betrieb als Windows-App: SMART Ink f\u00fcr Flowboard X \u00fcber \u201eSMART Ink ausschalten \u2192 In dieser Anwendung\u201c deaktivieren.',
                       ],
                     ),
                     _HelpCard(
@@ -85,6 +125,7 @@ class FlowboardHelpDialog extends StatelessWidget {
                       title: 'Handschrift und Text',
                       lines: [
                         'Handschrift auswählen und über „In Text umwandeln“ erkennen lassen.',
+                        'Das lateinische Erkennungsmodell ist in der Android-App gebündelt und benötigt weder einen ersten Download noch eine Internetverbindung.',
                         'Text auswählen und „Text mit Stift korrigieren“ aktivieren.',
                         'Direkt über ein Wort schreiben, um es zu ersetzen; waagerecht durchstreichen löscht es.',
                         'Rechts hinter dem letzten Wort weiterschreiben hängt den erkannten Text an.',
@@ -114,6 +155,21 @@ class FlowboardHelpDialog extends StatelessWidget {
                 ),
               ),
             ),
+            if (onExportDiagnostics != null) ...[
+              const Divider(height: 1),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(24, 12, 24, 16),
+                child: Align(
+                  alignment: Alignment.centerRight,
+                  child: OutlinedButton.icon(
+                    key: const ValueKey('export-diagnostics-button'),
+                    onPressed: () => unawaited(onExportDiagnostics!()),
+                    icon: const Icon(Icons.bug_report_outlined),
+                    label: const Text('Diagnoseprotokoll teilen'),
+                  ),
+                ),
+              ),
+            ],
           ],
         ),
       ),

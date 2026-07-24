@@ -108,6 +108,7 @@ class DocumentPagePreviewPainter extends CustomPainter {
       final transform = object.transform;
       if (layer != null && _validTransform(transform)) {
         canvas.save();
+        _applyObjectOrientation(canvas, transform);
         canvas.translate(transform.x, transform.y);
         final objectSize = Size(transform.width, transform.height);
         final count = math.min(layer.strokes.length, maxPreviewStrokes);
@@ -263,6 +264,8 @@ class DocumentPagePreviewPainter extends CustomPainter {
       transform.width,
       transform.height,
     );
+    canvas.save();
+    _applyObjectOrientation(canvas, transform);
     switch (object) {
       case final ShapeObject shape:
         _paintShape(canvas, rect, shape, scale);
@@ -293,6 +296,24 @@ class DocumentPagePreviewPainter extends CustomPainter {
       case final TextObject text:
         _paintText(canvas, rect, text, scale);
     }
+    canvas.restore();
+  }
+
+  void _applyObjectOrientation(Canvas canvas, ObjectTransform transform) {
+    if (transform.rotationRadians.abs() < .0000001 &&
+        !transform.flipX &&
+        !transform.flipY) {
+      return;
+    }
+    final center = Offset(
+      transform.x + transform.width / 2,
+      transform.y + transform.height / 2,
+    );
+    canvas
+      ..translate(center.dx, center.dy)
+      ..rotate(transform.rotationRadians)
+      ..scale(transform.flipX ? -1 : 1, transform.flipY ? -1 : 1)
+      ..translate(-center.dx, -center.dy);
   }
 
   void _paintShape(Canvas canvas, Rect rect, ShapeObject shape, double scale) {

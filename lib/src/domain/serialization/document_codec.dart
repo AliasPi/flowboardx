@@ -46,7 +46,7 @@ final class DocumentCodec {
 final class DocumentMigrator {
   const DocumentMigrator();
 
-  static const currentVersion = 4;
+  static const currentVersion = 5;
 
   Map<String, Object?> migrate(Map<String, Object?> source) {
     var document = _deepMap(source);
@@ -62,6 +62,7 @@ final class DocumentMigrator {
         1 => _fromV1ToV2(document),
         2 => _fromV2ToV3(document),
         3 => _fromV3ToV4(document),
+        4 => _fromV4ToV5(document),
         _ => throw FormatException(
           'Keine Migration für Dokumentversion $version.',
         ),
@@ -222,6 +223,32 @@ final class DocumentMigrator {
     }
     result['pages'] = pages;
     result['schemaVersion'] = 4;
+    return result;
+  }
+
+  /// Schema 5 makes object orientation persistent. Explicit defaults prevent
+  /// older axis-aligned documents from depending on decoder-side fallbacks and
+  /// make later migrations deterministic.
+  Map<String, Object?> _fromV4ToV5(Map<String, Object?> source) {
+    final result = _deepMap(source);
+    final pages = _mutableList(result['pages']);
+    for (var pageIndex = 0; pageIndex < pages.length; pageIndex++) {
+      final page = _asMutableMap(pages[pageIndex]);
+      final objects = _mutableList(page['objects']);
+      for (var objectIndex = 0; objectIndex < objects.length; objectIndex++) {
+        final object = _asMutableMap(objects[objectIndex]);
+        final transform = _asMutableMap(object['transform']);
+        transform['rotationRadians'] ??= 0;
+        transform['flipX'] ??= false;
+        transform['flipY'] ??= false;
+        object['transform'] = transform;
+        objects[objectIndex] = object;
+      }
+      page['objects'] = objects;
+      pages[pageIndex] = page;
+    }
+    result['pages'] = pages;
+    result['schemaVersion'] = 5;
     return result;
   }
 

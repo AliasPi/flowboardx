@@ -3,6 +3,8 @@ package de.flowboardx.flowboard_x
 import android.app.Activity
 import android.content.Intent
 import android.os.Bundle
+import android.view.MotionEvent
+import android.view.View
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodCall
@@ -14,6 +16,8 @@ class MainActivity : FlutterActivity() {
     private var widgetChannel: MethodChannel? = null
     private var fileSaverChannel: MethodChannel? = null
     private var handwritingRecognitionService: AndroidHandwritingRecognitionService? = null
+    private var palmInputService: AndroidPalmInputService? = null
+    private var smartBoardCompatibilityService: SmartBoardCompatibilityService? = null
     private var pdfQuickShareService: AndroidPdfQuickShareService? = null
     private var pendingWidgetAction: Map<String, Any?>? = null
     private var pendingPdfSave: PendingPdfSave? = null
@@ -64,6 +68,18 @@ class MainActivity : FlutterActivity() {
         handwritingRecognitionService = AndroidHandwritingRecognitionService(
             flutterEngine.dartExecutor.binaryMessenger,
         )
+        palmInputService?.dispose()
+        palmInputService = AndroidPalmInputService(
+            this,
+            flutterEngine.dartExecutor.binaryMessenger,
+        ) {
+            findViewById<View>(FLUTTER_VIEW_ID)
+        }
+        smartBoardCompatibilityService?.dispose()
+        smartBoardCompatibilityService = SmartBoardCompatibilityService(
+            this,
+            flutterEngine.dartExecutor.binaryMessenger,
+        )
         pdfQuickShareService = AndroidPdfQuickShareService(
             this,
             flutterEngine.dartExecutor.binaryMessenger,
@@ -77,6 +93,10 @@ class MainActivity : FlutterActivity() {
         fileSaverChannel = null
         handwritingRecognitionService?.dispose()
         handwritingRecognitionService = null
+        palmInputService?.dispose()
+        palmInputService = null
+        smartBoardCompatibilityService?.dispose()
+        smartBoardCompatibilityService = null
         pdfQuickShareService?.dispose()
         pdfQuickShareService = null
         pendingPdfSave?.result?.error(
@@ -86,6 +106,24 @@ class MainActivity : FlutterActivity() {
         )
         pendingPdfSave = null
         super.cleanUpFlutterEngine(flutterEngine)
+    }
+
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        // Observe before Flutter/Android can transform or cancel the event,
+        // but always preserve the framework's original consumption result.
+        palmInputService?.observe(event)
+        smartBoardCompatibilityService?.observe(event)
+        return super.dispatchTouchEvent(event)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        smartBoardCompatibilityService?.applyDrawingSurfacePolicy()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) smartBoardCompatibilityService?.applyDrawingSurfacePolicy()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -171,7 +209,7 @@ class MainActivity : FlutterActivity() {
             canonical.path == root.path ||
                 canonical.path.startsWith(root.path + File.separator)
         }
-        if (!allowed || canonical == null || !canonical.isFile || canonical.length() <= 0L) {
+        if (!allowed || !canonical.isFile || canonical.length() <= 0L) {
             result.error("invalid_source", "Die temporäre PDF-Datei ist ungültig.", null)
             return
         }

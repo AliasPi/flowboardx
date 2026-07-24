@@ -72,6 +72,9 @@ abstract final class TextObjectLayout {
       y: _finiteOr(y, value.transform.y),
       width: width,
       height: height,
+      rotationRadians: value.transform.rotationRadians,
+      flipX: value.transform.flipX,
+      flipY: value.transform.flipY,
     );
   }
 

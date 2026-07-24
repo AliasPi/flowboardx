@@ -30,12 +30,14 @@ class ActivePenStyle {
 final class ActiveInkSession {
   ActiveInkSession({
     required this.pointer,
+    required this.deviceKind,
     required this.authorId,
     required this.style,
     required this.sampler,
   });
 
   final int pointer;
+  final PointerDeviceKind deviceKind;
   final String authorId;
   final ActivePenStyle style;
   final StrokeSampler sampler;
@@ -56,6 +58,9 @@ class InkSessionManager extends ChangeNotifier {
   UnmodifiableMapView<int, ActiveInkSession> get sessions =>
       UnmodifiableMapView(_sessions);
   bool get isWriting => _sessions.isNotEmpty;
+  bool get hasActiveStylus => _sessions.values.any(
+    (session) => session.deviceKind == PointerDeviceKind.stylus,
+  );
 
   bool begin({
     required PointerDownEvent event,
@@ -70,6 +75,7 @@ class InkSessionManager extends ChangeNotifier {
     final sampler = StrokeSampler()..addEvent(event, worldPosition);
     _sessions[event.pointer] = ActiveInkSession(
       pointer: event.pointer,
+      deviceKind: event.kind,
       authorId: authorId,
       style: style,
       sampler: sampler,

@@ -15,6 +15,111 @@ void main() {
   );
 
   group('CommandHistory', () {
+    test('participant undo and redo preserve interleaved foreign ink', () {
+      final initial = WhiteboardDocument.create(id: 'scoped', now: now);
+      final pageId = initial.currentPage.id;
+      final history = CommandHistory(initial);
+
+      history.execute(
+        AddStrokeCommand(pageId, stroke('left-1', 0), now: now),
+        ownerId: 'left',
+      );
+      history.execute(
+        AddStrokeCommand(pageId, stroke('right-1', 20), now: now),
+        ownerId: 'right',
+      );
+      expect(history.canUndoFor('left'), isTrue);
+      expect(history.canUndoFor('right'), isTrue);
+
+      history.undo(ownerId: 'left');
+      expect(history.document.currentPage.strokes.map((item) => item.id), [
+        'right-1',
+      ]);
+      expect(history.canRedoFor('left'), isTrue);
+      expect(history.canRedoFor('right'), isFalse);
+
+      history.redo(ownerId: 'left');
+      expect(history.document.currentPage.strokes.map((item) => item.id), [
+        'left-1',
+        'right-1',
+      ]);
+
+      history.undo(ownerId: 'right');
+      expect(history.document.currentPage.strokes.map((item) => item.id), [
+        'left-1',
+      ]);
+    });
+
+    test('one participant action does not clear the other redo branch', () {
+      final initial = WhiteboardDocument.create(id: 'redo-scope', now: now);
+      final pageId = initial.currentPage.id;
+      final history = CommandHistory(initial);
+
+      history.execute(
+        AddStrokeCommand(pageId, stroke('left', 0), now: now),
+        ownerId: 'left',
+      );
+      history.undo(ownerId: 'left');
+      history.execute(
+        AddStrokeCommand(pageId, stroke('right', 20), now: now),
+        ownerId: 'right',
+      );
+
+      expect(history.canRedoFor('left'), isTrue);
+      history.redo(ownerId: 'left');
+      expect(history.document.currentPage.strokes.map((item) => item.id), [
+        'left',
+        'right',
+      ]);
+    });
+
+    test('later foreign edits win when both participants touched one item', () {
+      var initial = WhiteboardDocument.create(id: 'shared-item', now: now);
+      final pageId = initial.currentPage.id;
+      initial = AddObjectCommand(
+        pageId,
+        ShapeObject(
+          id: 'shape',
+          transform: const ObjectTransform(x: 0, y: 0, width: 100, height: 80),
+          createdAt: now,
+        ),
+        now: now,
+      ).apply(initial);
+      final history = CommandHistory(initial);
+      history.execute(
+        TransformItemsCommand(
+          pageId,
+          const ['shape'],
+          const TransformDelta(dx: 10),
+          now: now,
+        ),
+        ownerId: 'left',
+      );
+      history.execute(
+        TransformItemsCommand(
+          pageId,
+          const ['shape'],
+          const TransformDelta(dx: 20),
+          now: now,
+        ),
+        ownerId: 'right',
+      );
+      expect(history.document.currentPage.objectById('shape')!.transform.x, 30);
+
+      history.undo(ownerId: 'left');
+
+      expect(
+        history.document.currentPage.objectById('shape')!.transform.x,
+        20,
+        reason:
+            'selective undo removes the left delta but retains the later '
+            'right delta',
+      );
+      expect(history.canUndoFor('right'), isTrue);
+      history.undo(ownerId: 'right');
+      expect(history.document.currentPage.objectById('shape')!.transform.x, 0);
+    });
+
     test('undoes and redoes stroke changes and clears redo branches', () {
       final history = CommandHistory(
         WhiteboardDocument.create(id: 'doc', now: now),

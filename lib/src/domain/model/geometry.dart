@@ -88,16 +88,12 @@ final class Rect2 {
   }
 
   Rect2 transformed(TransformDelta delta) {
-    final first = delta.apply(Vec2(left, top));
-    final second = delta.apply(Vec2(right, bottom));
-    final nextLeft = math.min(first.x, second.x);
-    final nextTop = math.min(first.y, second.y);
-    return Rect2(
-      left: nextLeft,
-      top: nextTop,
-      width: (second.x - first.x).abs(),
-      height: (second.y - first.y).abs(),
-    );
+    return Rect2.fromPoints(<Vec2>[
+      delta.apply(Vec2(left, top)),
+      delta.apply(Vec2(right, top)),
+      delta.apply(Vec2(right, bottom)),
+      delta.apply(Vec2(left, bottom)),
+    ]);
   }
 
   static Rect2 fromPoints(Iterable<Vec2> points) {
@@ -147,29 +143,87 @@ final class Rect2 {
   int get hashCode => Object.hash(left, top, width, height);
 }
 
-/// Object placement in page coordinates. Rotation is deliberately unsupported.
+/// Object placement in page coordinates.
+///
+/// [x], [y], [width] and [height] describe the object's unrotated local frame.
+/// [rotationRadians] is applied around that frame's centre. Keeping the local
+/// frame stable means annotations remain normalized to the object and rotate
+/// with it without destructive point rewrites.
 final class ObjectTransform {
   const ObjectTransform({
     required this.x,
     required this.y,
     required this.width,
     required this.height,
+    this.rotationRadians = 0,
+    this.flipX = false,
+    this.flipY = false,
   });
 
   final double x;
   final double y;
   final double width;
   final double height;
+  final double rotationRadians;
+  final bool flipX;
+  final bool flipY;
 
-  Rect2 get bounds => Rect2(left: x, top: y, width: width, height: height);
+  Rect2 get localFrame => Rect2(left: x, top: y, width: width, height: height);
+
+  Vec2 get center => Vec2(x + width / 2, y + height / 2);
+
+  /// Axis-aligned world bounds enclosing the possibly rotated local frame.
+  Rect2 get bounds {
+    if (rotationRadians.abs() < 0.0000001) return localFrame;
+    return Rect2.fromPoints(<Vec2>[
+      localToWorld(const Vec2(0, 0)),
+      localToWorld(Vec2(width, 0)),
+      localToWorld(Vec2(width, height)),
+      localToWorld(Vec2(0, height)),
+    ]);
+  }
+
+  Vec2 localToWorld(Vec2 point) {
+    final pivot = center;
+    final unrotated = Vec2(
+      x + (flipX ? width - point.x : point.x),
+      y + (flipY ? height - point.y : point.y),
+    );
+    return _rotateAround(unrotated, pivot, rotationRadians);
+  }
+
+  Vec2 worldToLocal(Vec2 point) {
+    final unrotated = _rotateAround(point, center, -rotationRadians);
+    final localX = unrotated.x - x;
+    final localY = unrotated.y - y;
+    return Vec2(
+      flipX ? width - localX : localX,
+      flipY ? height - localY : localY,
+    );
+  }
+
+  bool containsWorld(Vec2 point, {double tolerance = 0}) {
+    final local = worldToLocal(point);
+    return local.x >= -tolerance &&
+        local.x <= width + tolerance &&
+        local.y >= -tolerance &&
+        local.y <= height + tolerance;
+  }
 
   ObjectTransform apply(TransformDelta delta) {
-    final result = bounds.transformed(delta);
+    final nextCenter = delta.apply(center);
+    final nextWidth = math.max(0.001, width * delta.scaleX.abs());
+    final nextHeight = math.max(0.001, height * delta.scaleY.abs());
     return ObjectTransform(
-      x: result.left,
-      y: result.top,
-      width: result.width,
-      height: result.height,
+      x: nextCenter.x - nextWidth / 2,
+      y: nextCenter.y - nextHeight / 2,
+      width: nextWidth,
+      height: nextHeight,
+      rotationRadians: _normalizeRadians(
+        rotationRadians + delta.rotationRadians,
+      ),
+      flipX: delta.scaleX < 0 ? !flipX : flipX,
+      flipY: delta.scaleY < 0 ? !flipY : flipY,
     );
   }
 
@@ -178,6 +232,9 @@ final class ObjectTransform {
     'y': y,
     'width': width,
     'height': height,
+    'rotationRadians': rotationRadians,
+    'flipX': flipX,
+    'flipY': flipY,
   };
 
   factory ObjectTransform.fromJson(Map<String, Object?> json) =>
@@ -186,6 +243,11 @@ final class ObjectTransform {
         y: _finiteDouble(json['y'], 0),
         width: math.max(0.001, _finiteDouble(json['width'], 1)),
         height: math.max(0.001, _finiteDouble(json['height'], 1)),
+        rotationRadians: _normalizeRadians(
+          _finiteDouble(json['rotationRadians'], 0),
+        ),
+        flipX: json['flipX'] == true,
+        flipY: json['flipY'] == true,
       );
 
   @override
@@ -194,13 +256,21 @@ final class ObjectTransform {
       other.x == x &&
       other.y == y &&
       other.width == width &&
-      other.height == height;
+      other.height == height &&
+      other.rotationRadians == rotationRadians &&
+      other.flipX == flipX &&
+      other.flipY == flipY;
 
   @override
-  int get hashCode => Object.hash(x, y, width, height);
+  int get hashCode =>
+      Object.hash(x, y, width, height, rotationRadians, flipX, flipY);
 }
 
-/// A translation and scale around an anchor, suitable for selection transforms.
+/// Translation, scale/mirroring and rotation around an anchor.
+///
+/// This remains a transient/command delta rather than persistent object state;
+/// applying it bakes free ink points while object transforms retain their
+/// angle and flip flags.
 final class TransformDelta {
   const TransformDelta({
     this.dx = 0,
@@ -208,6 +278,8 @@ final class TransformDelta {
     this.scaleX = 1,
     this.scaleY = 1,
     this.anchor = Vec2.zero,
+    this.rotationRadians = 0,
+    this.scaleAxisRadians = 0,
   });
 
   final double dx;
@@ -215,11 +287,19 @@ final class TransformDelta {
   final double scaleX;
   final double scaleY;
   final Vec2 anchor;
+  final double rotationRadians;
+  final double scaleAxisRadians;
 
-  Vec2 apply(Vec2 point) => Vec2(
-    anchor.x + (point.x - anchor.x) * scaleX + dx,
-    anchor.y + (point.y - anchor.y) * scaleY + dy,
-  );
+  Vec2 apply(Vec2 point) {
+    final aligned = _rotateAround(point, anchor, -scaleAxisRadians);
+    final scaled = Vec2(
+      anchor.x + (aligned.x - anchor.x) * scaleX,
+      anchor.y + (aligned.y - anchor.y) * scaleY,
+    );
+    final worldScaled = _rotateAround(scaled, anchor, scaleAxisRadians);
+    final rotated = _rotateAround(worldScaled, anchor, rotationRadians);
+    return Vec2(rotated.x + dx, rotated.y + dy);
+  }
 
   Map<String, Object> toJson() => {
     'dx': dx,
@@ -227,6 +307,9 @@ final class TransformDelta {
     'scaleX': scaleX,
     'scaleY': scaleY,
     'anchor': anchor.toJson(),
+    'rotationRadians': rotationRadians,
+    if (scaleAxisRadians.abs() >= 0.0000001)
+      'scaleAxisRadians': scaleAxisRadians,
   };
 
   factory TransformDelta.fromJson(Map<String, Object?> json) => TransformDelta(
@@ -237,5 +320,25 @@ final class TransformDelta {
     anchor: json['anchor'] is Map
         ? Vec2.fromJson(Map<String, Object?>.from(json['anchor']! as Map))
         : Vec2.zero,
+    rotationRadians: _finiteDouble(json['rotationRadians'], 0),
+    scaleAxisRadians: _finiteDouble(json['scaleAxisRadians'], 0),
   );
+}
+
+Vec2 _rotateAround(Vec2 point, Vec2 center, double radians) {
+  if (radians.abs() < 0.0000001) return point;
+  final cosine = math.cos(radians);
+  final sine = math.sin(radians);
+  final dx = point.x - center.x;
+  final dy = point.y - center.y;
+  return Vec2(
+    center.x + dx * cosine - dy * sine,
+    center.y + dx * sine + dy * cosine,
+  );
+}
+
+double _normalizeRadians(double radians) {
+  if (!radians.isFinite) return 0;
+  final normalized = (radians + math.pi) % (math.pi * 2) - math.pi;
+  return normalized == -math.pi ? math.pi : normalized;
 }

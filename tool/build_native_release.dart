@@ -2,6 +2,8 @@ import 'dart:io';
 
 import 'package:path/path.dart' as p;
 
+import 'android_offline_model_verifier.dart';
+
 /// Builds a native release without pdfrx's web-only PDFium WASM payload.
 ///
 /// The official pdfrx cleanup is always reverted in `finally`, so subsequent
@@ -44,6 +46,9 @@ Future<void> main(List<String> arguments) async {
       '--no-pub',
       ...arguments.skip(1),
     ]);
+    if (target == 'apk' || target == 'appbundle') {
+      await _verifyAndroidOfflineModels(target);
+    }
     final stale = await _nativeWasmArtifacts(target);
     if (stale.isNotEmpty) {
       throw StateError(
@@ -59,6 +64,49 @@ Future<void> main(List<String> arguments) async {
         '--revert',
       ]);
     }
+  }
+}
+
+/// Fails the production build if any emitted Android artifact lost the
+/// statically linked Latin recognition model.
+Future<void> _verifyAndroidOfflineModels(String target) async {
+  final buildRoot = p.normalize(p.absolute('build', 'app', 'outputs'));
+  final outputDirectory = switch (target) {
+    'apk' => Directory(p.join(buildRoot, 'flutter-apk')),
+    'appbundle' => Directory(p.join(buildRoot, 'bundle', 'release')),
+    _ => throw ArgumentError.value(target, 'target'),
+  };
+  if (!p.isWithin(buildRoot, p.normalize(outputDirectory.absolute.path))) {
+    throw StateError(
+      'Unsicherer Android-Ausgabepfad: ${outputDirectory.absolute.path}',
+    );
+  }
+  final extension = target == 'apk' ? '.apk' : '.aab';
+  final artifacts = outputDirectory.existsSync()
+      ? outputDirectory
+            .listSync(followLinks: false)
+            .whereType<File>()
+            .where(
+              (file) =>
+                  p.extension(file.path).toLowerCase() == extension &&
+                  p.basename(file.path).toLowerCase().contains('release'),
+            )
+            .toList(growable: false)
+      : const <File>[];
+  if (artifacts.isEmpty) {
+    throw StateError(
+      'Kein Android-Releaseartefakt zur Modellprüfung gefunden: '
+      '${outputDirectory.path}',
+    );
+  }
+  const verifier = AndroidOfflineModelVerifier();
+  for (final artifact in artifacts) {
+    final report = verifier.verifyArchive(artifact);
+    stdout.writeln(
+      '> Offline-Handschriftmodell geprüft: ${report.artifactName}, '
+      '${report.modelFileCount} Dateien, '
+      '${report.uncompressedModelBytes} Byte',
+    );
   }
 }
 

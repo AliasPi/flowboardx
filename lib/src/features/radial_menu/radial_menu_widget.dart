@@ -3,6 +3,9 @@ import 'dart:math' as math;
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+import '../input/touch_contact_classifier.dart';
 import 'radial_menu_geometry.dart';
 import 'radial_menu_models.dart';
 import 'radial_menu_painter.dart';
@@ -30,6 +33,7 @@ class RadialMenu extends StatefulWidget {
     this.centerLogo,
     this.maxDiameter = 600,
     this.edgePadding = 12,
+    this.confineToBounds = false,
     this.positionResetToken = 0,
     this.canUndo = true,
     this.canRedo = true,
@@ -67,6 +71,15 @@ class RadialMenu extends StatefulWidget {
   final double maxDiameter;
   final double edgePadding;
 
+  /// Clips visible rings to this menu's layout region.
+  ///
+  /// The draggable centre always keeps only its own disc inside the region,
+  /// whether the rings are open or closed. This is important in split mode:
+  /// either participant can place the control at every corner of their half
+  /// while expanded ring pixels are cleanly clipped at the divider or screen
+  /// edge.
+  final bool confineToBounds;
+
   /// Increment this value to move the draggable center to the middle of the
   /// currently visible board without coupling the menu to editor history.
   final int positionResetToken;
@@ -82,6 +95,11 @@ class RadialMenu extends StatefulWidget {
 }
 
 class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
+  static const TouchContactClassifier _touchContactClassifier =
+      TouchContactClassifier();
+  static const double _fiveFingerDetent = math.pi / 10;
+  static const double _fiveFingerDetentHysteresis = .70;
+
   late RadialMenuController _controller;
   late bool _ownsController;
   late final AnimationController _openAnimation;
@@ -91,6 +109,7 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
   late RadialMenuBranch? _lastBranch;
 
   Offset? _centerPosition;
+  Offset? _displayCenterPosition;
   Size _availableSize = Size.zero;
   double _diameter = RadialMenuGeometry.designDiameter;
   _DragMode _dragMode = _DragMode.none;
@@ -104,8 +123,16 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
   double _pageWheelLastAngle = 0;
   double _pageWheelTravel = 0;
   int _pageWheelIndex = 0;
+  // Global touch routing lets the five-finger page gesture start around the
+  // compact center even while the painted menu rings are fully closed. It
+  // observes pointers without claiming the hit test, so board ink remains
+  // available for ordinary one- and two-finger interaction.
   final Map<int, Offset> _menuPointers = <int, Offset>{};
+  final Map<int, double> _fiveFingerAngularTravel = <int, double>{};
+  final Set<int> _suppressedMenuPointers = <int>{};
   bool _fiveFingerPageGesture = false;
+  int _fiveFingerStartPagePosition = 0;
+  int _fiveFingerDetentPosition = 0;
   bool _suppressMenuActivation = false;
   RadialHitTarget _hovered = RadialHitTarget.none;
   RadialHitTarget _pressed = RadialHitTarget.none;
@@ -131,6 +158,9 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
     _tailAnimation = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 620),
+    );
+    GestureBinding.instance.pointerRouter.addGlobalRoute(
+      _handleGlobalPointerEvent,
     );
   }
 
@@ -158,6 +188,7 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
         Offset(_availableSize.width / 2, _availableSize.height / 2),
       );
       _centerPosition = centered;
+      _displayCenterPosition = centered;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) widget.callbacks.onPositionChanged?.call(centered);
       });
@@ -189,6 +220,17 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
 
   @override
   void dispose() {
+    GestureBinding.instance.pointerRouter.removeGlobalRoute(
+      _handleGlobalPointerEvent,
+    );
+    if (_suppressMenuActivation) {
+      widget.callbacks.onFiveFingerPageGestureChanged?.call(false);
+    }
+    _fiveFingerPageGesture = false;
+    _suppressMenuActivation = false;
+    _menuPointers.clear();
+    _fiveFingerAngularTravel.clear();
+    _suppressedMenuPointers.clear();
     _controller.removeListener(_onControllerChanged);
     if (_ownsController) _controller.dispose();
     _openAnimation.dispose();
@@ -216,15 +258,24 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
         _centerPosition ??= _clampCenter(
           widget.initialPosition ??
               Offset(_availableSize.width / 2, _availableSize.height / 2),
+          keepFullSurfaceVisible: false,
         );
-        _centerPosition = _clampCenter(_centerPosition!);
+        // Opening rings never changes the draggable centre. In a constrained
+        // split region, only the portions of those rings outside the owning
+        // participant's half are clipped.
+        _centerPosition = _clampCenter(
+          _centerPosition!,
+          keepFullSurfaceVisible: false,
+        );
+        _displayCenterPosition = _clampCenter(_centerPosition!);
 
         return Stack(
-          clipBehavior: Clip.none,
+          key: const ValueKey<String>('radial-menu-region'),
+          clipBehavior: widget.confineToBounds ? Clip.hardEdge : Clip.none,
           children: <Widget>[
             Positioned(
-              left: _centerPosition!.dx - _diameter / 2,
-              top: _centerPosition!.dy - _diameter / 2,
+              left: _displayCenterPosition!.dx - _diameter / 2,
+              top: _displayCenterPosition!.dy - _diameter / 2,
               width: _diameter,
               height: _diameter,
               child: RepaintBoundary(
@@ -240,9 +291,119 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
                 ),
               ),
             ),
+            if (_fiveFingerPageGesture &&
+                _pageWheelIndex >= 0 &&
+                _pageWheelIndex < widget.pagePreviews.length)
+              _buildFiveFingerPagePreview(widget.pagePreviews[_pageWheelIndex]),
           ],
         );
       },
+    );
+  }
+
+  Widget _buildFiveFingerPagePreview(RadialPagePreview page) {
+    final scale = (_availableSize.shortestSide / 800).clamp(.78, 1.15);
+    final width = (184 * scale).clamp(148.0, 212.0);
+    final height = (146 * scale).clamp(122.0, 168.0);
+    final center = _displayCenterPosition ?? _availableSize.center(Offset.zero);
+    const gap = 22.0;
+    final geometry = RadialMenuGeometry(Size.square(_diameter));
+    final preferAbove = center.dy >= _availableSize.height / 2;
+    final desiredTop = preferAbove
+        ? center.dy - geometry.centerRadius - gap - height
+        : center.dy + geometry.centerRadius + gap;
+    final maximumTop = math.max(
+      widget.edgePadding,
+      _availableSize.height - height - widget.edgePadding,
+    );
+    final top = desiredTop.clamp(widget.edgePadding, maximumTop);
+    final maximumLeft = math.max(
+      widget.edgePadding,
+      _availableSize.width - width - widget.edgePadding,
+    );
+    final left = (center.dx - width / 2).clamp(widget.edgePadding, maximumLeft);
+
+    return Positioned(
+      left: left,
+      top: top,
+      width: width,
+      height: height,
+      child: IgnorePointer(
+        child: Semantics(
+          liveRegion: true,
+          label:
+              '${page.semanticLabel ?? 'Seite ${page.pageNumber}'}, ausgew\u00e4hlt',
+          child: AnimatedSwitcher(
+            duration: const Duration(milliseconds: 110),
+            switchInCurve: Curves.easeOutBack,
+            switchOutCurve: Curves.easeIn,
+            child: DecoratedBox(
+              key: ValueKey<String>(
+                'five-finger-page-preview-${page.pageIndex}',
+              ),
+              decoration: BoxDecoration(
+                color: const Color(0xFF171D1C),
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(
+                  color: widget.theme.activeColor.withValues(alpha: .95),
+                  width: 2,
+                ),
+                boxShadow: const <BoxShadow>[
+                  BoxShadow(
+                    color: Color(0x59000000),
+                    blurRadius: 18,
+                    offset: Offset(0, 7),
+                  ),
+                ],
+              ),
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(9, 9, 9, 8),
+                child: Column(
+                  children: <Widget>[
+                    Expanded(
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(9),
+                        child: ColoredBox(
+                          color: page.backgroundColor,
+                          child: SizedBox.expand(
+                            child: page.thumbnail == null
+                                ? const Icon(
+                                    Icons.description_outlined,
+                                    color: Color(0xFF64706E),
+                                    size: 38,
+                                  )
+                                : RawImage(
+                                    key: const ValueKey<String>(
+                                      'five-finger-page-thumbnail',
+                                    ),
+                                    image: page.thumbnail,
+                                    fit: BoxFit.contain,
+                                    filterQuality: FilterQuality.medium,
+                                  ),
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 7),
+                    Text(
+                      'Seite ${page.pageNumber}',
+                      key: const ValueKey<String>('five-finger-page-number'),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 14,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: .2,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
     );
   }
 
@@ -287,10 +448,6 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
           : MouseCursor.defer,
       onExit: (_) => _setHovered(RadialHitTarget.none),
       child: Listener(
-        onPointerDown: _handleMenuPointerDown,
-        onPointerMove: _handleMenuPointerMove,
-        onPointerUp: _handleMenuPointerEnd,
-        onPointerCancel: _handleMenuPointerEnd,
         onPointerHover: (event) {
           _setHovered(
             painter.hitTargetAt(event.localPosition, Size.square(_diameter)),
@@ -341,7 +498,7 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
             );
             _panDownGlobalPosition = details.globalPosition;
             _panDownLocalPosition = details.localPosition;
-            _centerAtPanDown = _centerPosition!;
+            _centerAtPanDown = _displayCenterPosition!;
             _panTravel = 0;
             _panStarted = false;
           },
@@ -378,7 +535,7 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
             _panTravel += details.delta.distance;
             switch (_dragMode) {
               case _DragMode.center:
-                _moveCenterTo(_centerPosition! + details.delta);
+                _moveCenterTo(_displayCenterPosition! + details.delta);
               case _DragMode.thickness:
                 _setThicknessFromPosition(details.localPosition);
               case _DragMode.pageWheel:
@@ -454,8 +611,11 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
 
   void _moveCenterTo(Offset requested) {
     final next = _clampCenter(requested);
-    if (next == _centerPosition) return;
-    setState(() => _centerPosition = next);
+    if (next == _centerPosition && next == _displayCenterPosition) return;
+    setState(() {
+      _centerPosition = next;
+      _displayCenterPosition = next;
+    });
     widget.callbacks.onPositionChanged?.call(next);
   }
 
@@ -684,65 +844,255 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
     _pageWheelTravel = 0;
     _pageWheelIndex = widget.pagePreviews.isEmpty
         ? 0
-        : widget.currentPageIndex.clamp(0, widget.pagePreviews.length - 1);
+        : _pagePositionFor(widget.currentPageIndex);
   }
 
-  void _handleMenuPointerDown(PointerDownEvent event) {
+  void _handleGlobalPointerEvent(PointerEvent event) {
+    // A stylus, inverted stylus or mouse must never count as one of the five
+    // fingers. This is especially important while several pupils write at
+    // once on a large panel.
     if (event.kind != PointerDeviceKind.touch) return;
-    _menuPointers[event.pointer] = event.localPosition;
-    if (_fiveFingerPageGesture ||
-        _menuPointers.length < 5 ||
-        !_controller.isOpen ||
-        widget.pagePreviews.length < 2) {
+    if (event is PointerDownEvent) {
+      _handleFiveFingerPointerDown(event);
+    } else if (event is PointerMoveEvent) {
+      _handleFiveFingerPointerMove(event);
+    } else if (event is PointerUpEvent || event is PointerCancelEvent) {
+      _handleFiveFingerPointerEnd(event);
+    }
+  }
+
+  void _handleFiveFingerPointerDown(PointerDownEvent event) {
+    // Once a five-finger session started, additional fingers are suppressed
+    // until every participant is up but do not alter the rotation average.
+    if (_suppressMenuActivation) {
+      _suppressedMenuPointers.add(event.pointer);
       return;
     }
+    // Some digitizers expose the lower edge of a fist as several neighbouring
+    // touch contacts. Those contacts belong to the board eraser and must not
+    // be consumed as a five-finger page command.
+    if (_touchContactClassifier.isBroadTouch(event)) return;
+    if (widget.pagePreviews.length < 2 ||
+        _menuPointers.length >= 5 ||
+        !_isInFiveFingerGestureZone(event.position)) {
+      return;
+    }
+    _menuPointers[event.pointer] = event.position;
+    _tryStartFiveFingerPageGesture();
+  }
+
+  void _tryStartFiveFingerPageGesture() {
+    if (_fiveFingerPageGesture ||
+        _menuPointers.length != 5 ||
+        !_hasFiveFingerAngularCoverage()) {
+      return;
+    }
+
     _fiveFingerPageGesture = true;
     _suppressMenuActivation = true;
+    _suppressedMenuPointers.addAll(_menuPointers.keys);
+    widget.callbacks.onFiveFingerPageGestureChanged?.call(true);
     _dragMode = _DragMode.none;
+    _panStartTarget = RadialHitTarget.none;
     _panStarted = false;
+    _panTravel = 0;
     _pageWheelTravel = 0;
-    _pageWheelIndex = widget.currentPageIndex.clamp(
-      0,
-      widget.pagePreviews.length - 1,
-    );
-    _controller.setBranch(RadialMenuBranch.pages);
-    if (_pressed.isInteractive && mounted) {
-      setState(() => _pressed = RadialHitTarget.none);
-    }
-  }
-
-  void _handleMenuPointerMove(PointerMoveEvent event) {
-    if (event.kind != PointerDeviceKind.touch) return;
-    final previous = _menuPointers[event.pointer];
-    _menuPointers[event.pointer] = event.localPosition;
-    if (!_fiveFingerPageGesture ||
-        previous == null ||
-        _menuPointers.length < 5) {
-      return;
-    }
-    final geometry = RadialMenuGeometry(Size.square(_diameter));
-    var delta =
-        geometry.angleFor(event.localPosition) - geometry.angleFor(previous);
-    if (delta > math.pi) delta -= math.pi * 2;
-    if (delta < -math.pi) delta += math.pi * 2;
-    _pageWheelTravel += delta / _menuPointers.length;
-    _emitPageWheelDetents();
-  }
-
-  void _handleMenuPointerEnd(PointerEvent event) {
-    if (event.kind != PointerDeviceKind.touch) return;
-    _menuPointers.remove(event.pointer);
-    if (_fiveFingerPageGesture && _menuPointers.length < 5) {
-      _fiveFingerPageGesture = false;
-      _pageWheelTravel = 0;
-    }
-    if (_menuPointers.isEmpty && _suppressMenuActivation) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted && _menuPointers.isEmpty) {
-          _suppressMenuActivation = false;
-        }
+    _pageWheelIndex = _pagePositionFor(widget.currentPageIndex);
+    _fiveFingerStartPagePosition = _pageWheelIndex;
+    _fiveFingerDetentPosition = 0;
+    _fiveFingerAngularTravel
+      ..clear()
+      ..addEntries(_menuPointers.keys.map((pointer) => MapEntry(pointer, 0.0)));
+    // Deliberately do not open the menu or mutate its branch. The floating
+    // preview is the only added surface while the five contacts are held.
+    if (mounted) {
+      setState(() {
+        if (_pressed.isInteractive) _pressed = RadialHitTarget.none;
       });
     }
+  }
+
+  void _handleFiveFingerPointerMove(PointerMoveEvent event) {
+    final previous = _menuPointers[event.pointer];
+    if (previous == null) return;
+    if (!_fiveFingerPageGesture &&
+        _touchContactClassifier.isBroadTouch(event)) {
+      _menuPointers.remove(event.pointer);
+      _fiveFingerAngularTravel.remove(event.pointer);
+      return;
+    }
+    _menuPointers[event.pointer] = event.position;
+    if (!_fiveFingerPageGesture) _tryStartFiveFingerPageGesture();
+    if (!_fiveFingerPageGesture || _menuPointers.length != 5) return;
+    final center = _globalMenuCenter;
+    if (center == null) return;
+    var delta =
+        _angleAround(center, event.position) - _angleAround(center, previous);
+    if (delta > math.pi) delta -= math.pi * 2;
+    if (delta < -math.pi) delta += math.pi * 2;
+    _fiveFingerAngularTravel[event.pointer] =
+        (_fiveFingerAngularTravel[event.pointer] ?? 0) + delta;
+    _emitCoherentFiveFingerDetents();
+  }
+
+  void _handleFiveFingerPointerEnd(PointerEvent event) {
+    _menuPointers.remove(event.pointer);
+    _fiveFingerAngularTravel.remove(event.pointer);
+    _suppressedMenuPointers.remove(event.pointer);
+    if (_fiveFingerPageGesture && _menuPointers.length < 5) {
+      if (event is PointerUpEvent) {
+        _commitFiveFingerPageGesture();
+      } else {
+        _cancelFiveFingerPageGesture();
+      }
+    }
+    if (_suppressMenuActivation && _suppressedMenuPointers.isEmpty) {
+      _menuPointers.clear();
+      _fiveFingerAngularTravel.clear();
+      // Per-pointer gesture routes (including onTapUp) run before global
+      // routes, so it is safe to release arbitration synchronously here.
+      _suppressMenuActivation = false;
+      widget.callbacks.onFiveFingerPageGestureChanged?.call(false);
+    }
+  }
+
+  Offset? get _globalMenuCenter {
+    if (_displayCenterPosition == null || _availableSize.isEmpty) return null;
+    final renderObject = context.findRenderObject();
+    if (renderObject is! RenderBox ||
+        !renderObject.attached ||
+        !renderObject.hasSize) {
+      return null;
+    }
+    return renderObject.localToGlobal(_displayCenterPosition!);
+  }
+
+  bool _isInFiveFingerGestureZone(Offset globalPosition) {
+    final center = _globalMenuCenter;
+    if (center == null) return false;
+    final geometry = RadialMenuGeometry(Size.square(_diameter));
+    final radius = (globalPosition - center).distance;
+    // Keep the centre free for normal menu activation and for clustered palm
+    // contacts. The outer tolerance includes Ring 3 when it is visible.
+    return radius >= geometry.centerRadius * .9 &&
+        radius <= geometry.tertiaryOuterRadius + 24 * geometry.scale;
+  }
+
+  bool _hasFiveFingerAngularCoverage() {
+    final center = _globalMenuCenter;
+    if (center == null || _menuPointers.length != 5) return false;
+    final angles =
+        _menuPointers.values
+            .map((position) => _angleAround(center, position))
+            .toList(growable: false)
+          ..sort();
+    final geometry = RadialMenuGeometry(Size.square(_diameter));
+    var maximumPairDistance = 0.0;
+    final positions = _menuPointers.values.toList(growable: false);
+    for (var first = 0; first < positions.length; first++) {
+      for (var second = first + 1; second < positions.length; second++) {
+        maximumPairDistance = math.max(
+          maximumPairDistance,
+          (positions[first] - positions[second]).distance,
+        );
+      }
+    }
+    if (maximumPairDistance < geometry.centerRadius * 1.6) return false;
+    var largestGap = 0.0;
+    for (var index = 0; index < angles.length; index++) {
+      final current = angles[index];
+      final next = index + 1 < angles.length
+          ? angles[index + 1]
+          : angles.first + math.pi * 2;
+      largestGap = math.max(largestGap, next - current);
+    }
+    // Five fingertips may naturally occupy only part of the wheel, but a
+    // clustered fist contact leaves one almost complete-circle gap. Requiring
+    // at least 153 degrees of circular coverage keeps a one-handed turn easy
+    // while rejecting that eraser footprint.
+    return largestGap <= math.pi * 1.15;
+  }
+
+  void _emitCoherentFiveFingerDetents() {
+    final pageCount = widget.pagePreviews.length;
+    if (pageCount < 2 || _fiveFingerAngularTravel.length != 5) return;
+    var changed = false;
+    while (true) {
+      final values = _fiveFingerAngularTravel.values.toList(growable: false)
+        ..sort();
+      final forwardThreshold =
+          (_fiveFingerDetentPosition + _fiveFingerDetentHysteresis) *
+          _fiveFingerDetent;
+      final backwardThreshold =
+          (_fiveFingerDetentPosition - _fiveFingerDetentHysteresis) *
+          _fiveFingerDetent;
+      final forwardSupport = values
+          .where((value) => value >= forwardThreshold)
+          .length;
+      final backwardSupport = values
+          .where((value) => value <= backwardThreshold)
+          .length;
+      final direction = forwardSupport >= 4
+          ? 1
+          : backwardSupport >= 4
+          ? -1
+          : 0;
+      if (direction == 0) break;
+      _fiveFingerDetentPosition += direction;
+      _pageWheelIndex =
+          (_fiveFingerStartPagePosition + _fiveFingerDetentPosition) %
+          pageCount;
+      changed = true;
+
+      // One pointer event may represent a large hardware-coalesced move. The
+      // loop catches up all crossed detents, but the support threshold still
+      // requires four coherent fingertips for every step.
+      if (_fiveFingerDetentPosition.abs() > pageCount * 100) {
+        break;
+      }
+    }
+    if (!changed) return;
+    unawaited(HapticFeedback.selectionClick());
+    if (mounted) setState(() {});
+  }
+
+  void _cancelFiveFingerPageGesture() {
+    if (!_fiveFingerPageGesture) return;
+    _fiveFingerPageGesture = false;
+    _pageWheelTravel = 0;
+    _fiveFingerDetentPosition = 0;
+    _fiveFingerAngularTravel.clear();
+    if (mounted) setState(() {});
+  }
+
+  void _commitFiveFingerPageGesture() {
+    if (!_fiveFingerPageGesture) return;
+    final selectedPage =
+        _pageWheelIndex != _fiveFingerStartPagePosition &&
+            _pageWheelIndex >= 0 &&
+            _pageWheelIndex < widget.pagePreviews.length
+        ? widget.pagePreviews[_pageWheelIndex].pageIndex
+        : null;
+    _cancelFiveFingerPageGesture();
+    if (selectedPage != null) {
+      widget.callbacks.onPageSelected?.call(selectedPage);
+    }
+  }
+
+  static double _angleAround(Offset center, Offset position) {
+    final delta = position - center;
+    var angle = math.atan2(delta.dy, delta.dx) + math.pi / 2;
+    if (angle < 0) angle += math.pi * 2;
+    return angle % (math.pi * 2);
+  }
+
+  int _pagePositionFor(int pageIndex) {
+    final exact = widget.pagePreviews.indexWhere(
+      (preview) => preview.pageIndex == pageIndex,
+    );
+    return exact >= 0
+        ? exact
+        : pageIndex.clamp(0, widget.pagePreviews.length - 1);
   }
 
   void _updatePageWheel(Offset position) {
@@ -769,21 +1119,23 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
       final direction = _pageWheelTravel > 0 ? 1 : -1;
       _pageWheelTravel -= detent * direction;
       _pageWheelIndex = (_pageWheelIndex + direction) % pageCount;
-      widget.callbacks.onPageSelected?.call(_pageWheelIndex);
+      widget.callbacks.onPageSelected?.call(
+        widget.pagePreviews[_pageWheelIndex].pageIndex,
+      );
     }
   }
 
-  Offset _clampCenter(Offset requested) {
+  Offset _clampCenter(Offset requested, {bool? keepFullSurfaceVisible}) {
     if (_availableSize.isEmpty) return requested;
     final geometry = RadialMenuGeometry(Size.square(_diameter));
-    final margin = geometry.centerRadius + widget.edgePadding;
-    final minX = margin;
-    final maxX = _availableSize.width - margin;
-    final minY = margin;
-    final maxY = _availableSize.height - margin;
-    return Offset(
-      minX <= maxX ? requested.dx.clamp(minX, maxX) : _availableSize.width / 2,
-      minY <= maxY ? requested.dy.clamp(minY, maxY) : _availableSize.height / 2,
+    return geometry.clampCenterToRegion(
+      requested,
+      regionSize: _availableSize,
+      edgePadding: widget.edgePadding,
+      // A menu's draggable object is its centre disc. Expanded rings may be
+      // clipped, but must never reduce the usable drag range in a participant
+      // half. Explicit true remains available for one-off callers.
+      keepFullSurfaceVisible: keepFullSurfaceVisible ?? false,
     );
   }
 }
