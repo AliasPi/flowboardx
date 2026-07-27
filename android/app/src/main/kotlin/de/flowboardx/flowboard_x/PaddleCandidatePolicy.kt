@@ -49,8 +49,9 @@ internal object PaddleCandidatePolicy {
 }
 
 /**
- * LinkageError is not an Exception. Native optional features therefore need a
- * deliberately Throwable-wide construction boundary at the platform edge.
+ * LinkageError is not an Exception. Native optional features therefore catch
+ * the expected linkage/initialization failures explicitly while fatal
+ * VirtualMachineErrors always escape instead of triggering more allocations.
  */
 internal object OptionalNativeEngine {
     fun <T> create(
@@ -58,8 +59,30 @@ internal object OptionalNativeEngine {
         factory: () -> T,
     ): T? = try {
         factory()
-    } catch (error: Throwable) {
+    } catch (error: VirtualMachineError) {
+        throw error
+    } catch (error: ExceptionInInitializerError) {
+        rethrowVirtualMachineError(error)
         onFailure(error)
         null
+    } catch (error: LinkageError) {
+        rethrowVirtualMachineError(error)
+        onFailure(error)
+        null
+    } catch (error: Exception) {
+        rethrowVirtualMachineError(error)
+        onFailure(error)
+        null
+    }
+
+    private fun rethrowVirtualMachineError(error: Throwable) {
+        var current: Throwable? = error
+        repeat(8) {
+            val candidate = current ?: return
+            if (candidate is VirtualMachineError) throw candidate
+            val cause = candidate.cause
+            if (cause == null || cause === candidate) return
+            current = cause
+        }
     }
 }

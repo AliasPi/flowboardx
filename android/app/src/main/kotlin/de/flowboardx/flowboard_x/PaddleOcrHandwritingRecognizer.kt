@@ -6,6 +6,8 @@ import ai.onnxruntime.OrtException
 import ai.onnxruntime.OrtSession
 import android.content.Context
 import android.graphics.Bitmap
+import java.io.File
+import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -21,7 +23,8 @@ import kotlin.math.min
  * on the CPU. The engine performs no network or model-manager operation.
  */
 class PaddleOcrHandwritingRecognizer(context: Context) : AutoCloseable {
-    private val assets = context.applicationContext.assets
+    private val applicationContext = context.applicationContext
+    private val assets = applicationContext.assets
     // Loading ORT may throw a LinkageError on vendor images with restrictive
     // linker namespaces. Keep it out of MainActivity/FlutterEngine startup so
     // the independent bundled ML Kit fallback can still serve the app.
@@ -36,12 +39,21 @@ class PaddleOcrHandwritingRecognizer(context: Context) : AutoCloseable {
     @Volatile
     private var state: EngineState? = null
 
-    fun hasBundledAssets(): Boolean = runCatching {
-        assets.open(MODEL_ASSET, android.content.res.AssetManager.ACCESS_STREAMING)
-            .use { stream -> stream.read() >= 0 }
-        assets.open(CONFIG_ASSET, android.content.res.AssetManager.ACCESS_STREAMING)
-            .use { stream -> stream.read() >= 0 }
-    }.getOrDefault(false)
+    private var reusableInputBuffer: FloatBuffer? = null
+
+    fun hasBundledAssets(): Boolean = try {
+        val hasModel =
+            assets.open(MODEL_ASSET, android.content.res.AssetManager.ACCESS_STREAMING)
+                .use { stream -> stream.read() >= 0 }
+        val hasConfiguration =
+            assets.open(CONFIG_ASSET, android.content.res.AssetManager.ACCESS_STREAMING)
+                .use { stream -> stream.read() >= 0 }
+        hasModel && hasConfiguration
+    } catch (error: VirtualMachineError) {
+        throw error
+    } catch (_: Exception) {
+        false
+    }
 
     /**
      * Recognizes one tightly cropped text line. Calls are serialized by the
@@ -79,11 +91,8 @@ class PaddleOcrHandwritingRecognizer(context: Context) : AutoCloseable {
                 }
                 val timeSteps = shape[1].toInt()
                 val classCount = shape[2].toInt()
-                val outputBuffer: FloatBuffer = outputTensor.floatBuffer
-                val probabilities = FloatArray(outputBuffer.remaining())
-                outputBuffer.get(probabilities)
                 return PaddleOcrCtcDecoder.decode(
-                    probabilities = probabilities,
+                    probabilities = outputTensor.floatBuffer,
                     timeSteps = timeSteps,
                     classCount = classCount,
                     characters = localState.characters,
@@ -96,8 +105,20 @@ class PaddleOcrHandwritingRecognizer(context: Context) : AutoCloseable {
         synchronized(lock) {
             if (closed) return
             closed = true
-            state?.session?.close()
+            state?.let { engine ->
+                // ONNX Runtime requires SessionOptions to outlive every
+                // OrtSession created from them. Closing the options directly
+                // after createSession can release native state still used by
+                // inference and manifests as an uncatchable SIGSEGV/SIGABRT
+                // on some ARM vendor runtimes.
+                try {
+                    engine.session.close()
+                } finally {
+                    engine.options.close()
+                }
+            }
             state = null
+            reusableInputBuffer = null
         }
     }
 
@@ -106,10 +127,7 @@ class PaddleOcrHandwritingRecognizer(context: Context) : AutoCloseable {
         synchronized(lock) {
             check(!closed) { "PP-OCRv5 recognizer is closed" }
             state?.let { return it }
-            val model = assets.open(
-                MODEL_ASSET,
-                android.content.res.AssetManager.ACCESS_STREAMING,
-            ).use { it.readBytes() }
+            val modelFile = materializeModel()
             val yaml = assets.open(
                 CONFIG_ASSET,
                 android.content.res.AssetManager.ACCESS_STREAMING,
@@ -126,16 +144,71 @@ class PaddleOcrHandwritingRecognizer(context: Context) : AutoCloseable {
                 setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
             }
             val session = try {
-                environment.createSession(model, options)
-            } finally {
-                options.close()
+                // Loading by file path avoids retaining both an 8 MiB Java
+                // byte[] and ORT's native model representation at startup.
+                environment.createSession(modelFile.absolutePath, options)
+            } catch (error: Throwable) {
+                try {
+                    options.close()
+                } catch (closeError: Throwable) {
+                    error.addSuppressed(closeError)
+                }
+                throw error
             }
             val inputName = session.inputNames.singleOrNull()
                 ?: run {
-                    session.close()
+                    try {
+                        session.close()
+                    } finally {
+                        options.close()
+                    }
                     error("PP-OCRv5 must have exactly one input")
                 }
-            return EngineState(session, inputName, characters).also { state = it }
+            return EngineState(session, options, inputName, characters).also {
+                state = it
+            }
+        }
+    }
+
+    /**
+     * Copies the immutable APK asset once into private app storage. The
+     * versioned destination and atomic rename make cold-start recovery safe
+     * even if Android kills the process while the model is being copied.
+     */
+    private fun materializeModel(): File {
+        synchronized(MODEL_FILE_LOCK) {
+            val directory = File(applicationContext.noBackupFilesDir, MODEL_DIRECTORY)
+            check(directory.isDirectory || directory.mkdirs()) {
+                "Could not create the PP-OCRv5 model directory"
+            }
+            val destination = File(directory, MATERIALIZED_MODEL_NAME)
+            if (destination.isFile && destination.length() == EXPECTED_MODEL_SIZE) {
+                return destination
+            }
+            val temporary = File.createTempFile("paddle-model-", ".tmp", directory)
+            try {
+                assets.open(
+                    MODEL_ASSET,
+                    android.content.res.AssetManager.ACCESS_STREAMING,
+                ).use { input ->
+                    FileOutputStream(temporary).buffered().use { output ->
+                        input.copyTo(output, MODEL_COPY_BUFFER_SIZE)
+                        output.flush()
+                    }
+                }
+                check(temporary.length() == EXPECTED_MODEL_SIZE) {
+                    "Bundled PP-OCRv5 model has an unexpected size"
+                }
+                if (destination.exists() && !destination.delete()) {
+                    error("Could not replace the PP-OCRv5 model")
+                }
+                check(temporary.renameTo(destination)) {
+                    "Could not publish the PP-OCRv5 model"
+                }
+                return destination
+            } finally {
+                if (temporary.exists()) temporary.delete()
+            }
         }
     }
 
@@ -170,10 +243,11 @@ class PaddleOcrHandwritingRecognizer(context: Context) : AutoCloseable {
             val planeSize = INPUT_HEIGHT * inputWidth
             // ORT can use a direct native-order FloatBuffer without making
             // another complete JNI-side copy of the input tensor.
-            val values = ByteBuffer
-                .allocateDirect(CHANNEL_COUNT * planeSize * Float.SIZE_BYTES)
-                .order(ByteOrder.nativeOrder())
-                .asFloatBuffer()
+            val valueCount = CHANNEL_COUNT * planeSize
+            val values = reusableInputValues(valueCount)
+            for (index in 0 until valueCount) {
+                values.put(index, 0f)
+            }
             for (y in 0 until INPUT_HEIGHT) {
                 val sourceRow = y * resizedWidth
                 val destinationRow = y * inputWidth
@@ -204,6 +278,26 @@ class PaddleOcrHandwritingRecognizer(context: Context) : AutoCloseable {
 
     private fun normalize(channel: Int): Float = channel / 127.5f - 1f
 
+    /**
+     * Reuses one direct tensor buffer. The owning service serializes
+     * recognition calls, and OrtSession.run has completed before this buffer
+     * can be requested again.
+     */
+    private fun reusableInputValues(requiredCapacity: Int): FloatBuffer {
+        var storage = reusableInputBuffer
+        if (storage == null || storage.capacity() < requiredCapacity) {
+            storage = ByteBuffer
+                .allocateDirect(requiredCapacity * Float.SIZE_BYTES)
+                .order(ByteOrder.nativeOrder())
+                .asFloatBuffer()
+            reusableInputBuffer = storage
+        }
+        return storage.duplicate().apply {
+            position(0)
+            limit(requiredCapacity)
+        }
+    }
+
     private data class PreparedInput(
         val values: FloatBuffer,
         val width: Int,
@@ -211,6 +305,7 @@ class PaddleOcrHandwritingRecognizer(context: Context) : AutoCloseable {
 
     private data class EngineState(
         val session: OrtSession,
+        val options: OrtSession.SessionOptions,
         val inputName: String,
         val characters: List<String>,
     )
@@ -218,6 +313,11 @@ class PaddleOcrHandwritingRecognizer(context: Context) : AutoCloseable {
     private companion object {
         const val MODEL_ASSET =
             "handwriting/latin_PP-OCRv5_mobile_rec.onnx"
+        const val MODEL_DIRECTORY = "flowboard-handwriting"
+        const val MATERIALIZED_MODEL_NAME =
+            "latin_PP-OCRv5_mobile_rec-78881130.onnx"
+        const val EXPECTED_MODEL_SIZE = 8_042_023L
+        const val MODEL_COPY_BUFFER_SIZE = 256 * 1_024
         const val CONFIG_ASSET =
             "handwriting/latin_PP-OCRv5_mobile_rec.yml"
         const val CHANNEL_COUNT = 3
@@ -227,5 +327,6 @@ class PaddleOcrHandwritingRecognizer(context: Context) : AutoCloseable {
         const val MAX_INPUT_WIDTH = 2_048
         const val MAX_INFERENCE_THREADS = 4
         const val EXPECTED_CHARACTER_COUNT = 836
+        val MODEL_FILE_LOCK = Any()
     }
 }

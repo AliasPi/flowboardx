@@ -1,5 +1,7 @@
 package de.flowboardx.flowboard_x
 
+import java.nio.FloatBuffer
+
 /**
  * Pure Kotlin post-processing for the bundled PP-OCRv5 Latin model.
  *
@@ -49,12 +51,58 @@ object PaddleOcrCtcDecoder {
         classCount: Int,
         characters: List<String>,
     ): Result? {
+        require(probabilities.size == expectedOutputSize(timeSteps, classCount)) {
+            "Unexpected PP-OCRv5 output size"
+        }
+        return decodeValues(
+            timeSteps = timeSteps,
+            classCount = classCount,
+            characters = characters,
+            probabilityAt = probabilities::get,
+        )
+    }
+
+    /**
+     * Decodes ORT's direct output buffer without first duplicating the complete
+     * native tensor into a Java FloatArray.
+     */
+    fun decode(
+        probabilities: FloatBuffer,
+        timeSteps: Int,
+        classCount: Int,
+        characters: List<String>,
+    ): Result? {
+        require(
+            probabilities.remaining() == expectedOutputSize(timeSteps, classCount),
+        ) {
+            "Unexpected PP-OCRv5 output size"
+        }
+        val start = probabilities.position()
+        return decodeValues(
+            timeSteps = timeSteps,
+            classCount = classCount,
+            characters = characters,
+            probabilityAt = { index -> probabilities.get(start + index) },
+        )
+    }
+
+    private fun expectedOutputSize(timeSteps: Int, classCount: Int): Int {
+        require(timeSteps >= 0) { "timeSteps must not be negative" }
+        require(classCount >= 0) { "classCount must not be negative" }
+        val size = timeSteps.toLong() * classCount
+        require(size <= Int.MAX_VALUE) { "PP-OCRv5 output is too large" }
+        return size.toInt()
+    }
+
+    private inline fun decodeValues(
+        timeSteps: Int,
+        classCount: Int,
+        characters: List<String>,
+        probabilityAt: (Int) -> Float,
+    ): Result? {
         require(timeSteps >= 0) { "timeSteps must not be negative" }
         require(classCount == characters.size + 2) {
             "Unexpected PP-OCRv5 class count: $classCount"
-        }
-        require(probabilities.size == timeSteps * classCount) {
-            "Unexpected PP-OCRv5 output size"
         }
 
         val text = StringBuilder()
@@ -64,9 +112,9 @@ object PaddleOcrCtcDecoder {
         for (time in 0 until timeSteps) {
             val offset = time * classCount
             var bestIndex = 0
-            var bestProbability = probabilities[offset]
+            var bestProbability = probabilityAt(offset)
             for (index in 1 until classCount) {
-                val probability = probabilities[offset + index]
+                val probability = probabilityAt(offset + index)
                 if (probability.isFinite() &&
                     (!bestProbability.isFinite() || probability > bestProbability)
                 ) {

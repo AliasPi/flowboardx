@@ -50,12 +50,15 @@ class AndroidHandwritingRecognitionService(
     private val activeNativeTasks = AtomicInteger(0)
     private val pendingRequests = AtomicInteger(0)
     private val nativeTaskMonitor = Object()
+    private val fallbackRecognizerLock = Any()
     private val recognizerClosed = AtomicBoolean(false)
-    private val recognizer: TextRecognizer? = runCatching {
-        TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-    }.onFailure { error ->
-        Log.e(TAG, "Bundled handwriting recognizer could not be created", error)
-    }.getOrNull()
+
+    @Volatile
+    private var fallbackRecognizer: TextRecognizer? = null
+
+    @Volatile
+    private var fallbackRecognizerInitializationAttempted = false
+
     @Volatile
     private var paddleRecognizer: PaddleOcrHandwritingRecognizer? =
         createPaddleRecognizer(context.applicationContext)
@@ -79,15 +82,66 @@ class AndroidHandwritingRecognitionService(
             PaddleOcrHandwritingRecognizer(context)
         }
 
+    /**
+     * ML Kit is a compatibility fallback, not a second opinion after a
+     * successful Paddle run. Delaying construction keeps its model and native
+     * runtime out of memory on the normal bundled-Paddle path.
+     */
+    private fun getOrCreateFallbackRecognizer(): TextRecognizer? {
+        fallbackRecognizer?.let { return it }
+        if (fallbackRecognizerInitializationAttempted ||
+            recognizerClosed.get() ||
+            disposed
+        ) {
+            return null
+        }
+        synchronized(fallbackRecognizerLock) {
+            fallbackRecognizer?.let { return it }
+            if (fallbackRecognizerInitializationAttempted ||
+                recognizerClosed.get() ||
+                disposed
+            ) {
+                return null
+            }
+            fallbackRecognizerInitializationAttempted = true
+            val created = try {
+                TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+            } catch (error: VirtualMachineError) {
+                throw error
+            } catch (error: ExceptionInInitializerError) {
+                rethrowVirtualMachineError(error)
+                Log.e(TAG, "Bundled Latin fallback could not be initialized", error)
+                null
+            } catch (error: LinkageError) {
+                rethrowVirtualMachineError(error)
+                Log.e(TAG, "Bundled Latin fallback could not be linked", error)
+                null
+            } catch (error: Exception) {
+                rethrowVirtualMachineError(error)
+                Log.e(TAG, "Bundled Latin fallback could not be created", error)
+                null
+            }
+            if (created == null) return null
+            if (recognizerClosed.get() || disposed) {
+                closeFallbackRecognizer(created)
+                return null
+            }
+            fallbackRecognizer = created
+            return created
+        }
+    }
+
     private fun disablePaddleRecognizer(
         failedRecognizer: PaddleOcrHandwritingRecognizer,
         error: Throwable,
     ) {
+        rethrowVirtualMachineError(error)
         if (paddleRecognizer === failedRecognizer) {
             paddleRecognizer = null
         }
         runCatching { failedRecognizer.close() }
             .onFailure { closeError ->
+                rethrowVirtualMachineError(closeError)
                 Log.w(TAG, "Could not close failed PP-OCRv5 engine", closeError)
             }
         Log.w(TAG, "Bundled PP-OCRv5 disabled; using Latin OCR fallback", error)
@@ -114,7 +168,10 @@ class AndroidHandwritingRecognitionService(
                     ?.get("languageTag") as? String ?: DEFAULT_LANGUAGE_TAG
                 result.success(
                     isSupportedLanguageTag(languageTag) &&
-                        (paddleRecognizer?.hasBundledAssets() == true || recognizer != null),
+                        (
+                            paddleRecognizer?.hasBundledAssets() == true ||
+                                getOrCreateFallbackRecognizer() != null
+                            ),
                 )
             }
             "recognize" -> recognize(call.arguments, result)
@@ -123,9 +180,8 @@ class AndroidHandwritingRecognitionService(
     }
 
     private fun recognize(arguments: Any?, result: MethodChannel.Result) {
-        val localRecognizer = recognizer
-        if (localRecognizer == null &&
-            paddleRecognizer?.hasBundledAssets() != true
+        if (paddleRecognizer?.hasBundledAssets() != true &&
+            getOrCreateFallbackRecognizer() == null
         ) {
             result.error(
                 "recognizer_start_failed",
@@ -159,6 +215,7 @@ class AndroidHandwritingRecognitionService(
                         postError(result, error.code, error.message)
                         return@execute
                     } catch (error: Throwable) {
+                        rethrowVirtualMachineError(error)
                         Log.e(TAG, "Could not prepare handwriting input", error)
                         postError(
                             result,
@@ -202,7 +259,7 @@ class AndroidHandwritingRecognitionService(
                         return@execute
                     }
                     try {
-                        val outcome = recognizeWithOfflineFallbacks(localRecognizer, request)
+                        val outcome = recognizeWithOfflineFallbacks(request)
                         if (disposed) {
                             postError(
                                 result,
@@ -246,6 +303,7 @@ class AndroidHandwritingRecognitionService(
                             )
                         }
                     } catch (error: Throwable) {
+                        rethrowVirtualMachineError(error)
                         Log.e(TAG, "Offline handwriting recognition failed", error)
                         postError(
                             result,
@@ -253,12 +311,31 @@ class AndroidHandwritingRecognitionService(
                             "Die lokale Handschrifterkennung ist fehlgeschlagen.",
                         )
                     }
+                } catch (error: VirtualMachineError) {
+                    // A fatal allocation/linker failure must terminate this
+                    // request immediately, but it must not become an uncaught
+                    // background-thread exception that kills the Android app.
+                    Log.e(TAG, "Handwriting recognition exhausted runtime resources", error)
+                    postError(
+                        result,
+                        "recognition_resource_exhausted",
+                        "Die Texterkennung hat nicht genügend Gerätespeicher.",
+                    )
                 } finally {
                     releasePendingRequest()
                 }
             }
+        } catch (error: VirtualMachineError) {
+            releasePendingRequest()
+            Log.e(TAG, "Handwriting worker could not be scheduled", error)
+            result.error(
+                "recognition_resource_exhausted",
+                "Die Texterkennung hat nicht genügend Gerätespeicher.",
+                null,
+            )
         } catch (error: Throwable) {
             releasePendingRequest()
+            rethrowVirtualMachineError(error)
             Log.e(TAG, "Handwriting worker is unavailable", error)
             result.error(
                 "service_closed",
@@ -275,7 +352,6 @@ class AndroidHandwritingRecognitionService(
      * the APK; this method never downloads or installs a model.
      */
     private fun recognizeWithOfflineFallbacks(
-        recognizer: TextRecognizer?,
         request: RecognitionRequest,
     ): RecognitionOutcome {
         val startedNanos = System.nanoTime()
@@ -337,6 +413,7 @@ class AndroidHandwritingRecognitionService(
                         layoutFidelity = 1.0,
                     )
                 } catch (error: Throwable) {
+                    rethrowVirtualMachineError(error)
                     completePaddleResult = false
                     lastFailure = error
                     if (error is InterruptedException) {
@@ -355,7 +432,7 @@ class AndroidHandwritingRecognitionService(
             return combineLineCandidates(recognizedLines)
         }
 
-        fun successfulPaddleOutcome(candidate: OcrCandidate): RecognitionOutcome {
+        fun paddleOutcome(candidate: OcrCandidate?): RecognitionOutcome {
             val durationMillis = TimeUnit.NANOSECONDS
                 .toMillis(System.nanoTime() - startedNanos)
                 .coerceIn(0L, Int.MAX_VALUE.toLong())
@@ -372,8 +449,8 @@ class AndroidHandwritingRecognitionService(
 
         // A single moderate-confidence raster must not replace the selected ink
         // before any independent evidence is available. Very strong geometry-
-        // consistent output may return directly; otherwise use a second raster
-        // profile and then the adaptive ML Kit ensemble below.
+        // consistent output may return directly; otherwise use a second Paddle
+        // raster. ML Kit is only initialized if Paddle cannot execute at all.
         val localPaddle = paddleRecognizer
         if (localPaddle != null &&
             !disposed &&
@@ -394,7 +471,7 @@ class AndroidHandwritingRecognitionService(
                         expectedWordCount = expectedWordCount,
                     )
                 ) {
-                    return successfulPaddleOutcome(primaryPaddle)
+                    return paddleOutcome(primaryPaddle)
                 }
             }
 
@@ -426,11 +503,33 @@ class AndroidHandwritingRecognitionService(
                             expectedLineCount = lines.size,
                             expectedWordCount = expectedWordCount,
                         ) ?: primaryPaddle
-                        return successfulPaddleOutcome(agreed)
+                        return paddleOutcome(agreed)
                     }
                 }
             }
         }
+
+        if (completedAttempt) {
+            // ORT completed successfully, so do not retain a second OCR runtime
+            // merely to obtain another opinion. Preserve any candidate which
+            // already satisfies the common acceptance policy; otherwise report
+            // a safe not-recognized result and leave the source ink untouched.
+            val acceptedPaddle = chooseBestCandidate(
+                candidates.filter { candidate ->
+                    candidateIsAcceptable(
+                        candidate,
+                        candidates = candidates,
+                        expectedLineCount = lines.size,
+                        expectedWordCount = expectedWordCount,
+                    )
+                },
+                expectedLineCount = lines.size,
+                expectedWordCount = expectedWordCount,
+            )
+            return paddleOutcome(acceptedPaddle)
+        }
+
+        val recognizer = getOrCreateFallbackRecognizer()
 
         fun runAttempt(
             attemptRequest: RecognitionRequest,
@@ -681,6 +780,7 @@ class AndroidHandwritingRecognitionService(
             recognizer.process(InputImage.fromBitmap(bitmap, 0))
         } catch (error: Throwable) {
             releaseBitmap()
+            rethrowVirtualMachineError(error)
             throw error
         }
         task.addOnCompleteListener(DIRECT_EXECUTOR) { releaseBitmap() }
@@ -732,17 +832,50 @@ class AndroidHandwritingRecognitionService(
         return activeNativeTasks.get() == 0 && !disposed
     }
 
+    private fun rethrowVirtualMachineError(error: Throwable) {
+        var current: Throwable? = error
+        repeat(MAX_FATAL_CAUSE_DEPTH) {
+            val candidate = current ?: return
+            if (candidate is VirtualMachineError) throw candidate
+            val cause = candidate.cause
+            if (cause == null || cause === candidate) return
+            current = cause
+        }
+    }
+
     private fun closeRecognizerWhenIdle() {
         if (activeNativeTasks.get() != 0 ||
             pendingRequests.get() != 0 ||
             !recognizerClosed.compareAndSet(false, true)
         ) return
-        runCatching { recognizer?.close() }
-            .onFailure { Log.w(TAG, "Could not close handwriting recognizer", it) }
+        val localFallback = synchronized(fallbackRecognizerLock) {
+            fallbackRecognizer.also { fallbackRecognizer = null }
+        }
+        localFallback?.let(::closeFallbackRecognizer)
         val localPaddle = paddleRecognizer
         paddleRecognizer = null
         runCatching { localPaddle?.close() }
-            .onFailure { Log.w(TAG, "Could not close PP-OCRv5 recognizer", it) }
+            .onFailure { error ->
+                rethrowVirtualMachineError(error)
+                Log.w(TAG, "Could not close PP-OCRv5 recognizer", error)
+            }
+    }
+
+    private fun closeFallbackRecognizer(recognizer: TextRecognizer) {
+        try {
+            recognizer.close()
+        } catch (error: VirtualMachineError) {
+            throw error
+        } catch (error: ExceptionInInitializerError) {
+            rethrowVirtualMachineError(error)
+            Log.w(TAG, "Could not close bundled Latin fallback", error)
+        } catch (error: LinkageError) {
+            rethrowVirtualMachineError(error)
+            Log.w(TAG, "Could not unlink bundled Latin fallback", error)
+        } catch (error: Exception) {
+            rethrowVirtualMachineError(error)
+            Log.w(TAG, "Could not close bundled Latin fallback", error)
+        }
     }
 
     private fun candidateFromRecognition(recognition: Text): OcrCandidate? {
@@ -1027,6 +1160,56 @@ class AndroidHandwritingRecognitionService(
         rawStrokes.forEach { rawStroke ->
             val stroke = rawStroke as? Map<*, *>
                 ?: throw ChannelException("invalid_ink", "Ein Strich ist ungültig.")
+            val rawCompactCoordinates = stroke["coordinates"]
+            if (rawCompactCoordinates != null ||
+                stroke.containsKey("coordinates")
+            ) {
+                val coordinates = rawCompactCoordinates as? FloatArray
+                    ?: throw ChannelException(
+                        "invalid_ink",
+                        "Kompakte Strichkoordinaten sind ungültig.",
+                    )
+                if (coordinates.size % 2 != 0) {
+                    throw ChannelException(
+                        "invalid_ink",
+                        "Kompakte Strichkoordinaten sind unvollständig.",
+                    )
+                }
+                val pointCount = coordinates.size / 2
+                if (pointCount == 0) return@forEach
+                if (pointCount > MAX_POINTS - totalPoints) {
+                    throw ChannelException(
+                        "invalid_ink",
+                        "Zu viele Handschriftpunkte.",
+                    )
+                }
+                val timestamps = when (val raw = stroke["timestampsMicros"]) {
+                    null -> null
+                    is LongArray -> raw
+                    else -> throw ChannelException(
+                        "invalid_ink",
+                        "Kompakte Zeitstempel sind ungültig.",
+                    )
+                }
+                if (timestamps != null && timestamps.size != pointCount) {
+                    throw ChannelException(
+                        "invalid_ink",
+                        "Koordinaten und Zeitstempel haben unterschiedliche Längen.",
+                    )
+                }
+                val compactPoints = List(pointCount) { index ->
+                    HandwritingInkPoint(
+                        x = finiteCoordinate(coordinates[index * 2], "x"),
+                        y = finiteCoordinate(coordinates[index * 2 + 1], "y"),
+                        timestampMicros =
+                            timestamps?.get(index)?.let(::optionalTimestamp),
+                    )
+                }
+                strokes += compactPoints
+                totalPoints += compactPoints.size
+                return@forEach
+            }
+
             val rawPoints = stroke["points"] as? List<*>
                 ?: throw ChannelException("invalid_ink", "Strichpunkte fehlen.")
             if (rawPoints.isEmpty()) return@forEach
@@ -1090,7 +1273,19 @@ class AndroidHandwritingRecognitionService(
         var scale = targetInkHeight / inkHeight
         scale = min(scale, renderStyle.maximumInkWidth / inkWidth)
         scale = min(scale, MAX_INK_HEIGHT / inkHeight)
-        scale = scale.coerceIn(MIN_SCALE, MAX_SCALE)
+        // MAX_BITMAP_SIZE is a memory ceiling, not a crop instruction. Include
+        // padding in the scale budget so broad board writing remains complete
+        // when the defensive bitmap limit is lowered.
+        val maximumBitmapContent = max(
+            1f,
+            MAX_BITMAP_SIZE - renderStyle.padding * 2f,
+        )
+        val maximumBitmapScale = min(
+            maximumBitmapContent / inkWidth,
+            maximumBitmapContent / inkHeight,
+        )
+        scale = min(scale, maximumBitmapScale).coerceAtMost(MAX_SCALE)
+        scale = max(scale, min(MIN_SCALE, maximumBitmapScale))
 
         val contentWidth = inkWidth * scale
         val contentHeight = inkHeight * scale
@@ -1156,6 +1351,7 @@ class AndroidHandwritingRecognitionService(
             return bitmap
         } catch (error: Throwable) {
             bitmap.recycle()
+            rethrowVirtualMachineError(error)
             throw error
         }
     }
@@ -1296,7 +1492,8 @@ class AndroidHandwritingRecognitionService(
         const val MODEL_DELIVERY = "bundled-apk"
         const val MAX_LANGUAGE_TAG_LENGTH = 64
         const val MAX_STROKES = 4_096
-        const val MAX_POINTS = 250_000
+        const val MAX_POINTS = 20_000
+        const val MAX_FATAL_CAUSE_DEPTH = 8
         const val MAX_ABSOLUTE_COORDINATE = 10_000_000.0
         const val MAX_TIMESTAMP_MICROS = 9_000_000_000_000_000.0
         const val MAX_RASTER_POINTS_PER_STROKE = 12_000
@@ -1306,8 +1503,8 @@ class AndroidHandwritingRecognitionService(
         const val MIN_SCALE = 0.05f
         const val MAX_SCALE = 64f
         const val MIN_BITMAP_SIZE = 128
-        const val MAX_BITMAP_SIZE = 2_048
-        const val MAX_PENDING_REQUESTS = 3
+        const val MAX_BITMAP_SIZE = 1_536
+        const val MAX_PENDING_REQUESTS = 1
         const val NATIVE_DRAIN_TIMEOUT_SECONDS = 8L
         // Cold inference is part of the first real queued request. It no longer
         // races a speculative warm-up, so this full budget is deterministic.

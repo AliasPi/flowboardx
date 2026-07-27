@@ -69,16 +69,17 @@ final class HandwritingRecognitionRequest {
       );
       if (points.isEmpty) continue;
       remaining -= points.length;
+      final coordinates = Float32List(points.length * 2);
+      for (var pointIndex = 0; pointIndex < points.length; pointIndex++) {
+        final point = points[pointIndex];
+        coordinates[pointIndex * 2] = point.x;
+        coordinates[pointIndex * 2 + 1] = point.y;
+      }
+      final timestampsMicros = _safeTimestamps(points);
       serializedStrokes.add(<String, Object?>{
         'id': stroke.id,
-        'points': <Map<String, Object?>>[
-          for (final point in points)
-            <String, Object?>{
-              'x': point.x,
-              'y': point.y,
-              'timestampMicros': point.timestampMicros,
-            },
-        ],
+        'coordinates': coordinates,
+        'timestampsMicros': ?timestampsMicros,
       });
     }
     return <String, Object?>{
@@ -88,10 +89,10 @@ final class HandwritingRecognitionRequest {
   }
 
   @visibleForTesting
-  static const int maximumChannelPointCount = 80000;
+  static const int maximumChannelPointCount = 20000;
 
   @visibleForTesting
-  static const int maximumChannelPointsPerStroke = 12000;
+  static const int maximumChannelPointsPerStroke = 6000;
 
   @visibleForTesting
   static const int maximumChannelStrokeCount = 4096;
@@ -177,6 +178,20 @@ final class HandwritingRecognitionRequest {
       point.y.isFinite &&
       point.x.abs() <= 10000000 &&
       point.y.abs() <= 10000000;
+
+  static Int64List? _safeTimestamps(List<InkPoint> points) {
+    if (points.every((point) => point.timestampMicros == 0)) return null;
+    for (final point in points) {
+      final timestamp = point.timestampMicros;
+      if (timestamp < _minimumInt64 || timestamp > _maximumInt64) return null;
+    }
+    return Int64List.fromList(<int>[
+      for (final point in points) point.timestampMicros,
+    ]);
+  }
+
+  static const int _minimumInt64 = -0x8000000000000000;
+  static const int _maximumInt64 = 0x7FFFFFFFFFFFFFFF;
 }
 
 @immutable
@@ -272,6 +287,8 @@ final class PlatformHandwritingRecognitionService
   }) : _channel = channel;
 
   static const channelName = 'de.flowboardx/handwriting_recognition';
+  @visibleForTesting
+  static const maximumRecognizedTextLength = 4096;
   final MethodChannel _channel;
 
   @override
@@ -408,6 +425,14 @@ final class PlatformHandwritingRecognitionService
     final text = response['text'] is String
         ? (response['text']! as String).trim()
         : '';
+    if (text.length > maximumRecognizedTextLength) {
+      const failure = HandwritingRecognitionFailure(
+        HandwritingRecognitionFailureKind.invalidResponse,
+        'Die lokale Erkennung hat einen unerwartet langen Text geliefert.',
+      );
+      _recordFailure(failure, StackTrace.current);
+      throw failure;
+    }
     if (status == 'recognized' && text.isEmpty) {
       const failure = HandwritingRecognitionFailure(
         HandwritingRecognitionFailureKind.invalidResponse,

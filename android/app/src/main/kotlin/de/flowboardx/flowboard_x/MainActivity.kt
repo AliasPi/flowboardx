@@ -65,6 +65,7 @@ class MainActivity : FlutterActivity() {
         ).also { channel ->
             channel.setMethodCallHandler(::handleFileSaverMethod)
         }
+        handwritingRecognitionService?.dispose()
         handwritingRecognitionService = AndroidHandwritingRecognitionService(
             this,
             flutterEngine.dartExecutor.binaryMessenger,

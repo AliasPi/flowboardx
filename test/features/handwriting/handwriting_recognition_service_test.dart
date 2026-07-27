@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:flowboard_x/src/domain/model/ink.dart';
 import 'package:flowboard_x/src/features/handwriting/handwriting_recognition_service.dart';
 import 'package:flutter/services.dart';
@@ -27,7 +29,23 @@ void main() {
     );
     final map = request.toMap();
     expect(map['languageTag'], 'de-DE');
-    expect((map['strokes']! as List).single, containsPair('id', 's1'));
+    final stroke = (map['strokes']! as List).single as Map;
+    expect(stroke, containsPair('id', 's1'));
+    expect(
+      stroke['coordinates'],
+      isA<Float32List>().having(
+        (values) => values.toList(),
+        'coordinates',
+        <double>[1, 2, 4, 5],
+      ),
+    );
+    expect(
+      stroke['timestampsMicros'],
+      isA<Int64List>().having((values) => values.toList(), 'timestamps', <int>[
+        3,
+        6,
+      ]),
+    );
   });
 
   test('filters corrupt coordinates before crossing the platform channel', () {
@@ -45,9 +63,15 @@ void main() {
     );
 
     final stroke = (request.toMap()['strokes']! as List).single as Map;
-    final points = stroke['points']! as List;
-    expect(points, hasLength(1));
-    expect(points.single, containsPair('x', 12));
+    final coordinates = stroke['coordinates']! as Float32List;
+    expect(coordinates, hasLength(2));
+    expect(coordinates, orderedEquals(<double>[12, 14]));
+    expect(
+      stroke['timestampsMicros'],
+      isA<Int64List>().having((values) => values.toList(), 'timestamps', <int>[
+        9,
+      ]),
+    );
     expect(request.hasSerializableInk, isTrue);
   });
 
@@ -66,23 +90,28 @@ void main() {
     );
 
     final stroke = (request.toMap()['strokes']! as List).single as Map;
-    final points = stroke['points']! as List;
+    final coordinates = stroke['coordinates']! as Float32List;
     expect(
-      points.length,
+      coordinates.length ~/ 2,
       lessThanOrEqualTo(
         HandwritingRecognitionRequest.maximumChannelPointsPerStroke,
       ),
     );
-    expect((points.first as Map)['x'], source.first.x);
-    expect((points.last as Map)['x'], source.last.x);
+    expect(coordinates.first, source.first.x);
+    expect(coordinates[coordinates.length - 2], source.last.x);
     expect(
-      points.cast<Map>().any((point) => point['y'] == 240),
-      isTrue,
+      <int>[
+        for (var index = 1; index < coordinates.length; index += 2)
+          if (coordinates[index] == 240) index,
+      ],
+      isNotEmpty,
       reason: 'the sharp turn must survive dense-packet simplification',
     );
   });
 
   test('caps the complete channel payload across many selected strokes', () {
+    expect(HandwritingRecognitionRequest.maximumChannelPointCount, 20000);
+    expect(HandwritingRecognitionRequest.maximumChannelPointsPerStroke, 6000);
     final request = HandwritingRecognitionRequest(
       strokes: <InkStroke>[
         for (var stroke = 0; stroke < 10; stroke++)
@@ -100,7 +129,9 @@ void main() {
     final serialized = request.toMap()['strokes']! as List;
     final pointCount = serialized.fold<int>(
       0,
-      (total, stroke) => total + ((stroke as Map)['points']! as List).length,
+      (total, stroke) =>
+          total +
+          (((stroke as Map)['coordinates']! as Float32List).length ~/ 2),
     );
     expect(
       pointCount,
@@ -135,7 +166,10 @@ void main() {
       (stroke) => stroke['id'] == 'cursive',
     );
 
-    expect(cursive['points'], hasLength(densePoints.length));
+    expect(
+      (cursive['coordinates']! as Float32List).length ~/ 2,
+      densePoints.length,
+    );
   });
 
   test('normalized sampling preserves a tight turn beside long packets', () {
@@ -152,12 +186,57 @@ void main() {
     );
 
     final stroke = (request.toMap()['strokes']! as List).single as Map;
-    final points = (stroke['points']! as List).cast<Map>();
+    final coordinates = stroke['coordinates']! as Float32List;
 
     expect(
-      points.any((point) => point['y'] == 28),
-      isTrue,
+      <double>[
+        for (var index = 1; index < coordinates.length; index += 2)
+          coordinates[index],
+      ],
+      contains(28),
       reason: 'short high-curvature features must not lose to long segments',
+    );
+  });
+
+  test('omits timestamps when they carry no timing information', () {
+    final request = HandwritingRecognitionRequest(
+      strokes: <InkStroke>[
+        InkStroke(
+          id: 'untimed',
+          points: const <InkPoint>[InkPoint(x: 1, y: 2), InkPoint(x: 3, y: 4)],
+        ),
+      ],
+    );
+
+    final stroke = (request.toMap()['strokes']! as List).single as Map;
+
+    expect(stroke['coordinates'], isA<Float32List>());
+    expect(stroke.containsKey('timestampsMicros'), isFalse);
+  });
+
+  test('serializes signed int64 timestamp boundaries without narrowing', () {
+    const minimumInt64 = -0x8000000000000000;
+    const maximumInt64 = 0x7FFFFFFFFFFFFFFF;
+    final safe = HandwritingRecognitionRequest(
+      strokes: <InkStroke>[
+        InkStroke(
+          id: 'safe',
+          points: const <InkPoint>[
+            InkPoint(x: 1, y: 2, timestampMicros: minimumInt64),
+            InkPoint(x: 3, y: 4, timestampMicros: maximumInt64),
+          ],
+        ),
+      ],
+    );
+
+    final safeStroke = (safe.toMap()['strokes']! as List).single as Map;
+
+    expect(
+      safeStroke['timestampsMicros'],
+      isA<Int64List>().having((values) => values.toList(), 'timestamps', <int>[
+        minimumInt64,
+        maximumInt64,
+      ]),
     );
   });
 
@@ -336,6 +415,38 @@ void main() {
 
     expect(
       () => service.recognize(
+        HandwritingRecognitionRequest(
+          strokes: [
+            InkStroke(id: 's', points: const [InkPoint(x: 0, y: 0)]),
+          ],
+        ),
+      ),
+      throwsA(
+        isA<HandwritingRecognitionFailure>().having(
+          (failure) => failure.kind,
+          'kind',
+          HandwritingRecognitionFailureKind.invalidResponse,
+        ),
+      ),
+    );
+  });
+
+  test('rejects an oversized recognized text before layout', () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          channel,
+          (call) async => <String, Object>{
+            'status': 'recognized',
+            'text':
+                'A' *
+                (PlatformHandwritingRecognitionService
+                        .maximumRecognizedTextLength +
+                    1),
+          },
+        );
+
+    await expectLater(
+      service.recognize(
         HandwritingRecognitionRequest(
           strokes: [
             InkStroke(id: 's', points: const [InkPoint(x: 0, y: 0)]),

@@ -149,21 +149,19 @@ Das erzeugte APK liegt unter
 
 Ein Release-Build setzt eine gültige `android/key.properties` voraus. Dadurch
 kann der Build nicht mehr versehentlich formal erzeugte, aber von Android als
-ungültig abgelehnte unsignierte APKs ausliefern. Mit konfigurierter Signatur
-erzeugt der direkte Flutter-Aufruf je Android-ABI eine eigene, kleinere APK:
-
-```powershell
-flutter build apk --split-per-abi
-```
-
-Für auszuliefernde native Builds ist der Repository-Wrapper vorzuziehen. Er
-führt denselben Release-Build aus, entfernt davor aber die ausschließlich für
-Web benötigten PDFium-WASM-Dateien kontrolliert und stellt sie danach wieder
-her:
+ungültig abgelehnte unsignierte APKs ausliefern. Für auszuliefernde native
+Builds ist der Repository-Wrapper der verbindliche Buildpfad:
 
 ```powershell
 dart run tool/build_native_release.dart apk --split-per-abi
 ```
+
+Er führt intern `flutter build apk --split-per-abi` aus, entfernt davor aber
+kontrolliert die ausschließlich für Web benötigten PDFium-WASM-Dateien und
+einen von Flutter 3.38 gegebenenfalls zurückgelassenen
+`integration_test`-Registrant. Anschließend stellt er beide Entwicklungsstände
+auch bei einem fehlgeschlagenen Build wieder her. Produktions-Plugins bleiben
+im Release-Registrant erhalten.
 
 Die Ergebnisse liegen unter `build/app/outputs/flutter-apk/`:
 
@@ -457,6 +455,14 @@ initialisiert werden kann, bleibt das ebenfalls gebündelte
 `com.google.mlkit:text-recognition:16.0.1` als defensiver Offline-Fallback
 verfügbar; die Play-Services-Variante wird nicht verwendet.
 
+Beim ersten Erkennungsauftrag wird das unveränderliche ONNX-Asset atomar in den
+privaten App-Speicher gestreamt und von dort geladen. Dadurch liegen nicht
+gleichzeitig eine vollständige Java-Bytekopie und das native Modell im Speicher.
+Session, Session-Optionen und wiederverwendeter Tensorpuffer besitzen einen
+gemeinsamen, serialisierten Lebenszyklus. Eine erfolgreich ausgeführte
+PP-OCR-Inferenz lädt nicht zusätzlich die ML-Kit-Laufzeit; der Fallback wird erst
+bei einer technisch nicht verfügbaren primären Engine initialisiert.
+
 Modellquelle:
 [`PaddlePaddle/latin_PP-OCRv5_mobile_rec_onnx`](https://huggingface.co/PaddlePaddle/latin_PP-OCRv5_mobile_rec_onnx),
 SHA-256
@@ -479,10 +485,14 @@ wurde; bei unsicherem Ergebnis greift die bestehende Profil-, Wort- und
 Zeilenheuristik des Offline-Fallbacks.
 
 Strichreihenfolge und Zeitstempel unterstützen weiterhin die
-räumlich-zeitliche Worttrennung. Der Platform-Channel ist auf 250.000 Punkte
-begrenzt, parallele Aufrufe sind begrenzt und Modell-/Bitmap-Lebenszyklen
-bleiben auch bei Timeout und App-Ende serialisiert. Ein gültiger, aber nicht
-erkannter Strich ist ein `notRecognized`-Ergebnis und keine `FormatException`.
+räumlich-zeitliche Worttrennung. Der Platform-Channel überträgt Koordinaten als
+kompakte Typed-Arrays statt als tausende einzelne Maps und ist auf 20.000
+geometrieerhaltend vereinfachte Punkte begrenzt. Pro Editor ist nur eine
+Textumwandlung gleichzeitig aktiv; Änderungen an Auswahl, Seite oder
+Originalstrichen machen ein verspätetes Ergebnis ungültig. Modell-,
+Bitmap- und Auswahllebenszyklen bleiben auch bei Timeout und App-Ende
+serialisiert. Ein gültiger, aber nicht erkannter Strich ist ein
+`notRecognized`-Ergebnis und keine `FormatException`.
 Wie jede lokale Handschrifterkennung bleibt auch diese probabilistisch; sie
 verwendet jedoch auf allen unterstützten Android-Geräten dasselbe
 handschrifttrainierte Modell und hängt nicht von herstellerspezifisch

@@ -2,7 +2,9 @@ package de.flowboardx.flowboard_x
 
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 class PaddleCandidatePolicyTest {
@@ -18,6 +20,22 @@ class PaddleCandidatePolicyTest {
 
         assertNull(engine)
         assertTrue(captured is UnsatisfiedLinkError)
+    }
+
+    @Test
+    fun optionalNativeEngineNeverContainsVirtualMachineErrors() {
+        val fatal = OutOfMemoryError("native OCR memory exhausted")
+
+        try {
+            OptionalNativeEngine.create<Any>(
+                onFailure = { fail("A fatal VM error must not become a fallback") },
+            ) {
+                throw fatal
+            }
+            fail("Expected the original fatal VM error")
+        } catch (actual: OutOfMemoryError) {
+            assertSame(fatal, actual)
+        }
     }
 
     @Test

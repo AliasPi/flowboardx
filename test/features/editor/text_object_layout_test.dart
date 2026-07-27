@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
@@ -12,6 +13,7 @@ import 'package:flowboard_x/src/features/editor/editor_controller.dart';
 import 'package:flowboard_x/src/features/editor/inline_text_editing_engine.dart';
 import 'package:flowboard_x/src/features/editor/text_object_layout.dart';
 import 'package:flowboard_x/src/features/board/presentation/board_object_layer.dart';
+import 'package:flowboard_x/src/features/board/presentation/board_surface.dart';
 import 'package:flowboard_x/src/features/handwriting/handwriting_recognition_service.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -85,6 +87,305 @@ void main() {
     expect(controller.selectedTextObject?.id, converted.id);
     await controller.close();
     controller.dispose();
+  });
+
+  test(
+    'handwriting conversion is single-flight and locks ink transforms',
+    () async {
+      final recognition = _DeferredRecognition();
+      final controller = _controllerWithSelectedStroke(
+        documentId: 'ocr-single-flight',
+        recognition: recognition,
+      );
+      addTearDown(() async {
+        await controller.close();
+        controller.dispose();
+      });
+
+      final conversion = controller.convertSelectedHandwritingToText();
+      expect(controller.isHandwritingConversionInProgress, isTrue);
+      await recognition.started.future;
+
+      expect(await controller.convertSelectedHandwritingToText(), isFalse);
+      expect(recognition.recognizeCalls, 1);
+      expect(
+        controller.claimSelectionInteraction('parallel-transform'),
+        isFalse,
+      );
+      expect(
+        controller.beginInk(
+          const PointerDownEvent(pointer: 91, position: Offset(160, 160)),
+          const Offset(160, 160),
+        ),
+        isFalse,
+      );
+
+      recognition.complete('Einmal');
+      expect(await conversion, isTrue);
+      expect(controller.isHandwritingConversionInProgress, isFalse);
+      expect(recognition.recognizeCalls, 1);
+      expect(controller.page.strokes, isEmpty);
+      expect(controller.selectedTextObject?.text, 'Einmal');
+    },
+  );
+
+  testWidgets('conversion action is disabled while recognition is pending', (
+    tester,
+  ) async {
+    tester.view.devicePixelRatio = 1;
+    tester.view.physicalSize = const Size(900, 700);
+    final recognition = _DeferredRecognition();
+    final controller = _controllerWithSelectedStroke(
+      documentId: 'ocr-disabled-action',
+      recognition: recognition,
+    );
+    addTearDown(() async {
+      await controller.close();
+      controller.dispose();
+      tester.view.resetDevicePixelRatio();
+      tester.view.resetPhysicalSize();
+    });
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(body: BoardSurface(controller: controller)),
+      ),
+    );
+    await tester.pump();
+    expect(find.byTooltip('Handschrift in Text umwandeln'), findsOneWidget);
+
+    final conversion = controller.convertSelectedHandwritingToText();
+    await recognition.started.future;
+    await tester.pump();
+
+    final busyTooltip = find.byTooltip('Handschrift wird umgewandelt');
+    expect(busyTooltip, findsOneWidget);
+    final button = tester.widget<IconButton>(
+      find.descendant(of: busyTooltip, matching: find.byType(IconButton)),
+    );
+    expect(button.onPressed, isNull);
+
+    recognition.complete('Fertig');
+    expect(await conversion, isTrue);
+    await tester.pump();
+    expect(find.byTooltip('Handschrift wird umgewandelt'), findsNothing);
+    await controller.flush();
+  });
+
+  test(
+    'selection changes invalidate an awaiting handwriting conversion',
+    () async {
+      final recognition = _DeferredRecognition();
+      final controller = _controllerWithSelectedStroke(
+        documentId: 'ocr-selection-race',
+        recognition: recognition,
+      );
+      addTearDown(() async {
+        await controller.close();
+        controller.dispose();
+      });
+
+      final source = controller.page.strokes.single;
+      final conversion = controller.convertSelectedHandwritingToText();
+      await recognition.started.future;
+      controller.clearSelection();
+      recognition.complete('Veraltet');
+
+      expect(await conversion, isFalse);
+      expect(controller.isHandwritingConversionInProgress, isFalse);
+      expect(controller.page.strokeById(source.id), same(source));
+      expect(controller.page.objects, isEmpty);
+      expect(controller.selectedIds, isEmpty);
+    },
+  );
+
+  test(
+    'stroke mutation invalidates an awaiting handwriting conversion',
+    () async {
+      final recognition = _DeferredRecognition();
+      final controller = _controllerWithSelectedStroke(
+        documentId: 'ocr-stroke-race',
+        recognition: recognition,
+      );
+      addTearDown(() async {
+        await controller.close();
+        controller.dispose();
+      });
+
+      final source = controller.page.strokes.single;
+      final conversion = controller.convertSelectedHandwritingToText();
+      await recognition.started.future;
+      controller.moveSelection(const Offset(80, 0));
+      final moved = controller.page.strokeById(source.id)!;
+      expect(moved, isNot(same(source)));
+      recognition.complete('Veraltet');
+
+      expect(await conversion, isFalse);
+      expect(controller.page.strokeById(source.id), same(moved));
+      expect(controller.page.objects, isEmpty);
+      expect(controller.selectedIds, contains(source.id));
+    },
+  );
+
+  test(
+    'failed conversion command never leaves a stale text selection',
+    () async {
+      final recognition = _DeferredRecognition();
+      final controller = _controllerWithSelectedStroke(
+        documentId: 'ocr-command-failure',
+        recognition: recognition,
+      );
+      addTearDown(() async {
+        await controller.close();
+        controller.dispose();
+      });
+
+      final source = controller.page.strokes.single;
+      final conversion = controller.convertSelectedHandwritingToText();
+      await recognition.started.future;
+      await controller.history.dispose();
+      recognition.complete('Nicht gespeichert');
+
+      expect(await conversion, isFalse);
+      expect(controller.isHandwritingConversionInProgress, isFalse);
+      expect(controller.page.strokeById(source.id), same(source));
+      expect(controller.page.objects, isEmpty);
+      expect(controller.selectedIds, <String>{source.id});
+      expect(controller.lastError, isNotNull);
+    },
+  );
+
+  test(
+    'closing the controller safely invalidates pending recognition',
+    () async {
+      final recognition = _DeferredRecognition();
+      final controller = _controllerWithSelectedStroke(
+        documentId: 'ocr-close-race',
+        recognition: recognition,
+      );
+      var disposed = false;
+      addTearDown(() async {
+        if (disposed) return;
+        await controller.close();
+        controller.dispose();
+      });
+
+      final source = controller.page.strokes.single;
+      final conversion = controller.convertSelectedHandwritingToText();
+      await recognition.started.future;
+      await controller.close();
+      controller.dispose();
+      disposed = true;
+      recognition.complete('Zu spät');
+
+      expect(await conversion, isFalse);
+      expect(controller.isHandwritingConversionInProgress, isFalse);
+      expect(controller.page.strokeById(source.id), same(source));
+      expect(controller.page.objects, isEmpty);
+    },
+  );
+
+  test(
+    'conversion uses one finite canonical stroke for OCR and layout',
+    () async {
+      final recognition = _DeferredRecognition();
+      final base = WhiteboardDocument.create(id: 'ocr-finite-snapshot');
+      final source = InkStroke(
+        id: 'mixed-ink',
+        width: double.infinity,
+        points: const <InkPoint>[
+          InkPoint(
+            x: 100,
+            y: 100,
+            pressure: double.nan,
+            tiltX: double.infinity,
+            tiltY: double.negativeInfinity,
+          ),
+          InkPoint(x: double.nan, y: 112),
+          InkPoint(x: 118, y: double.infinity),
+          InkPoint(x: 10000001, y: 120),
+          InkPoint(x: 164, y: 132, pressure: .7, tiltX: .2, tiltY: -.3),
+        ],
+      );
+      final controller = EditorController(
+        document: base.copyWith(
+          pages: <BoardPage>[
+            base.currentPage.copyWith(
+              strokes: <InkStroke>[source],
+              selection: SelectionState(
+                selectedItemIds: const <String>['mixed-ink'],
+              ),
+            ),
+          ],
+        ),
+        repository: _MemoryRepository(),
+        assetDirectory: Directory.current,
+        handwritingRecognition: recognition,
+      );
+      addTearDown(() async {
+        await controller.close();
+        controller.dispose();
+      });
+
+      final conversion = controller.convertSelectedHandwritingToText();
+      await recognition.started.future;
+      final requestStroke = recognition.requests.single.strokes.single;
+      expect(requestStroke.points, hasLength(2));
+      expect(requestStroke.width, 4);
+      expect(
+        requestStroke.points.every(
+          (point) =>
+              point.x.isFinite &&
+              point.y.isFinite &&
+              point.pressure.isFinite &&
+              point.tiltX.isFinite &&
+              point.tiltY.isFinite,
+        ),
+        isTrue,
+      );
+      recognition.complete('Sicher');
+
+      expect(await conversion, isTrue);
+      final converted = controller.page.objects.whereType<TextObject>().single;
+      expect(
+        <double>[
+          converted.transform.x,
+          converted.transform.y,
+          converted.transform.width,
+          converted.transform.height,
+          converted.fontSize,
+        ].every((value) => value.isFinite),
+        isTrue,
+      );
+      expect(converted.transform.width, greaterThan(0));
+      expect(converted.transform.height, greaterThan(0));
+    },
+  );
+
+  test('active ink prevents handwriting conversion from starting', () async {
+    final recognition = _DeferredRecognition();
+    final controller = _controllerWithSelectedStroke(
+      documentId: 'ocr-active-ink',
+      recognition: recognition,
+    );
+    addTearDown(() async {
+      controller.cancelInk(92);
+      await controller.close();
+      controller.dispose();
+    });
+
+    controller.clearSelection();
+    expect(
+      controller.beginInk(
+        const PointerDownEvent(pointer: 92, position: Offset(200, 200)),
+        const Offset(200, 200),
+      ),
+      isTrue,
+    );
+    controller.selectAll();
+
+    expect(await controller.convertSelectedHandwritingToText(), isFalse);
+    expect(recognition.recognizeCalls, 0);
+    expect(controller.isHandwritingConversionInProgress, isFalse);
   });
 
   test(
@@ -623,6 +924,34 @@ final class _RecognitionSequence implements HandwritingRecognitionService {
   ) async => HandwritingRecognitionResult(text: _values.removeAt(0));
 }
 
+final class _DeferredRecognition implements HandwritingRecognitionService {
+  final Completer<void> started = Completer<void>();
+  final Completer<HandwritingRecognitionResult> _result =
+      Completer<HandwritingRecognitionResult>();
+  final List<HandwritingRecognitionRequest> requests =
+      <HandwritingRecognitionRequest>[];
+  int recognizeCalls = 0;
+
+  @override
+  Future<bool> isAvailable() async => true;
+
+  @override
+  Future<HandwritingRecognitionResult> recognize(
+    HandwritingRecognitionRequest request,
+  ) {
+    recognizeCalls++;
+    requests.add(request);
+    if (!started.isCompleted) started.complete();
+    return _result.future;
+  }
+
+  void complete(String text) {
+    if (!_result.isCompleted) {
+      _result.complete(HandwritingRecognitionResult(text: text));
+    }
+  }
+}
+
 final class _NoCandidateRecognition implements HandwritingRecognitionService {
   const _NoCandidateRecognition();
 
@@ -668,4 +997,32 @@ final class _NoAssets implements BoardAssetResolver {
 
   @override
   Future<Uint8List?> readBytes(String assetId) async => null;
+}
+
+EditorController _controllerWithSelectedStroke({
+  required String documentId,
+  required HandwritingRecognitionService recognition,
+}) {
+  final base = WhiteboardDocument.create(id: documentId);
+  final stroke = InkStroke(
+    id: 'ink',
+    width: 8,
+    points: const <InkPoint>[
+      InkPoint(x: 100, y: 100),
+      InkPoint(x: 132, y: 118),
+    ],
+  );
+  return EditorController(
+    document: base.copyWith(
+      pages: <BoardPage>[
+        base.currentPage.copyWith(
+          strokes: <InkStroke>[stroke],
+          selection: SelectionState(selectedItemIds: const <String>['ink']),
+        ),
+      ],
+    ),
+    repository: _MemoryRepository(),
+    assetDirectory: Directory.current,
+    handwritingRecognition: recognition,
+  );
 }

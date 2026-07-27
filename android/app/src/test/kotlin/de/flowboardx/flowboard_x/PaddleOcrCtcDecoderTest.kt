@@ -1,6 +1,8 @@
 package de.flowboardx.flowboard_x
 
 import java.io.File
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
@@ -43,6 +45,26 @@ class PaddleOcrCtcDecoderTest {
         assertNotNull(result)
         assertEquals("Hi all", result!!.text)
         assertEquals(.92, result.confidence, .001)
+    }
+
+    @Test
+    fun decoderReadsDirectOrtStyleBufferWithoutChangingItsPosition() {
+        val probabilities = ByteBuffer
+            .allocateDirect(6 * Float.SIZE_BYTES)
+            .order(ByteOrder.nativeOrder())
+            .asFloatBuffer()
+        probabilities.put(floatArrayOf(0f, .9f, 0f, .8f, 0f, 0f))
+        probabilities.flip()
+
+        val result = PaddleOcrCtcDecoder.decode(
+            probabilities = probabilities,
+            timeSteps = 2,
+            classCount = 3,
+            characters = listOf("A"),
+        )
+
+        assertEquals("A", result?.text)
+        assertEquals(0, probabilities.position())
     }
 
     @Test(expected = IllegalArgumentException::class)

@@ -27,7 +27,7 @@ namespace {
 constexpr char kChannelName[] = "de.flowboardx/handwriting_recognition";
 constexpr UINT kRecognitionCompletedMessage = WM_APP + 0x46;
 constexpr size_t kMaximumStrokes = 4096;
-constexpr size_t kMaximumPoints = 250000;
+constexpr size_t kMaximumPoints = 20000;
 constexpr double kMaximumAbsoluteCoordinate = 10000000.0;
 constexpr uint32_t kMaximumBitmapDimension = 2048;
 constexpr uint32_t kMaximumOcrHeight = 1024;
@@ -124,47 +124,85 @@ std::vector<std::vector<InkPoint>> ReadStrokes(
     if (stroke_map == nullptr) {
       throw std::invalid_argument("stroke is not a map");
     }
-    const auto* points_value = FindValue(*stroke_map, "points");
-    const auto* raw_points = points_value == nullptr
-                                 ? nullptr
-                                 : std::get_if<EncodableList>(points_value);
-    if (raw_points == nullptr) {
-      throw std::invalid_argument("points are missing");
-    }
-    if (raw_points->empty()) {
-      continue;
-    }
-    if (raw_points->size() > kMaximumPoints - total_points) {
-      throw std::invalid_argument("too many points");
-    }
-
     std::vector<InkPoint> points;
-    points.reserve(std::max<size_t>(raw_points->size(), 2));
-    for (const auto& raw_point : *raw_points) {
-      const auto* point_map = std::get_if<EncodableMap>(&raw_point);
-      if (point_map == nullptr) {
-        throw std::invalid_argument("point is not a map");
+    size_t point_count = 0;
+    const auto* coordinates_value = FindValue(*stroke_map, "coordinates");
+    const auto* coordinates =
+        coordinates_value == nullptr
+            ? nullptr
+            : std::get_if<std::vector<float>>(coordinates_value);
+    if (coordinates != nullptr) {
+      if (coordinates->empty() || coordinates->size() % 2 != 0) {
+        throw std::invalid_argument("coordinates are malformed");
       }
-      const auto* x_value = FindValue(*point_map, "x");
-      const auto* y_value = FindValue(*point_map, "y");
-      if (x_value == nullptr || y_value == nullptr) {
-        throw std::invalid_argument("coordinate is missing");
+      point_count = coordinates->size() / 2;
+      if (point_count > kMaximumPoints - total_points) {
+        throw std::invalid_argument("too many points");
       }
-      const double x = ReadNumber(*x_value);
-      const double y = ReadNumber(*y_value);
-      if (!std::isfinite(x) || !std::isfinite(y) ||
-          std::abs(x) > kMaximumAbsoluteCoordinate ||
-          std::abs(y) > kMaximumAbsoluteCoordinate) {
-        throw std::invalid_argument("coordinate is outside the safe range");
+      const auto* timestamps_value =
+          FindValue(*stroke_map, "timestampsMicros");
+      if (timestamps_value != nullptr) {
+        const auto* timestamps =
+            std::get_if<std::vector<int64_t>>(timestamps_value);
+        if (timestamps == nullptr || timestamps->size() != point_count) {
+          throw std::invalid_argument("timestamps are malformed");
+        }
       }
-      points.emplace_back(static_cast<float>(x), static_cast<float>(y));
+      points.reserve(std::max<size_t>(point_count, 2));
+      for (size_t index = 0; index < point_count; ++index) {
+        const double x = (*coordinates)[index * 2];
+        const double y = (*coordinates)[index * 2 + 1];
+        if (!std::isfinite(x) || !std::isfinite(y) ||
+            std::abs(x) > kMaximumAbsoluteCoordinate ||
+            std::abs(y) > kMaximumAbsoluteCoordinate) {
+          throw std::invalid_argument("coordinate is outside the safe range");
+        }
+        points.emplace_back(static_cast<float>(x), static_cast<float>(y));
+      }
+    } else {
+      // Keep accepting the original nested-map representation so an older
+      // Flutter engine can survive a hot restart during a native update.
+      const auto* points_value = FindValue(*stroke_map, "points");
+      const auto* raw_points = points_value == nullptr
+                                   ? nullptr
+                                   : std::get_if<EncodableList>(points_value);
+      if (raw_points == nullptr) {
+        throw std::invalid_argument("points are missing");
+      }
+      if (raw_points->empty()) {
+        continue;
+      }
+      point_count = raw_points->size();
+      if (point_count > kMaximumPoints - total_points) {
+        throw std::invalid_argument("too many points");
+      }
+      points.reserve(std::max<size_t>(point_count, 2));
+      for (const auto& raw_point : *raw_points) {
+        const auto* point_map = std::get_if<EncodableMap>(&raw_point);
+        if (point_map == nullptr) {
+          throw std::invalid_argument("point is not a map");
+        }
+        const auto* x_value = FindValue(*point_map, "x");
+        const auto* y_value = FindValue(*point_map, "y");
+        if (x_value == nullptr || y_value == nullptr) {
+          throw std::invalid_argument("coordinate is missing");
+        }
+        const double x = ReadNumber(*x_value);
+        const double y = ReadNumber(*y_value);
+        if (!std::isfinite(x) || !std::isfinite(y) ||
+            std::abs(x) > kMaximumAbsoluteCoordinate ||
+            std::abs(y) > kMaximumAbsoluteCoordinate) {
+          throw std::invalid_argument("coordinate is outside the safe range");
+        }
+        points.emplace_back(static_cast<float>(x), static_cast<float>(y));
+      }
     }
     // InkStrokeBuilder rejects a one-point polyline. Preserve taps as a tiny
     // segment; at board scale the added 0.01 unit is visually irrelevant.
     if (points.size() == 1) {
       points.emplace_back(points.front().X + 0.01f, points.front().Y + 0.01f);
     }
-    total_points += raw_points->size();
+    total_points += point_count;
     strokes.emplace_back(std::move(points));
   }
   if (strokes.empty() || total_points == 0) {

@@ -3208,9 +3208,17 @@ class _SelectionActions extends StatelessWidget {
               ),
             if (controller.hasSelectedHandwriting)
               _action(
-                Icons.text_fields_rounded,
-                'Handschrift in Text umwandeln',
-                () => unawaited(controller.convertSelectedHandwritingToText()),
+                controller.isHandwritingConversionInProgress
+                    ? Icons.hourglass_top_rounded
+                    : Icons.text_fields_rounded,
+                controller.isHandwritingConversionInProgress
+                    ? 'Handschrift wird umgewandelt'
+                    : 'Handschrift in Text umwandeln',
+                controller.isHandwritingConversionInProgress
+                    ? null
+                    : () => unawaited(
+                        controller.convertSelectedHandwritingToText(),
+                      ),
               ),
             if (controller.selectedTextObject case final text?)
               PopupMenuButton<double>(
@@ -3287,7 +3295,7 @@ class _SelectionActions extends StatelessWidget {
   Widget _action(
     IconData icon,
     String label,
-    VoidCallback action, {
+    VoidCallback? action, {
     bool danger = false,
   }) {
     return Tooltip(
@@ -3296,7 +3304,11 @@ class _SelectionActions extends StatelessWidget {
         onPressed: action,
         icon: Icon(
           icon,
-          color: danger ? FlowboardColors.danger : FlowboardColors.textPrimary,
+          color: action == null
+              ? FlowboardColors.textSecondary
+              : danger
+              ? FlowboardColors.danger
+              : FlowboardColors.textPrimary,
         ),
       ),
     );

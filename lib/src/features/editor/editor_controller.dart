@@ -176,6 +176,7 @@ class EditorController extends ChangeNotifier {
   Set<String> _expandedSelectionCache = const <String>{};
   TransformDelta? _selectionTransformPreview;
   String? _selectionInteractionOwner;
+  bool _handwritingConversionInProgress = false;
   bool _returnToInkWhenInsertedSelectionClears = false;
   _ClipboardPayload? _clipboard;
   Timer? _settingsPersistenceTimer;
@@ -383,6 +384,8 @@ class EditorController extends ChangeNotifier {
 
   bool get hasSelectedHandwriting =>
       page.strokes.any((stroke) => _expandedSelectionIds.contains(stroke.id));
+  bool get isHandwritingConversionInProgress =>
+      _handwritingConversionInProgress;
 
   double coverRevealValue(String objectId, double persisted) =>
       _coverRevealPreviews[objectId] ?? persisted;
@@ -519,6 +522,7 @@ class EditorController extends ChangeNotifier {
     String? authorId,
     Offset? samplingPosition,
   }) {
+    if (_handwritingConversionInProgress) return false;
     // A transform preview is a single atomic document operation. Ink sessions
     // may run concurrently with each other, but must not invalidate another
     // participant's active move/resize/rotation preview.
@@ -940,7 +944,7 @@ class EditorController extends ChangeNotifier {
   /// Serializes selection previews across both participant surfaces.
   /// Ordinary ink remains multi-pointer and does not use this lock.
   bool claimSelectionInteraction(String owner) {
-    if (owner.isEmpty) return false;
+    if (owner.isEmpty || _handwritingConversionInProgress) return false;
     final current = _selectionInteractionOwner;
     if (current != null && current != owner) return false;
     _selectionInteractionOwner = owner;
@@ -1403,18 +1407,26 @@ class EditorController extends ChangeNotifier {
   }
 
   Future<bool> convertSelectedHandwritingToText() async {
-    final sourcePageId = page.id;
-    final expanded = _expandedSelectionIds;
-    final strokes = page.strokes
-        .where((stroke) => expanded.contains(stroke.id))
-        .toList(growable: false);
-    if (strokes.isEmpty) return false;
+    if (_closed ||
+        _handwritingConversionInProgress ||
+        inkSessions.isWriting ||
+        _selectionTransformPreview != null ||
+        _selectionInteractionOwner != null) {
+      return false;
+    }
+    final snapshot = _captureHandwritingConversionSnapshot();
+    if (snapshot == null) return false;
+
+    _handwritingConversionInProgress = true;
+    lastError = null;
+    notifyListeners();
     try {
       if (!await handwritingRecognition.isAvailable()) {
         throw const HandwritingRecognitionUnavailable();
       }
+      if (!_isCurrentHandwritingConversionSnapshot(snapshot)) return false;
       final result = await handwritingRecognition.recognize(
-        HandwritingRecognitionRequest(strokes: strokes),
+        HandwritingRecognitionRequest(strokes: snapshot.canonicalStrokes),
       );
       if (!result.isRecognized) {
         if (!_closed) {
@@ -1425,13 +1437,10 @@ class EditorController extends ChangeNotifier {
         }
         return false;
       }
-      if (_closed ||
-          page.id != sourcePageId ||
-          strokes.any((stroke) => page.strokeById(stroke.id) == null)) {
-        return false;
-      }
+      if (!_isCurrentHandwritingConversionSnapshot(snapshot)) return false;
+
       Rect2? bounds;
-      for (final stroke in strokes) {
+      for (final stroke in snapshot.canonicalStrokes) {
         bounds = bounds == null ? stroke.bounds : bounds.union(stroke.bounds);
       }
       final textBounds = bounds ?? const Rect2.zero();
@@ -1445,8 +1454,8 @@ class EditorController extends ChangeNotifier {
         ),
         text: result.text,
         fontSize: math.max(24, math.min(72, textBounds.height * .72)),
-        colorArgb: strokes.first.colorArgb,
-        sourceStrokeIds: strokes.map((stroke) => stroke.id),
+        colorArgb: snapshot.canonicalStrokes.first.colorArgb,
+        sourceStrokeIds: snapshot.canonicalStrokes.map((stroke) => stroke.id),
         zIndex: nextBoardSceneZIndex(
           objects: page.objects,
           strokes: page.strokes,
@@ -1464,7 +1473,9 @@ class EditorController extends ChangeNotifier {
           ),
         ),
       );
-      final removed = strokes.map((stroke) => stroke.id).toSet();
+      final removed = snapshot.canonicalStrokes
+          .map((stroke) => stroke.id)
+          .toSet();
       final repairedContentGroups = page.contentGroups.map((group) {
         if (!group.memberIds.any(removed.contains)) return group;
         return group.copyWith(
@@ -1494,15 +1505,109 @@ class EditorController extends ChangeNotifier {
       nextPage = nextPage.copyWith(
         selection: SelectionState(selectedItemIds: nextSelection),
       );
-      execute(ReplacePageCommand(nextPage));
+      if (!execute(ReplacePageCommand(nextPage))) return false;
       _selectedIds = nextSelection;
       notifyListeners();
       return true;
     } catch (error) {
-      lastError = error.toString();
-      notifyListeners();
+      if (!_closed) {
+        lastError = error.toString();
+        notifyListeners();
+      }
+      return false;
+    } finally {
+      _handwritingConversionInProgress = false;
+      if (!_closed) notifyListeners();
+    }
+  }
+
+  _HandwritingConversionSnapshot? _captureHandwritingConversionSnapshot() {
+    final selectedIds = Set<String>.unmodifiable(_selectedIds);
+    final expandedIds = Set<String>.unmodifiable(_expandedSelectionIds);
+    if (selectedIds.isEmpty || expandedIds.isEmpty) return null;
+
+    final canonicalStrokes = <InkStroke>[];
+    final sourceStrokesById = <String, InkStroke>{};
+    for (final source in page.strokes) {
+      if (!expandedIds.contains(source.id)) continue;
+      final canonical = _canonicalHandwritingStroke(source);
+      if (canonical == null) continue;
+      canonicalStrokes.add(canonical);
+      sourceStrokesById[source.id] = source;
+    }
+    if (canonicalStrokes.isEmpty) return null;
+
+    return _HandwritingConversionSnapshot(
+      pageId: page.id,
+      documentRevision: document.revision,
+      selectedIds: selectedIds,
+      expandedIds: expandedIds,
+      sourceStrokesById: Map<String, InkStroke>.unmodifiable(sourceStrokesById),
+      canonicalStrokes: List<InkStroke>.unmodifiable(canonicalStrokes),
+    );
+  }
+
+  bool _isCurrentHandwritingConversionSnapshot(
+    _HandwritingConversionSnapshot snapshot,
+  ) {
+    if (_closed ||
+        page.id != snapshot.pageId ||
+        document.revision != snapshot.documentRevision ||
+        inkSessions.isWriting ||
+        _selectionTransformPreview != null ||
+        _selectionInteractionOwner != null ||
+        !setEquals(_selectedIds, snapshot.selectedIds) ||
+        !setEquals(_expandedSelectionIds, snapshot.expandedIds)) {
       return false;
     }
+    for (final entry in snapshot.sourceStrokesById.entries) {
+      if (!identical(page.strokeById(entry.key), entry.value)) return false;
+    }
+    return true;
+  }
+
+  static InkStroke? _canonicalHandwritingStroke(InkStroke source) {
+    const maximumCoordinate = 10000000.0;
+    final points = <InkPoint>[];
+    for (final point in source.points) {
+      if (!point.x.isFinite ||
+          !point.y.isFinite ||
+          point.x.abs() > maximumCoordinate ||
+          point.y.abs() > maximumCoordinate) {
+        continue;
+      }
+      points.add(
+        InkPoint(
+          x: point.x,
+          y: point.y,
+          pressure: point.pressure.isFinite
+              ? point.pressure.clamp(0.0, 1.0).toDouble()
+              : 1,
+          timestampMicros: point.timestampMicros,
+          tiltX: point.tiltX.isFinite
+              ? point.tiltX.clamp(-1.0, 1.0).toDouble()
+              : 0,
+          tiltY: point.tiltY.isFinite
+              ? point.tiltY.clamp(-1.0, 1.0).toDouble()
+              : 0,
+        ),
+      );
+    }
+    if (points.isEmpty) return null;
+    final width = source.width.isFinite && source.width > 0
+        ? source.width.clamp(.0001, 80.0).toDouble()
+        : 4.0;
+    return InkStroke(
+      id: source.id,
+      points: points,
+      colorArgb: source.colorArgb,
+      width: width,
+      type: source.type,
+      zIndex: source.zIndex,
+      createdAt: source.createdAt,
+      authorId: source.authorId,
+      pointerId: source.pointerId,
+    );
   }
 
   /// Replaces a text object's content and typography as one undoable action.
@@ -2979,6 +3084,24 @@ class EditorController extends ChangeNotifier {
           locked: value.locked,
         ),
       };
+}
+
+final class _HandwritingConversionSnapshot {
+  const _HandwritingConversionSnapshot({
+    required this.pageId,
+    required this.documentRevision,
+    required this.selectedIds,
+    required this.expandedIds,
+    required this.sourceStrokesById,
+    required this.canonicalStrokes,
+  });
+
+  final String pageId;
+  final int documentRevision;
+  final Set<String> selectedIds;
+  final Set<String> expandedIds;
+  final Map<String, InkStroke> sourceStrokesById;
+  final List<InkStroke> canonicalStrokes;
 }
 
 ({WhiteboardDocument document, bool changed}) _upgradePersistedTextFrames(

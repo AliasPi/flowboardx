@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
@@ -34,11 +35,16 @@ Future<void> main(List<String> arguments) async {
 
   await _run('flutter', const <String>['pub', 'get']);
   var cleanupAttempted = false;
+  _GeneratedFileBackup? androidRegistrantBackup;
   try {
     cleanupAttempted = true;
     await _run('dart', const <String>['run', 'pdfrx:remove_wasm_modules']);
     await _clearFlutterAssetCache();
     await _removeStaleNativeWasmArtifacts(target);
+    if (target == 'apk' || target == 'appbundle') {
+      androidRegistrantBackup =
+          await _stripDevOnlyAndroidPluginsFromRegistrant();
+    }
     await _run('flutter', <String>[
       'build',
       target,
@@ -47,7 +53,10 @@ Future<void> main(List<String> arguments) async {
       ...arguments.skip(1),
     ]);
     if (target == 'apk' || target == 'appbundle') {
-      await _verifyAndroidOfflineModels(target);
+      await _verifyAndroidOfflineModels(
+        target,
+        splitPerAbi: arguments.skip(1).contains('--split-per-abi'),
+      );
     }
     final stale = await _nativeWasmArtifacts(target);
     if (stale.isNotEmpty) {
@@ -57,19 +66,29 @@ Future<void> main(List<String> arguments) async {
       );
     }
   } finally {
-    if (cleanupAttempted) {
-      await _run('dart', const <String>[
-        'run',
-        'pdfrx:remove_wasm_modules',
-        '--revert',
-      ]);
+    try {
+      if (cleanupAttempted) {
+        await _run('dart', const <String>[
+          'run',
+          'pdfrx:remove_wasm_modules',
+          '--revert',
+        ]);
+      }
+    } finally {
+      final backup = androidRegistrantBackup;
+      if (backup != null) {
+        await backup.file.writeAsString(backup.contents);
+      }
     }
   }
 }
 
 /// Fails the production build if any emitted Android artifact lost the
 /// statically linked Latin recognition model.
-Future<void> _verifyAndroidOfflineModels(String target) async {
+Future<void> _verifyAndroidOfflineModels(
+  String target, {
+  required bool splitPerAbi,
+}) async {
   final buildRoot = p.normalize(p.absolute('build', 'app', 'outputs'));
   final outputDirectory = switch (target) {
     'apk' => Directory(p.join(buildRoot, 'flutter-apk')),
@@ -82,6 +101,15 @@ Future<void> _verifyAndroidOfflineModels(String target) async {
     );
   }
   final extension = target == 'apk' ? '.apk' : '.aab';
+  final expectedNames = target == 'appbundle'
+      ? const <String>{'app-release.aab'}
+      : splitPerAbi
+      ? const <String>{
+          'app-armeabi-v7a-release.apk',
+          'app-arm64-v8a-release.apk',
+          'app-x86_64-release.apk',
+        }
+      : const <String>{'app-release.apk'};
   final artifacts = outputDirectory.existsSync()
       ? outputDirectory
             .listSync(followLinks: false)
@@ -89,14 +117,18 @@ Future<void> _verifyAndroidOfflineModels(String target) async {
             .where(
               (file) =>
                   p.extension(file.path).toLowerCase() == extension &&
-                  p.basename(file.path).toLowerCase().contains('release'),
+                  expectedNames.contains(p.basename(file.path).toLowerCase()),
             )
             .toList(growable: false)
       : const <File>[];
-  if (artifacts.isEmpty) {
+  final foundNames = artifacts
+      .map((artifact) => p.basename(artifact.path).toLowerCase())
+      .toSet();
+  if (!foundNames.containsAll(expectedNames)) {
+    final missing = expectedNames.difference(foundNames).toList()..sort();
     throw StateError(
-      'Kein Android-Releaseartefakt zur Modellprüfung gefunden: '
-      '${outputDirectory.path}',
+      'Android-Releaseartefakte zur Modellprüfung fehlen: '
+      '${missing.join(', ')} (${outputDirectory.path})',
     );
   }
   const verifier = AndroidOfflineModelVerifier();
@@ -112,6 +144,114 @@ Future<void> _verifyAndroidOfflineModels(String target) async {
     );
   }
 }
+
+/// Removes dev-only Android plugins from Flutter's generated release source.
+///
+/// A preceding `flutter test integration_test/...` legitimately writes the
+/// dev-only `integration_test` plugin into this generated source. Flutter 3.38
+/// can otherwise reuse that debug registrant while excluding the corresponding
+/// release dependency. Deleting the complete registrant is unsafe because
+/// native plugins such as `jni` require their production registration.
+Future<_GeneratedFileBackup?>
+_stripDevOnlyAndroidPluginsFromRegistrant() async {
+  final androidRoot = p.normalize(p.absolute('android'));
+  final registrantPath = p.normalize(
+    p.join(
+      androidRoot,
+      'app',
+      'src',
+      'main',
+      'java',
+      'io',
+      'flutter',
+      'plugins',
+      'GeneratedPluginRegistrant.java',
+    ),
+  );
+  if (!p.isWithin(androidRoot, registrantPath)) {
+    throw StateError('Unsicherer Android-Registrant-Pfad: $registrantPath');
+  }
+  final dependencyFile = File(
+    p.normalize(p.absolute('.flutter-plugins-dependencies')),
+  );
+  if (!await dependencyFile.exists()) {
+    throw StateError('Flutter-Pluginmetadaten fehlen: ${dependencyFile.path}');
+  }
+  final metadata = jsonDecode(await dependencyFile.readAsString());
+  if (metadata is! Map<String, dynamic> ||
+      metadata['plugins'] is! Map<String, dynamic>) {
+    throw const FormatException('Ungültige Flutter-Pluginmetadaten.');
+  }
+  final platformPlugins =
+      (metadata['plugins'] as Map<String, dynamic>)['android'];
+  if (platformPlugins is! List) {
+    throw const FormatException('Android-Pluginmetadaten fehlen.');
+  }
+  final devPluginNames = <String>{
+    for (final plugin in platformPlugins)
+      if (plugin is Map<String, dynamic> &&
+          plugin['dev_dependency'] == true &&
+          plugin['name'] is String)
+        plugin['name']! as String,
+  };
+  if (devPluginNames.isEmpty) return null;
+
+  final registrant = File(registrantPath);
+  if (!await registrant.exists()) {
+    throw StateError('Android-Plugin-Registrant fehlt: $registrantPath');
+  }
+  final originalContents = await registrant.readAsString();
+  final lines = originalContents.split('\n');
+  final releaseLines = <String>[];
+  final removed = <String>{};
+  var index = 0;
+  while (index < lines.length) {
+    if (lines[index].trimRight() != '    try {') {
+      releaseLines.add(lines[index]);
+      index++;
+      continue;
+    }
+    var end = index + 1;
+    while (end < lines.length && lines[end].trimRight() != '    }') {
+      end++;
+    }
+    if (end >= lines.length) {
+      throw const FormatException(
+        'Der Android-Plugin-Registrant enthält einen unvollständigen Block.',
+      );
+    }
+    final block = lines.sublist(index, end + 1);
+    final blockText = block.join('\n');
+    String? devPlugin;
+    for (final name in devPluginNames) {
+      if (blockText.contains('Error registering plugin $name,')) {
+        devPlugin = name;
+        break;
+      }
+    }
+    if (devPlugin == null) {
+      releaseLines.addAll(block);
+    } else {
+      removed.add(devPlugin);
+    }
+    index = end + 1;
+  }
+  if (!removed.containsAll(devPluginNames)) {
+    final unexpected = devPluginNames.difference(removed).toList()..sort();
+    throw StateError(
+      'Dev-Plugins konnten nicht aus dem Release-Registrant entfernt werden: '
+      '${unexpected.join(', ')}',
+    );
+  }
+  stdout.writeln(
+    '> entferne Dev-Plugins aus Android-Release-Registrant: '
+    '${removed.toList()..sort()}',
+  );
+  await registrant.writeAsString(releaseLines.join('\n'));
+  return (file: registrant, contents: originalContents);
+}
+
+typedef _GeneratedFileBackup = ({File file, String contents});
 
 /// Invalidates Flutter's generated asset manifest after pdfrx's package
 /// manifest changed. Merely deleting the final runner directory is not enough:
