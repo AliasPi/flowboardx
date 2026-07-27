@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
@@ -284,12 +285,18 @@ final class PlatformHandwritingRecognitionService
     implements HandwritingRecognitionService {
   const PlatformHandwritingRecognitionService({
     MethodChannel channel = const MethodChannel(channelName),
+    this.ensureModelTimeout = defaultEnsureModelTimeout,
+    this.recognitionTimeout = defaultRecognitionTimeout,
   }) : _channel = channel;
 
   static const channelName = 'de.flowboardx/handwriting_recognition';
+  static const defaultEnsureModelTimeout = Duration(seconds: 5);
+  static const defaultRecognitionTimeout = Duration(seconds: 35);
   @visibleForTesting
   static const maximumRecognizedTextLength = 4096;
   final MethodChannel _channel;
+  final Duration ensureModelTimeout;
+  final Duration recognitionTimeout;
 
   @override
   Future<bool> isAvailable() => prepare();
@@ -301,10 +308,20 @@ final class PlatformHandwritingRecognitionService
     final normalizedTag = languageTag.trim();
     if (normalizedTag.isEmpty) return false;
     try {
-      return await _channel.invokeMethod<bool>('ensureModel', {
-            'languageTag': normalizedTag,
-          }) ??
+      return await _channel
+              .invokeMethod<bool>('ensureModel', {'languageTag': normalizedTag})
+              .timeout(
+                _positiveTimeout(ensureModelTimeout, defaultEnsureModelTimeout),
+              ) ??
           false;
+    } on TimeoutException catch (error, stackTrace) {
+      const failure = HandwritingRecognitionFailure(
+        HandwritingRecognitionFailureKind.engineFailure,
+        'Die eingebettete Handschrifterkennung hat beim Start nicht '
+        'rechtzeitig geantwortet.',
+      );
+      _recordFailure(error, stackTrace);
+      throw failure;
     } on MissingPluginException {
       return false;
     } on PlatformException {
@@ -336,10 +353,18 @@ final class PlatformHandwritingRecognitionService
     try {
       // The native side also ensures the exact request model. Recognition is
       // therefore race-safe even when callers skip [isAvailable].
-      response = await _channel.invokeMapMethod<Object?, Object?>(
-        'recognize',
-        request.toMap(),
+      response = await _channel
+          .invokeMapMethod<Object?, Object?>('recognize', request.toMap())
+          .timeout(
+            _positiveTimeout(recognitionTimeout, defaultRecognitionTimeout),
+          );
+    } on TimeoutException catch (error, stackTrace) {
+      const failure = HandwritingRecognitionFailure(
+        HandwritingRecognitionFailureKind.engineFailure,
+        'Die lokale Handschrifterkennung hat das Zeitlimit überschritten.',
       );
+      _recordFailure(error, stackTrace);
+      throw failure;
     } on MissingPluginException catch (error, stackTrace) {
       _recordFailure(error, stackTrace);
       throw const HandwritingRecognitionUnavailable();
@@ -537,6 +562,9 @@ final class PlatformHandwritingRecognitionService
     if (value is! num || !value.isFinite) return null;
     return value.toInt().clamp(0, maximum).toInt();
   }
+
+  static Duration _positiveTimeout(Duration configured, Duration fallback) =>
+      configured > Duration.zero ? configured : fallback;
 
   static void _recordFailure(Object error, StackTrace stackTrace) {
     DiagnosticLogService.instance.recordException(

@@ -6,12 +6,21 @@ import ai.onnxruntime.OrtException
 import ai.onnxruntime.OrtSession
 import android.content.Context
 import android.graphics.Bitmap
+import android.util.Log
+import java.io.BufferedOutputStream
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
+import java.security.DigestInputStream
+import java.security.MessageDigest
 import java.util.Collections
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.min
@@ -40,6 +49,7 @@ class PaddleOcrHandwritingRecognizer(context: Context) : AutoCloseable {
     private var state: EngineState? = null
 
     private var reusableInputBuffer: FloatBuffer? = null
+    private val activeRunOptions = AtomicReference<OrtSession.RunOptions?>()
 
     fun hasBundledAssets(): Boolean = try {
         val hasModel =
@@ -60,10 +70,16 @@ class PaddleOcrHandwritingRecognizer(context: Context) : AutoCloseable {
      * owning handwriting worker, so one reusable session is sufficient.
      */
     @Throws(OrtException::class)
-    fun recognize(bitmap: Bitmap): PaddleOcrCtcDecoder.Result? {
+    fun recognize(
+        bitmap: Bitmap,
+        deadlineNanos: Long,
+    ): PaddleOcrCtcDecoder.Result? {
         check(!closed) { "PP-OCRv5 recognizer is closed" }
         require(bitmap.width > 0 && bitmap.height > 0) {
             "PP-OCRv5 input bitmap is empty"
+        }
+        check(deadlineNanos - System.nanoTime() > 0L) {
+            "PP-OCRv5 recognition deadline elapsed"
         }
         val localState = ensureState()
         val input = prepareInput(bitmap)
@@ -72,36 +88,68 @@ class PaddleOcrHandwritingRecognizer(context: Context) : AutoCloseable {
             input.values,
             longArrayOf(1, CHANNEL_COUNT.toLong(), INPUT_HEIGHT.toLong(), input.width.toLong()),
         ).use { tensor ->
-            localState.session.run(
-                Collections.singletonMap(localState.inputName, tensor),
-            ).use { output ->
-                val outputTensor = output[0] as? OnnxTensor
-                    ?: throw OrtException("PP-OCRv5 returned no tensor")
-                val shape = outputTensor.info.shape
-                if (shape.size != 3 ||
-                    shape[0] != 1L ||
-                    shape[1] <= 0L ||
-                    shape[2] <= 0L ||
-                    shape[1] > Int.MAX_VALUE ||
-                    shape[2] > Int.MAX_VALUE
-                ) {
-                    throw OrtException(
-                        "Unexpected PP-OCRv5 output shape ${shape.contentToString()}",
-                    )
+            OrtSession.RunOptions().use { runOptions ->
+                check(activeRunOptions.compareAndSet(null, runOptions)) {
+                    "A PP-OCRv5 inference is already active"
                 }
-                val timeSteps = shape[1].toInt()
-                val classCount = shape[2].toInt()
-                return PaddleOcrCtcDecoder.decode(
-                    probabilities = outputTensor.floatBuffer,
-                    timeSteps = timeSteps,
-                    classCount = classCount,
-                    characters = localState.characters,
-                )
+                var termination: ScheduledFuture<*>? = null
+                try {
+                    val inferenceBudget = deadlineNanos - System.nanoTime()
+                    check(inferenceBudget > 0L) {
+                        "PP-OCRv5 recognition deadline elapsed"
+                    }
+                    termination = TERMINATION_EXECUTOR.schedule(
+                        { terminateRun(runOptions) },
+                        inferenceBudget,
+                        TimeUnit.NANOSECONDS,
+                    )
+                    localState.session.run(
+                        Collections.singletonMap(localState.inputName, tensor),
+                        runOptions,
+                    ).use { output ->
+                        val outputTensor = output[0] as? OnnxTensor
+                            ?: throw OrtException("PP-OCRv5 returned no tensor")
+                        val shape = outputTensor.info.shape
+                        if (shape.size != 3 ||
+                            shape[0] != 1L ||
+                            shape[1] <= 0L ||
+                            shape[2] <= 0L ||
+                            shape[1] > Int.MAX_VALUE ||
+                            shape[2] > Int.MAX_VALUE
+                        ) {
+                            throw OrtException(
+                                "Unexpected PP-OCRv5 output shape ${shape.contentToString()}",
+                            )
+                        }
+                        val timeSteps = shape[1].toInt()
+                        val classCount = shape[2].toInt()
+                        return PaddleOcrCtcDecoder.decode(
+                            probabilities = outputTensor.floatBuffer,
+                            timeSteps = timeSteps,
+                            classCount = classCount,
+                            characters = localState.characters,
+                        )
+                    }
+                } finally {
+                    synchronized(runOptions) {
+                        activeRunOptions.compareAndSet(runOptions, null)
+                        termination?.cancel(false)
+                    }
+                }
             }
         }
     }
 
+    /**
+     * Requests termination in ONNX Runtime itself. Interrupting only the Java
+     * worker cannot stop a synchronous native OrtSession.run call.
+     */
+    fun cancelActiveRun() {
+        activeRunOptions.get()?.let(::terminateRun)
+    }
+
     override fun close() {
+        cancelActiveRun()
         synchronized(lock) {
             if (closed) return
             closed = true
@@ -119,6 +167,19 @@ class PaddleOcrHandwritingRecognizer(context: Context) : AutoCloseable {
             }
             state = null
             reusableInputBuffer = null
+        }
+    }
+
+    private fun terminateRun(runOptions: OrtSession.RunOptions) {
+        synchronized(runOptions) {
+            if (activeRunOptions.get() !== runOptions) return
+            try {
+                runOptions.setTerminate(true)
+            } catch (error: VirtualMachineError) {
+                throw error
+            } catch (error: Throwable) {
+                Log.w(TAG, "Could not terminate PP-OCRv5 inference", error)
+            }
         }
     }
 
@@ -182,22 +243,37 @@ class PaddleOcrHandwritingRecognizer(context: Context) : AutoCloseable {
                 "Could not create the PP-OCRv5 model directory"
             }
             val destination = File(directory, MATERIALIZED_MODEL_NAME)
-            if (destination.isFile && destination.length() == EXPECTED_MODEL_SIZE) {
+            if (isExpectedModel(destination)) {
                 return destination
             }
+            directory.listFiles { file ->
+                file.isFile &&
+                    file.name.startsWith(MATERIALIZED_TEMPORARY_PREFIX) &&
+                    file.name.endsWith(".tmp")
+            }?.forEach { stale -> stale.delete() }
             val temporary = File.createTempFile("paddle-model-", ".tmp", directory)
             try {
+                val digest = MessageDigest.getInstance("SHA-256")
                 assets.open(
                     MODEL_ASSET,
                     android.content.res.AssetManager.ACCESS_STREAMING,
-                ).use { input ->
-                    FileOutputStream(temporary).buffered().use { output ->
-                        input.copyTo(output, MODEL_COPY_BUFFER_SIZE)
-                        output.flush()
+                ).use { assetInput ->
+                    DigestInputStream(assetInput, digest).use { input ->
+                        FileOutputStream(temporary).use { fileOutput ->
+                            val output = BufferedOutputStream(
+                                fileOutput,
+                                MODEL_COPY_BUFFER_SIZE,
+                            )
+                            input.copyTo(output, MODEL_COPY_BUFFER_SIZE)
+                            output.flush()
+                            fileOutput.fd.sync()
+                        }
                     }
                 }
-                check(temporary.length() == EXPECTED_MODEL_SIZE) {
-                    "Bundled PP-OCRv5 model has an unexpected size"
+                check(temporary.length() == EXPECTED_MODEL_SIZE &&
+                    digest.digest().toHexString() == EXPECTED_MODEL_SHA256
+                ) {
+                    "Bundled PP-OCRv5 model failed its integrity check"
                 }
                 if (destination.exists() && !destination.delete()) {
                     error("Could not replace the PP-OCRv5 model")
@@ -205,12 +281,39 @@ class PaddleOcrHandwritingRecognizer(context: Context) : AutoCloseable {
                 check(temporary.renameTo(destination)) {
                     "Could not publish the PP-OCRv5 model"
                 }
+                check(isExpectedModel(destination)) {
+                    "Published PP-OCRv5 model failed its integrity check"
+                }
                 return destination
             } finally {
                 if (temporary.exists()) temporary.delete()
             }
         }
     }
+
+    private fun isExpectedModel(file: File): Boolean {
+        if (!file.isFile || file.length() != EXPECTED_MODEL_SIZE) return false
+        return try {
+            val digest = MessageDigest.getInstance("SHA-256")
+            FileInputStream(file).use { input ->
+                val buffer = ByteArray(MODEL_COPY_BUFFER_SIZE)
+                while (true) {
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    if (count > 0) digest.update(buffer, 0, count)
+                }
+            }
+            digest.digest().toHexString() == EXPECTED_MODEL_SHA256
+        } catch (error: VirtualMachineError) {
+            throw error
+        } catch (error: Exception) {
+            Log.w(TAG, "Could not validate materialized PP-OCRv5 model", error)
+            false
+        }
+    }
+
+    private fun ByteArray.toHexString(): String =
+        joinToString(separator = "") { byte -> "%02x".format(byte.toInt() and 0xff) }
 
     /**
      * Mirrors PaddleOCR's `RecResizeImg(eval_mode=true)` preprocessing:
@@ -316,7 +419,10 @@ class PaddleOcrHandwritingRecognizer(context: Context) : AutoCloseable {
         const val MODEL_DIRECTORY = "flowboard-handwriting"
         const val MATERIALIZED_MODEL_NAME =
             "latin_PP-OCRv5_mobile_rec-78881130.onnx"
+        const val MATERIALIZED_TEMPORARY_PREFIX = "paddle-model-"
         const val EXPECTED_MODEL_SIZE = 8_042_023L
+        const val EXPECTED_MODEL_SHA256 =
+            "7888113072263cb471b93f66dd5e2ad70548dc526fa1ace760d0d973dd121498"
         const val MODEL_COPY_BUFFER_SIZE = 256 * 1_024
         const val CONFIG_ASSET =
             "handwriting/latin_PP-OCRv5_mobile_rec.yml"
@@ -327,6 +433,13 @@ class PaddleOcrHandwritingRecognizer(context: Context) : AutoCloseable {
         const val MAX_INPUT_WIDTH = 2_048
         const val MAX_INFERENCE_THREADS = 4
         const val EXPECTED_CHARACTER_COUNT = 836
+        const val TAG = "FlowboardHandwriting"
         val MODEL_FILE_LOCK = Any()
+        val TERMINATION_EXECUTOR =
+            Executors.newSingleThreadScheduledExecutor { task ->
+                Thread(task, "flowboard-handwriting-timeout").apply {
+                    isDaemon = true
+                }
+            }
     }
 }

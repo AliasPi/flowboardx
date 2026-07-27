@@ -140,7 +140,8 @@ Future<void> _verifyAndroidOfflineModels(
       '${report.uncompressedModelBytes} Byte ML Kit; '
       '${report.handwritingAssetCount} PP-OCRv5-Assets, '
       '${report.handwritingAssetBytes} Byte; '
-      '${report.onnxRuntimeLibraryCount} ONNX-Runtime-Bibliotheken',
+      '${report.onnxRuntimeLibraryCount} ONNX-Runtime-Bibliotheken; '
+      '${report.onnxRuntimeJavaTypeCount} JNI-Java-Typen',
     );
   }
 }

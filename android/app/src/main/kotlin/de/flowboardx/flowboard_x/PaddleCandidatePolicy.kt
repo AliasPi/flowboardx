@@ -7,7 +7,7 @@ package de.flowboardx.flowboard_x
  * to test the important "no confident-looking single guess" contract on the
  * local JVM without loading native libraries.
  */
-internal object PaddleCandidatePolicy {
+object PaddleCandidatePolicy {
     fun isStrongStandalone(
         text: String,
         confidence: Double?,
@@ -53,7 +53,7 @@ internal object PaddleCandidatePolicy {
  * the expected linkage/initialization failures explicitly while fatal
  * VirtualMachineErrors always escape instead of triggering more allocations.
  */
-internal object OptionalNativeEngine {
+object OptionalNativeEngine {
     fun <T> create(
         onFailure: (Throwable) -> Unit,
         factory: () -> T,

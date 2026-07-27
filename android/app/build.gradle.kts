@@ -90,6 +90,10 @@ android {
             if (releaseSigningConfigured) {
                 signingConfig = signingConfigs.getByName("release")
             }
+            // ONNX Runtime uses fixed Java class/member names from JNI.
+            // Without its official keep rule, R8 produces a release-only
+            // native SIGABRT inside OrtSession.run on real Android devices.
+            proguardFiles("proguard-rules.pro")
         }
     }
 }
@@ -118,7 +122,72 @@ val verifyBundledLatinRecognitionModel =
     tasks.register("verifyBundledLatinRecognitionModel") {
         dependsOn("mergeReleaseAssets")
         dependsOn("mergeReleaseNativeLibs")
+        dependsOn("minifyReleaseWithR8")
         doLast {
+            val r8Mapping =
+                layout.buildDirectory
+                    .file("outputs/mapping/release/mapping.txt")
+                    .get().asFile
+            val r8Usage =
+                layout.buildDirectory
+                    .file("outputs/mapping/release/usage.txt")
+                    .get().asFile
+            if (!r8Mapping.isFile || !r8Usage.isFile) {
+                throw GradleException(
+                    "R8 reports are missing; ONNX Runtime JNI names cannot be verified.",
+                )
+            }
+            val classMappingPattern =
+                Regex("""^(ai\.onnxruntime(?:\.[A-Za-z0-9_$]+)+) -> ([^:]+):$""")
+            val onnxClassMappings =
+                r8Mapping.useLines { lines ->
+                    lines.mapNotNull { line ->
+                        classMappingPattern.matchEntire(line)?.let { match ->
+                            match.groupValues[1] to match.groupValues[2]
+                        }
+                    }.toList()
+                }
+            val requiredJniTypes =
+                setOf(
+                    "ai.onnxruntime.OnnxTensor",
+                    "ai.onnxruntime.OnnxValue",
+                    "ai.onnxruntime.OrtSession",
+                    "ai.onnxruntime.TensorInfo",
+                )
+            val mappedTypes = onnxClassMappings.mapTo(mutableSetOf()) { it.first }
+            val missingJniTypes = requiredJniTypes - mappedTypes
+            val removedJniTypes =
+                r8Usage.useLines { lines ->
+                    lines.map { it.substringBefore(':').trim() }
+                        .filter { it in requiredJniTypes }
+                        .toSet()
+                }
+            val renamedOnnxTypes =
+                onnxClassMappings.filter { (original, emitted) ->
+                    // D8/R8 creates these implementation-only helper classes
+                    // after applying keep rules. Native ORT code never resolves
+                    // their generated names through JNI.
+                    !original.contains("\$\$ExternalSynthetic") &&
+                        original != emitted
+                }
+            if (missingJniTypes.isNotEmpty() ||
+                removedJniTypes.isNotEmpty() ||
+                renamedOnnxTypes.isNotEmpty()
+            ) {
+                throw GradleException(
+                    "ONNX Runtime R8/JNI contract is broken: " +
+                        "missing=${missingJniTypes.sorted().joinToString()}, " +
+                        "removed=${removedJniTypes.sorted().joinToString()}, " +
+                        "renamed=${
+                            renamedOnnxTypes
+                                .take(8)
+                                .joinToString { (original, emitted) ->
+                                    "$original->$emitted"
+                                }
+                        }",
+                )
+            }
+
             val bundledHandwritingDirectory =
                 project.file("src/main/assets/handwriting")
             val mergedHandwritingDirectory =

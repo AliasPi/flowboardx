@@ -150,6 +150,9 @@ class AndroidHandwritingRecognitionService(
     fun dispose() {
         disposed = true
         channel.setMethodCallHandler(null)
+        // OrtSession.run is native and ignores Thread.interrupt(). Ask ORT to
+        // stop an active inference before the worker is drained.
+        paddleRecognizer?.cancelActiveRun()
         // Drain accepted jobs so every MethodChannel call receives exactly
         // one terminal response. shutdownNow() used to drop queued two-user
         // requests and leave their Dart futures unresolved forever.
@@ -392,7 +395,7 @@ class AndroidHandwritingRecognitionService(
                     1,
                 )
                 try {
-                    val recognized = engine.recognize(bitmap)
+                    val recognized = engine.recognize(bitmap, deadlineNanos)
                     completedAttempt = true
                     // ORT runs synchronously, but recognition is already off the
                     // UI thread. Enforce the shared budget immediately after
@@ -416,6 +419,10 @@ class AndroidHandwritingRecognitionService(
                     rethrowVirtualMachineError(error)
                     completePaddleResult = false
                     lastFailure = error
+                    if (System.nanoTime() >= deadlineNanos || disposed) {
+                        timedOut = true
+                        break
+                    }
                     if (error is InterruptedException) {
                         Thread.currentThread().interrupt()
                     }

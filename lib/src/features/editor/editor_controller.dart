@@ -48,6 +48,7 @@ class EditorController extends ChangeNotifier {
     required Directory assetDirectory,
     Uuid? uuid,
     HandwritingRecognitionService? handwritingRecognition,
+    @visibleForTesting VoidCallback? debugBeforeHandwritingSnapshotCapture,
   }) {
     final hydration = _upgradePersistedTextFrames(document);
     return EditorController._(
@@ -56,6 +57,8 @@ class EditorController extends ChangeNotifier {
       assetDirectory: assetDirectory,
       uuid: uuid,
       handwritingRecognition: handwritingRecognition,
+      debugBeforeHandwritingSnapshotCapture:
+          debugBeforeHandwritingSnapshotCapture,
       ownsDocumentSession: true,
       followsDocumentNavigation: true,
       historyOwnerId: CommandHistory.defaultOwnerId,
@@ -79,6 +82,8 @@ class EditorController extends ChangeNotifier {
     assetDirectory: owner.assetDirectory,
     uuid: const Uuid(),
     handwritingRecognition: owner.handwritingRecognition,
+    debugBeforeHandwritingSnapshotCapture:
+        owner._debugBeforeHandwritingSnapshotCapture,
     sharedHistory: owner.history,
     sharedAutosave: owner.autosave,
     ownsDocumentSession: false,
@@ -99,6 +104,7 @@ class EditorController extends ChangeNotifier {
     required String historyOwnerId,
     Uuid? uuid,
     HandwritingRecognitionService? handwritingRecognition,
+    VoidCallback? debugBeforeHandwritingSnapshotCapture,
     CommandHistory? sharedHistory,
     AutosaveController? sharedAutosave,
     String? activePageId,
@@ -125,6 +131,8 @@ class EditorController extends ChangeNotifier {
        _ownsDocumentSession = ownsDocumentSession,
        _followsDocumentNavigation = followsDocumentNavigation,
        _historyOwnerId = historyOwnerId,
+       _debugBeforeHandwritingSnapshotCapture =
+           debugBeforeHandwritingSnapshotCapture,
        handwritingRecognition =
            handwritingRecognition ??
            const PlatformHandwritingRecognitionService() {
@@ -153,6 +161,7 @@ class EditorController extends ChangeNotifier {
   final InkGroupingEngine groupingEngine = InkGroupingEngine();
   final TemplateFactory templateFactory = TemplateFactory();
   final HandwritingRecognitionService handwritingRecognition;
+  final VoidCallback? _debugBeforeHandwritingSnapshotCapture;
 
   late final StreamSubscription<WhiteboardDocument> _historySubscription;
   StreamSubscription<Object>? _saveErrorSubscription;
@@ -1414,13 +1423,15 @@ class EditorController extends ChangeNotifier {
         _selectionInteractionOwner != null) {
       return false;
     }
-    final snapshot = _captureHandwritingConversionSnapshot();
-    if (snapshot == null) return false;
-
-    _handwritingConversionInProgress = true;
-    lastError = null;
-    notifyListeners();
+    var conversionStarted = false;
     try {
+      final snapshot = _captureHandwritingConversionSnapshot();
+      if (snapshot == null) return false;
+
+      _handwritingConversionInProgress = true;
+      conversionStarted = true;
+      lastError = null;
+      notifyListeners();
       if (!await handwritingRecognition.isAvailable()) {
         throw const HandwritingRecognitionUnavailable();
       }
@@ -1516,12 +1527,15 @@ class EditorController extends ChangeNotifier {
       }
       return false;
     } finally {
-      _handwritingConversionInProgress = false;
-      if (!_closed) notifyListeners();
+      if (conversionStarted) {
+        _handwritingConversionInProgress = false;
+        if (!_closed) notifyListeners();
+      }
     }
   }
 
   _HandwritingConversionSnapshot? _captureHandwritingConversionSnapshot() {
+    _debugBeforeHandwritingSnapshotCapture?.call();
     final selectedIds = Set<String>.unmodifiable(_selectedIds);
     final expandedIds = Set<String>.unmodifiable(_expandedSelectionIds);
     if (selectedIds.isEmpty || expandedIds.isEmpty) return null;
@@ -1550,8 +1564,9 @@ class EditorController extends ChangeNotifier {
   bool _isCurrentHandwritingConversionSnapshot(
     _HandwritingConversionSnapshot snapshot,
   ) {
+    final currentPage = page;
     if (_closed ||
-        page.id != snapshot.pageId ||
+        currentPage.id != snapshot.pageId ||
         document.revision != snapshot.documentRevision ||
         inkSessions.isWriting ||
         _selectionTransformPreview != null ||
@@ -1560,54 +1575,96 @@ class EditorController extends ChangeNotifier {
         !setEquals(_expandedSelectionIds, snapshot.expandedIds)) {
       return false;
     }
+    final currentSelectedStrokes = <String, InkStroke>{};
+    for (final stroke in currentPage.strokes) {
+      if (snapshot.sourceStrokesById.containsKey(stroke.id)) {
+        currentSelectedStrokes[stroke.id] = stroke;
+      }
+    }
     for (final entry in snapshot.sourceStrokesById.entries) {
-      if (!identical(page.strokeById(entry.key), entry.value)) return false;
+      if (!identical(currentSelectedStrokes[entry.key], entry.value)) {
+        return false;
+      }
     }
     return true;
   }
 
   static InkStroke? _canonicalHandwritingStroke(InkStroke source) {
     const maximumCoordinate = 10000000.0;
-    final points = <InkPoint>[];
+    var hasUsablePoint = false;
+    var needsPointRepair = false;
     for (final point in source.points) {
+      if (!point.x.isFinite ||
+          !point.y.isFinite ||
+          point.x.abs() > maximumCoordinate ||
+          point.y.abs() > maximumCoordinate) {
+        needsPointRepair = true;
+        continue;
+      }
+      hasUsablePoint = true;
+      if (!point.pressure.isFinite ||
+          point.pressure < 0 ||
+          point.pressure > 1 ||
+          !point.tiltX.isFinite ||
+          point.tiltX < -1 ||
+          point.tiltX > 1 ||
+          !point.tiltY.isFinite ||
+          point.tiltY < -1 ||
+          point.tiltY > 1) {
+        needsPointRepair = true;
+      }
+    }
+    if (!hasUsablePoint) return null;
+    final width = source.width.isFinite && source.width > 0
+        ? source.width.clamp(.0001, 80.0).toDouble()
+        : 4.0;
+    if (!needsPointRepair) {
+      return width == source.width ? source : source.copyWith(width: width);
+    }
+    return source.copyWith(
+      points: _repairedHandwritingPoints(
+        source.points,
+        maximumCoordinate: maximumCoordinate,
+      ),
+      width: width,
+    );
+  }
+
+  static Iterable<InkPoint> _repairedHandwritingPoints(
+    Iterable<InkPoint> source, {
+    required double maximumCoordinate,
+  }) sync* {
+    for (final point in source) {
       if (!point.x.isFinite ||
           !point.y.isFinite ||
           point.x.abs() > maximumCoordinate ||
           point.y.abs() > maximumCoordinate) {
         continue;
       }
-      points.add(
-        InkPoint(
+      final pressure = point.pressure.isFinite
+          ? point.pressure.clamp(0.0, 1.0).toDouble()
+          : 1.0;
+      final tiltX = point.tiltX.isFinite
+          ? point.tiltX.clamp(-1.0, 1.0).toDouble()
+          : 0.0;
+      final tiltY = point.tiltY.isFinite
+          ? point.tiltY.clamp(-1.0, 1.0).toDouble()
+          : 0.0;
+      if (pressure == point.pressure &&
+          tiltX == point.tiltX &&
+          tiltY == point.tiltY) {
+        yield point;
+      } else {
+        yield InkPoint(
           x: point.x,
           y: point.y,
-          pressure: point.pressure.isFinite
-              ? point.pressure.clamp(0.0, 1.0).toDouble()
-              : 1,
+          pressure: pressure,
           timestampMicros: point.timestampMicros,
-          tiltX: point.tiltX.isFinite
-              ? point.tiltX.clamp(-1.0, 1.0).toDouble()
-              : 0,
-          tiltY: point.tiltY.isFinite
-              ? point.tiltY.clamp(-1.0, 1.0).toDouble()
-              : 0,
-        ),
-      );
+          tiltX: tiltX,
+          tiltY: tiltY,
+        );
+      }
     }
-    if (points.isEmpty) return null;
-    final width = source.width.isFinite && source.width > 0
-        ? source.width.clamp(.0001, 80.0).toDouble()
-        : 4.0;
-    return InkStroke(
-      id: source.id,
-      points: points,
-      colorArgb: source.colorArgb,
-      width: width,
-      type: source.type,
-      zIndex: source.zIndex,
-      createdAt: source.createdAt,
-      authorId: source.authorId,
-      pointerId: source.pointerId,
-    );
   }
 
   /// Replaces a text object's content and typography as one undoable action.

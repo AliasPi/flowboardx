@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:archive/archive_io.dart';
@@ -50,6 +51,12 @@ final class AndroidOfflineModelVerifier {
     'libonnxruntime.so',
     'libonnxruntime4j_jni.so',
   ];
+  static const List<String> requiredOnnxJavaDescriptors = <String>[
+    'Lai/onnxruntime/OnnxTensor;',
+    'Lai/onnxruntime/OnnxValue;',
+    'Lai/onnxruntime/OrtSession;',
+    'Lai/onnxruntime/TensorInfo;',
+  ];
 
   OfflineModelReport verifyArchive(File artifact) {
     if (!artifact.existsSync() ||
@@ -84,11 +91,27 @@ final class AndroidOfflineModelVerifier {
               ))
             _normalized(entry.name): entry.size,
       };
+      final dexPayloads = <List<int>>[
+        for (final entry in archive.files)
+          if (entry.isFile &&
+              RegExp(
+                r'(^|/)classes[0-9]*\.dex$',
+              ).hasMatch(_normalized(entry.name)))
+            entry.content,
+      ];
+      final onnxJavaDescriptors = <String>{
+        for (final descriptor in requiredOnnxJavaDescriptors)
+          if (dexPayloads.any(
+            (payload) => _containsBytes(payload, ascii.encode(descriptor)),
+          ))
+            descriptor,
+      };
       return evaluateEntries(
         artifactName: artifact.uri.pathSegments.last,
         modelEntries: modelEntries,
         handwritingEntries: handwritingEntries,
         nativeLibraryEntries: nativeLibraryEntries,
+        onnxJavaDescriptors: onnxJavaDescriptors,
       );
     } finally {
       input.closeSync();
@@ -100,6 +123,7 @@ final class AndroidOfflineModelVerifier {
     required Map<String, int> modelEntries,
     required Map<String, OfflineAssetEvidence> handwritingEntries,
     required Map<String, int> nativeLibraryEntries,
+    required Set<String> onnxJavaDescriptors,
   }) {
     final normalizedEntries = <String, int>{
       for (final entry in modelEntries.entries)
@@ -193,6 +217,16 @@ final class AndroidOfflineModelVerifier {
         '(fehlend/zu klein: ${missingNativeLibraries.join(', ')}).',
       );
     }
+    final missingOnnxJavaTypes = requiredOnnxJavaDescriptors
+        .where((descriptor) => !onnxJavaDescriptors.contains(descriptor))
+        .toList(growable: false);
+    if (missingOnnxJavaTypes.isNotEmpty) {
+      throw StateError(
+        'Das Android-Artefakt $artifactName enthält nicht alle von der '
+        'nativen ONNX-Runtime per JNI aufgelösten Java-Typen '
+        '(fehlend: ${missingOnnxJavaTypes.join(', ')}).',
+      );
+    }
     final handwritingBytes = normalizedHandwriting.values.fold<int>(
       0,
       (sum, asset) => sum + (asset.size > 0 ? asset.size : 0),
@@ -204,10 +238,29 @@ final class AndroidOfflineModelVerifier {
       handwritingAssetCount: normalizedHandwriting.length,
       handwritingAssetBytes: handwritingBytes,
       onnxRuntimeLibraryCount: normalizedNativeLibraries.length,
+      onnxRuntimeJavaTypeCount: onnxJavaDescriptors.length,
     );
   }
 
   static String _normalized(String path) => path.replaceAll('\\', '/');
+
+  static bool _containsBytes(List<int> data, List<int> pattern) {
+    if (pattern.isEmpty) return true;
+    if (pattern.length > data.length) return false;
+    final lastStart = data.length - pattern.length;
+    for (var start = 0; start <= lastStart; start++) {
+      if (data[start] != pattern.first) continue;
+      var matched = true;
+      for (var offset = 1; offset < pattern.length; offset++) {
+        if (data[start + offset] != pattern[offset]) {
+          matched = false;
+          break;
+        }
+      }
+      if (matched) return true;
+    }
+    return false;
+  }
 }
 
 final class OfflineModelReport {
@@ -218,6 +271,7 @@ final class OfflineModelReport {
     required this.handwritingAssetCount,
     required this.handwritingAssetBytes,
     required this.onnxRuntimeLibraryCount,
+    required this.onnxRuntimeJavaTypeCount,
   });
 
   final String artifactName;
@@ -226,6 +280,7 @@ final class OfflineModelReport {
   final int handwritingAssetCount;
   final int handwritingAssetBytes;
   final int onnxRuntimeLibraryCount;
+  final int onnxRuntimeJavaTypeCount;
 }
 
 final class OfflineAssetEvidence {
@@ -253,6 +308,7 @@ void main(List<String> arguments) {
       '${report.handwritingAssetCount} PP-OCRv5-Assets, '
       '${report.handwritingAssetBytes} Byte; '
       '${report.onnxRuntimeLibraryCount} ONNX-Runtime-Bibliotheken, '
+      '${report.onnxRuntimeJavaTypeCount} JNI-Java-Typen, '
       'vollständig offline.',
     );
   }

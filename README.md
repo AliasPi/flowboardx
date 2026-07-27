@@ -463,6 +463,20 @@ gemeinsamen, serialisierten Lebenszyklus. Eine erfolgreich ausgeführte
 PP-OCR-Inferenz lädt nicht zusätzlich die ML-Kit-Laufzeit; der Fallback wird erst
 bei einer technisch nicht verfügbaren primären Engine initialisiert.
 
+ONNX Runtime löst einen Teil seiner Java-Typen aus nativem JNI-Code über feste
+Binärnamen auf. Der Android-Release übernimmt deshalb die
+[offizielle `ai.onnxruntime`-Keep-Regel](https://onnxruntime.ai/docs/build/android.html#note-proguard-rules-for-r8-minimization-android-app-builds-to-work).
+Der Build kontrolliert sowohl die R8-Berichte als auch die tatsächlich erzeugten
+DEX-Dateien jeder APK; fehlen beispielsweise `TensorInfo` oder `OnnxTensor`,
+wird das Artefakt nicht ausgeliefert. Das verhindert einen ansonsten nicht
+abfangbaren Release-only-`SIGABRT`.
+
+Vor dem Laden wird die materialisierte ONNX-Datei zusätzlich gegen den
+eingebetteten SHA-256-Wert geprüft. Jede Inferenz verwendet eigene
+`OrtSession.RunOptions`; der gemeinsame Erkennungs-Deadline kann dadurch auch
+einen bereits laufenden nativen ORT-Aufruf beenden, statt nur den Dart-Future
+abzubrechen.
+
 Modellquelle:
 [`PaddlePaddle/latin_PP-OCRv5_mobile_rec_onnx`](https://huggingface.co/PaddlePaddle/latin_PP-OCRv5_mobile_rec_onnx),
 SHA-256

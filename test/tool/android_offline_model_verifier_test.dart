@@ -19,6 +19,9 @@ void main() {
         'lib/$abi/$library':
             AndroidOfflineModelVerifier.minimumOnnxRuntimeLibraryBytes + 1,
   };
+  final validOnnxJavaDescriptors = AndroidOfflineModelVerifier
+      .requiredOnnxJavaDescriptors
+      .toSet();
 
   test('accepts a complete statically bundled Latin model', () {
     final entries = <String, int>{
@@ -33,6 +36,7 @@ void main() {
       modelEntries: entries,
       handwritingEntries: validHandwriting,
       nativeLibraryEntries: validNativeLibraries,
+      onnxJavaDescriptors: validOnnxJavaDescriptors,
     );
 
     expect(
@@ -56,6 +60,7 @@ void main() {
         },
         handwritingEntries: validHandwriting,
         nativeLibraryEntries: validNativeLibraries,
+        onnxJavaDescriptors: validOnnxJavaDescriptors,
       ),
       throwsA(
         isA<StateError>().having(
@@ -89,6 +94,7 @@ void main() {
         modelEntries: entries,
         handwritingEntries: changed,
         nativeLibraryEntries: validNativeLibraries,
+        onnxJavaDescriptors: validOnnxJavaDescriptors,
       ),
       throwsA(
         isA<StateError>().having(
@@ -116,12 +122,41 @@ void main() {
         modelEntries: entries,
         handwritingEntries: validHandwriting,
         nativeLibraryEntries: incompleteNative,
+        onnxJavaDescriptors: validOnnxJavaDescriptors,
       ),
       throwsA(
         isA<StateError>().having(
           (error) => error.message,
           'message',
           allOf(contains('ABI-passende ONNX-Runtime'), contains('arm64-v8a')),
+        ),
+      ),
+    );
+  });
+
+  test('rejects an R8 artifact missing a JNI-resolved ONNX Java type', () {
+    final entries = <String, int>{
+      for (final suffix in AndroidOfflineModelVerifier.requiredModelSuffixes)
+        'base/assets/$suffix': 310000,
+      for (var index = 0; index < 14; index++)
+        'assets/mlkit-google-ocr-models/part-$index.binarypb': 1000,
+    };
+    final incompleteDescriptors = Set<String>.of(validOnnxJavaDescriptors)
+      ..remove('Lai/onnxruntime/TensorInfo;');
+
+    expect(
+      () => verifier.evaluateEntries(
+        artifactName: 'app-arm64-v8a-release.apk',
+        modelEntries: entries,
+        handwritingEntries: validHandwriting,
+        nativeLibraryEntries: validNativeLibraries,
+        onnxJavaDescriptors: incompleteDescriptors,
+      ),
+      throwsA(
+        isA<StateError>().having(
+          (error) => error.message,
+          'message',
+          allOf(contains('JNI'), contains('TensorInfo')),
         ),
       ),
     );

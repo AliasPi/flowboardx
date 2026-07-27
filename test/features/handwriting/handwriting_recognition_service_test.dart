@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:flowboard_x/src/domain/model/ink.dart';
@@ -312,6 +313,74 @@ void main() {
     expect(await service.prepare(languageTag: 'en-US'), isTrue);
     expect(invocation?.method, 'ensureModel');
     expect(invocation?.arguments, containsPair('languageTag', 'en-US'));
+  });
+
+  test('prepare timeout is reported as a typed engine failure', () async {
+    final pending = Completer<Object?>();
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (_) => pending.future);
+    const timedService = PlatformHandwritingRecognitionService(
+      channel: channel,
+      ensureModelTimeout: Duration(milliseconds: 20),
+    );
+
+    await expectLater(
+      timedService.prepare(),
+      throwsA(
+        isA<HandwritingRecognitionFailure>()
+            .having(
+              (failure) => failure.kind,
+              'kind',
+              HandwritingRecognitionFailureKind.engineFailure,
+            )
+            .having(
+              (failure) => failure.toString(),
+              'message',
+              contains('nicht rechtzeitig'),
+            ),
+      ),
+    );
+    pending.complete(true);
+  });
+
+  test('recognition timeout is reported as a typed engine failure', () async {
+    final pending = Completer<Object?>();
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (_) => pending.future);
+    const timedService = PlatformHandwritingRecognitionService(
+      channel: channel,
+      recognitionTimeout: Duration(milliseconds: 20),
+    );
+
+    await expectLater(
+      timedService.recognize(
+        HandwritingRecognitionRequest(
+          strokes: <InkStroke>[
+            InkStroke(
+              id: 'timeout',
+              points: const <InkPoint>[InkPoint(x: 1, y: 2)],
+            ),
+          ],
+        ),
+      ),
+      throwsA(
+        isA<HandwritingRecognitionFailure>()
+            .having(
+              (failure) => failure.kind,
+              'kind',
+              HandwritingRecognitionFailureKind.engineFailure,
+            )
+            .having(
+              (failure) => failure.toString(),
+              'message',
+              contains('Zeitlimit'),
+            ),
+      ),
+    );
+    pending.complete(<String, Object?>{
+      'status': 'recognized',
+      'text': 'zu spät',
+    });
   });
 
   test(

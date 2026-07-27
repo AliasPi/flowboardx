@@ -129,6 +129,112 @@ void main() {
     },
   );
 
+  test(
+    'valid dense handwriting snapshots reuse stroke and point storage',
+    () async {
+      final recognition = _DeferredRecognition();
+      final base = WhiteboardDocument.create(id: 'ocr-dense-snapshot');
+      final source = InkStroke(
+        id: 'dense-ink',
+        width: 8,
+        points: List<InkPoint>.generate(
+          12000,
+          (index) => InkPoint(
+            x: index / 4,
+            y: 120 + math.sin(index / 20) * 24,
+            pressure: .6,
+            timestampMicros: index,
+          ),
+          growable: false,
+        ),
+      );
+      final controller = EditorController(
+        document: base.copyWith(
+          pages: <BoardPage>[
+            base.currentPage.copyWith(
+              strokes: <InkStroke>[source],
+              selection: SelectionState(
+                selectedItemIds: const <String>['dense-ink'],
+              ),
+            ),
+          ],
+        ),
+        repository: _MemoryRepository(),
+        assetDirectory: Directory.current,
+        handwritingRecognition: recognition,
+      );
+      addTearDown(() async {
+        await controller.close();
+        controller.dispose();
+      });
+
+      final conversion = controller.convertSelectedHandwritingToText();
+      await recognition.started.future;
+      final captured = recognition.requests.single.strokes.single;
+      expect(captured, same(source));
+      expect(captured.points, same(source.points));
+      expect(captured.points.first, same(source.points.first));
+      expect(captured.points.last, same(source.points.last));
+
+      recognition.complete('Speichergebunden');
+      expect(await conversion, isTrue);
+    },
+  );
+
+  test(
+    'snapshot capture failures stay inside the conversion boundary',
+    () async {
+      final recognition = _DeferredRecognition();
+      final controller = _controllerWithSelectedStroke(
+        documentId: 'ocr-capture-failure',
+        recognition: recognition,
+        debugBeforeHandwritingSnapshotCapture: () {
+          throw StateError('Beschädigter Snapshot');
+        },
+      );
+      addTearDown(() async {
+        await controller.close();
+        controller.dispose();
+      });
+
+      expect(await controller.convertSelectedHandwritingToText(), isFalse);
+      expect(controller.isHandwritingConversionInProgress, isFalse);
+      expect(controller.page.strokes, hasLength(1));
+      expect(recognition.recognizeCalls, 0);
+      expect(controller.lastError, contains('Beschädigter Snapshot'));
+    },
+  );
+
+  test(
+    'typed recognition failures release the conversion busy state',
+    () async {
+      final recognition = _DeferredRecognition();
+      final controller = _controllerWithSelectedStroke(
+        documentId: 'ocr-timeout-state',
+        recognition: recognition,
+      );
+      addTearDown(() async {
+        await controller.close();
+        controller.dispose();
+      });
+
+      final conversion = controller.convertSelectedHandwritingToText();
+      await recognition.started.future;
+      expect(controller.isHandwritingConversionInProgress, isTrue);
+      recognition.fail(
+        const HandwritingRecognitionFailure(
+          HandwritingRecognitionFailureKind.engineFailure,
+          'Die lokale Handschrifterkennung hat das Zeitlimit überschritten.',
+        ),
+      );
+
+      expect(await conversion, isFalse);
+      expect(controller.isHandwritingConversionInProgress, isFalse);
+      expect(controller.page.strokes, hasLength(1));
+      expect(controller.lastError, contains('Zeitlimit'));
+    },
+  );
+
   testWidgets('conversion action is disabled while recognition is pending', (
     tester,
   ) async {
@@ -331,6 +437,7 @@ void main() {
       final requestStroke = recognition.requests.single.strokes.single;
       expect(requestStroke.points, hasLength(2));
       expect(requestStroke.width, 4);
+      expect(requestStroke.points.last, same(source.points.last));
       expect(
         requestStroke.points.every(
           (point) =>
@@ -950,6 +1057,12 @@ final class _DeferredRecognition implements HandwritingRecognitionService {
       _result.complete(HandwritingRecognitionResult(text: text));
     }
   }
+
+  void fail(Object error, [StackTrace? stackTrace]) {
+    if (!_result.isCompleted) {
+      _result.completeError(error, stackTrace ?? StackTrace.current);
+    }
+  }
 }
 
 final class _NoCandidateRecognition implements HandwritingRecognitionService {
@@ -1002,6 +1115,7 @@ final class _NoAssets implements BoardAssetResolver {
 EditorController _controllerWithSelectedStroke({
   required String documentId,
   required HandwritingRecognitionService recognition,
+  VoidCallback? debugBeforeHandwritingSnapshotCapture,
 }) {
   final base = WhiteboardDocument.create(id: documentId);
   final stroke = InkStroke(
@@ -1024,5 +1138,7 @@ EditorController _controllerWithSelectedStroke({
     repository: _MemoryRepository(),
     assetDirectory: Directory.current,
     handwritingRecognition: recognition,
+    debugBeforeHandwritingSnapshotCapture:
+        debugBeforeHandwritingSnapshotCapture,
   );
 }
