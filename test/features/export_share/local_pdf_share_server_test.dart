@@ -153,6 +153,89 @@ void main() {
     expect(server.session?.url, current.url);
     expect(server.session?.fileName, 'second.pdf');
   });
+
+  test(
+    'a request from a replaced session cannot mutate the new session',
+    () async {
+      final events = <LocalPdfShareEvent>[];
+      final subscription = server.events.listen(events.add);
+      addTearDown(subscription.cancel);
+      final blockedSource = _BlockedRequestLengthSource();
+      final oldSession = await server.start(blockedSource);
+
+      final oldRequest = await client.getUrl(oldSession.url);
+      final oldResponse = () async {
+        try {
+          final response = await oldRequest.close();
+          await response.drain<void>();
+        } on Object {
+          // Force-closing the replaced server is also a valid client outcome.
+        }
+      }();
+      await blockedSource.requestLengthStarted.future;
+
+      final replacementFuture = server.start(
+        SharedPdfSource.bytes(
+          Uint8List.fromList('%PDF-new'.codeUnits),
+          fileName: 'new.pdf',
+        ),
+      );
+      // The old socket may wait for its handler to unwind on some platforms.
+      // Releasing it after replacement has begun exercises the operation gate.
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      blockedSource.releaseRequestLength.complete();
+      final replacement = await replacementFuture;
+      await oldResponse.timeout(const Duration(seconds: 2));
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+
+      expect(server.session?.url, replacement.url);
+      expect(server.session?.downloadCount, 0);
+      expect(
+        events.where(
+          (event) =>
+              event.kind == LocalPdfShareEventKind.downloaded &&
+              event.session.url == replacement.url,
+        ),
+        isEmpty,
+      );
+    },
+  );
+
+  test('counts two overlapping downloads in the same session', () async {
+    final source = _ParallelDownloadSource();
+    final downloadedEvents = <LocalPdfShareEvent>[];
+    final subscription = server.events
+        .where((event) => event.kind == LocalPdfShareEventKind.downloaded)
+        .listen(downloadedEvents.add);
+    addTearDown(subscription.cancel);
+    final session = await server.start(source);
+
+    final firstRequest = await client.getUrl(session.url);
+    final secondRequest = await client.getUrl(session.url);
+    final firstDownload = firstRequest.close().then(_read);
+    final secondDownload = secondRequest.close().then(_read);
+    await source.bothOpened.future;
+    source.release.complete();
+
+    final downloads = await Future.wait([firstDownload, secondDownload]);
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+
+    expect(downloads, everyElement(source.bytes));
+    expect(server.session?.downloadCount, 2);
+    expect(downloadedEvents, hasLength(2));
+  });
+
+  test('contains an unexpected source failure inside the request', () async {
+    final source = _FailingRequestLengthSource();
+    final session = await server.start(source);
+
+    final request = await client.getUrl(session.url);
+    final response = await request.close();
+    await response.drain<void>();
+
+    expect(response.statusCode, HttpStatus.internalServerError);
+    expect(server.session?.url, session.url);
+  });
 }
 
 Future<Uint8List> _read(HttpClientResponse response) async {
@@ -161,4 +244,73 @@ Future<Uint8List> _read(HttpClientResponse response) async {
     builder.add(chunk);
   }
   return builder.takeBytes();
+}
+
+final class _BlockedRequestLengthSource implements SharedDownloadSource {
+  final Completer<void> requestLengthStarted = Completer<void>();
+  final Completer<void> releaseRequestLength = Completer<void>();
+  var _lengthReads = 0;
+
+  @override
+  String get fileName => 'old.pdf';
+
+  @override
+  ContentType get contentType => ContentType('application', 'pdf');
+
+  @override
+  Future<int> get length async {
+    _lengthReads++;
+    if (_lengthReads > 1) {
+      requestLengthStarted.complete();
+      await releaseRequestLength.future;
+    }
+    return 8;
+  }
+
+  @override
+  Stream<List<int>> openRead() => Stream<List<int>>.value('%PDF-old'.codeUnits);
+}
+
+final class _ParallelDownloadSource implements SharedDownloadSource {
+  final bytes = Uint8List.fromList('%PDF-parallel'.codeUnits);
+  final Completer<void> bothOpened = Completer<void>();
+  final Completer<void> release = Completer<void>();
+  var _opened = 0;
+
+  @override
+  String get fileName => 'parallel.pdf';
+
+  @override
+  ContentType get contentType => ContentType('application', 'pdf');
+
+  @override
+  Future<int> get length async => bytes.length;
+
+  @override
+  Stream<List<int>> openRead() async* {
+    _opened++;
+    if (_opened == 2) bothOpened.complete();
+    await release.future;
+    yield bytes;
+  }
+}
+
+final class _FailingRequestLengthSource implements SharedDownloadSource {
+  var _reads = 0;
+
+  @override
+  String get fileName => 'failure.pdf';
+
+  @override
+  ContentType get contentType => ContentType('application', 'pdf');
+
+  @override
+  Future<int> get length async {
+    _reads++;
+    if (_reads > 1) throw StateError('simulated source failure');
+    return 8;
+  }
+
+  @override
+  Stream<List<int>> openRead() => Stream<List<int>>.value('%PDF-ok'.codeUnits);
 }

@@ -5,6 +5,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
+import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -29,94 +30,77 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Offline handwriting adapter backed by ML Kit's *bundled* Latin recognizer.
+ * Offline handwriting adapter backed primarily by the APK-bundled
+ * PP-OCRv5 Latin handwriting model, executed through ONNX Runtime.
  *
  * Flowboard keeps ink as vectors. For recognition only, this service renders a
- * tightly cropped, high-contrast bitmap off the Android main thread and feeds
- * it to the model packaged in the APK via `com.google.mlkit:text-recognition`.
- * No Play Services model installation and no runtime download are involved.
+ * tightly cropped, high-contrast line bitmap off the Android main thread.
+ * ML Kit's bundled Latin image OCR remains a defensive fallback. Neither path
+ * uses Play Services model installation or a runtime download.
  */
-internal class AndroidHandwritingRecognitionService(messenger: BinaryMessenger) {
+class AndroidHandwritingRecognitionService(
+    context: Context,
+    messenger: BinaryMessenger,
+) {
     private val channel = MethodChannel(messenger, CHANNEL_NAME)
     private val mainHandler = Handler(Looper.getMainLooper())
     private val rasterExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "flowboard-handwriting-raster").apply { isDaemon = true }
     }
     private val activeNativeTasks = AtomicInteger(0)
-    private val requestInFlight = AtomicBoolean(false)
+    private val pendingRequests = AtomicInteger(0)
+    private val nativeTaskMonitor = Object()
     private val recognizerClosed = AtomicBoolean(false)
     private val recognizer: TextRecognizer? = runCatching {
         TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
     }.onFailure { error ->
         Log.e(TAG, "Bundled handwriting recognizer could not be created", error)
     }.getOrNull()
+    @Volatile
+    private var paddleRecognizer: PaddleOcrHandwritingRecognizer? =
+        createPaddleRecognizer(context.applicationContext)
 
     @Volatile
     private var disposed = false
 
     init {
         channel.setMethodCallHandler(::handleMethodCall)
-        // Force the bundled model through one tiny inference while the user is
-        // still opening the document. Integrated classroom boards often have
-        // slower storage than tablets; warming on our private worker prevents
-        // the first real conversion from spending most of its deadline loading
-        // model pages. A real request is queued behind this task and therefore
-        // never races the warm-up.
-        recognizer?.let { localRecognizer ->
-            runCatching {
-                rasterExecutor.execute { warmBundledRecognizer(localRecognizer) }
-            }.onFailure { error ->
-                Log.w(TAG, "Bundled handwriting recognizer could not be warmed", error)
-            }
+    }
+
+    private fun createPaddleRecognizer(context: Context): PaddleOcrHandwritingRecognizer? =
+        OptionalNativeEngine.create(
+            onFailure = { error ->
+                // In particular catch LinkageError/ExceptionInInitializerError.
+                // Paddle is an optional primary engine; its failure must never
+                // prevent the independent ML Kit fallback from starting.
+                Log.e(TAG, "Bundled PP-OCRv5 engine could not be prepared", error)
+            },
+        ) {
+            PaddleOcrHandwritingRecognizer(context)
         }
+
+    private fun disablePaddleRecognizer(
+        failedRecognizer: PaddleOcrHandwritingRecognizer,
+        error: Throwable,
+    ) {
+        if (paddleRecognizer === failedRecognizer) {
+            paddleRecognizer = null
+        }
+        runCatching { failedRecognizer.close() }
+            .onFailure { closeError ->
+                Log.w(TAG, "Could not close failed PP-OCRv5 engine", closeError)
+            }
+        Log.w(TAG, "Bundled PP-OCRv5 disabled; using Latin OCR fallback", error)
     }
 
     fun dispose() {
         disposed = true
         channel.setMethodCallHandler(null)
-        rasterExecutor.shutdownNow()
+        // Drain accepted jobs so every MethodChannel call receives exactly
+        // one terminal response. shutdownNow() used to drop queued two-user
+        // requests and leave their Dart futures unresolved forever.
+        rasterExecutor.shutdown()
         closeRecognizerWhenIdle()
-    }
-
-    private fun warmBundledRecognizer(recognizer: TextRecognizer) {
-        if (disposed || Thread.currentThread().isInterrupted) return
-        val bitmap = Bitmap.createBitmap(96, 64, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bitmap)
-        canvas.drawColor(Color.WHITE)
-        canvas.drawLine(
-            24f,
-            45f,
-            72f,
-            18f,
-            Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.BLACK
-                style = Paint.Style.STROKE
-                strokeCap = Paint.Cap.ROUND
-                strokeWidth = 4f
-            },
-        )
-        val released = AtomicBoolean(false)
-        val releaseBitmap = {
-            if (released.compareAndSet(false, true)) {
-                bitmap.recycle()
-                releaseNativeTask()
-            }
-        }
-        var completionOwnsBitmap = false
-        try {
-            activeNativeTasks.incrementAndGet()
-            val task = recognizer.process(InputImage.fromBitmap(bitmap, 0))
-            task.addOnCompleteListener(DIRECT_EXECUTOR) { releaseBitmap() }
-            completionOwnsBitmap = true
-            Tasks.await(task, MODEL_WARMUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-        } catch (error: Throwable) {
-            if (error is InterruptedException) Thread.currentThread().interrupt()
-            Log.w(TAG, "Bundled handwriting warm-up did not complete", error)
-        } finally {
-            // ML Kit may continue after our wait budget. Once a completion
-            // listener is registered it is the sole bitmap owner.
-            if (!completionOwnsBitmap) releaseBitmap()
-        }
     }
 
     private fun handleMethodCall(call: MethodCall, result: MethodChannel.Result) {
@@ -128,7 +112,10 @@ internal class AndroidHandwritingRecognitionService(messenger: BinaryMessenger) 
             "ensureModel", "isAvailable" -> {
                 val languageTag = (call.arguments as? Map<*, *>)
                     ?.get("languageTag") as? String ?: DEFAULT_LANGUAGE_TAG
-                result.success(recognizer != null && isSupportedLanguageTag(languageTag))
+                result.success(
+                    isSupportedLanguageTag(languageTag) &&
+                        (paddleRecognizer?.hasBundledAssets() == true || recognizer != null),
+                )
             }
             "recognize" -> recognize(call.arguments, result)
             else -> result.notImplemented()
@@ -137,7 +124,9 @@ internal class AndroidHandwritingRecognitionService(messenger: BinaryMessenger) 
 
     private fun recognize(arguments: Any?, result: MethodChannel.Result) {
         val localRecognizer = recognizer
-        if (localRecognizer == null) {
+        if (localRecognizer == null &&
+            paddleRecognizer?.hasBundledAssets() != true
+        ) {
             result.error(
                 "recognizer_start_failed",
                 "Die eingebettete Handschrifterkennung konnte nicht gestartet werden.",
@@ -145,13 +134,15 @@ internal class AndroidHandwritingRecognitionService(messenger: BinaryMessenger) 
             )
             return
         }
-        if (!requestInFlight.compareAndSet(false, true)) {
+        val queued = pendingRequests.incrementAndGet()
+        if (queued > MAX_PENDING_REQUESTS) {
+            releasePendingRequest()
             result.success(
                 mapOf(
                     "status" to "notRecognized",
                     "message" to
-                        "Eine Handschrifterkennung läuft bereits. " +
-                        "Bitte gleich erneut versuchen.",
+                        "Es warten bereits mehrere Handschrifterkennungen. " +
+                        "Bitte einen Moment warten.",
                     "engine" to ENGINE_NAME,
                     "modelDelivery" to MODEL_DELIVERY,
                     "attempts" to 0,
@@ -176,16 +167,33 @@ internal class AndroidHandwritingRecognitionService(messenger: BinaryMessenger) 
                         )
                         return@execute
                     }
-                    // A timed-out warm-up/recognition may still own its native
-                    // bitmap. Never overlap another large inference with it.
-                    if (activeNativeTasks.get() > 0) {
+                    if (disposed) {
+                        postError(
+                            result,
+                            "service_closed",
+                            "Die Handschrifterkennung wurde beendet.",
+                        )
+                        return@execute
+                    }
+                    // A timed-out native task can complete after Tasks.await
+                    // returns. Wait for it instead of rejecting the next
+                    // participant's valid request as unrecognized handwriting.
+                    if (!awaitNativeTasksIdle(NATIVE_DRAIN_TIMEOUT_SECONDS)) {
+                        if (disposed) {
+                            postError(
+                                result,
+                                "service_closed",
+                                "Die Handschrifterkennung wurde beendet.",
+                            )
+                            return@execute
+                        }
                         postSuccess(
                             result,
                             mapOf(
                                 "status" to "notRecognized",
                                 "message" to
-                                    "Die vorherige Handschrifterkennung wird noch abgeschlossen. " +
-                                    "Bitte gleich erneut versuchen.",
+                                    "Die Erkennungs-Engine beendet noch einen " +
+                                    "vorherigen Auftrag. Bitte gleich erneut versuchen.",
                                 "engine" to ENGINE_NAME,
                                 "modelDelivery" to MODEL_DELIVERY,
                                 "attempts" to 0,
@@ -195,7 +203,14 @@ internal class AndroidHandwritingRecognitionService(messenger: BinaryMessenger) 
                     }
                     try {
                         val outcome = recognizeWithOfflineFallbacks(localRecognizer, request)
-                        if (disposed) return@execute
+                        if (disposed) {
+                            postError(
+                                result,
+                                "service_closed",
+                                "Die Handschrifterkennung wurde beendet.",
+                            )
+                            return@execute
+                        }
                         if (outcome.candidate == null) {
                             postSuccess(
                                 result,
@@ -207,6 +222,10 @@ internal class AndroidHandwritingRecognitionService(messenger: BinaryMessenger) 
                                     "engine" to ENGINE_NAME,
                                     "modelDelivery" to MODEL_DELIVERY,
                                     "attempts" to outcome.attemptCount,
+                                    "lineCountHint" to outcome.lineCountHint,
+                                    "wordCountHint" to outcome.wordCountHint,
+                                    "durationMillis" to outcome.durationMillis,
+                                    "timedOut" to outcome.timedOut,
                                 ),
                             )
                         } else {
@@ -219,6 +238,10 @@ internal class AndroidHandwritingRecognitionService(messenger: BinaryMessenger) 
                                     "engine" to ENGINE_NAME,
                                     "modelDelivery" to MODEL_DELIVERY,
                                     "attempts" to outcome.attemptCount,
+                                    "lineCountHint" to outcome.lineCountHint,
+                                    "wordCountHint" to outcome.wordCountHint,
+                                    "durationMillis" to outcome.durationMillis,
+                                    "timedOut" to outcome.timedOut,
                                 ),
                             )
                         }
@@ -231,11 +254,11 @@ internal class AndroidHandwritingRecognitionService(messenger: BinaryMessenger) 
                         )
                     }
                 } finally {
-                    requestInFlight.set(false)
+                    releasePendingRequest()
                 }
             }
         } catch (error: Throwable) {
-            requestInFlight.set(false)
+            releasePendingRequest()
             Log.e(TAG, "Handwriting worker is unavailable", error)
             result.error(
                 "service_closed",
@@ -252,93 +275,226 @@ internal class AndroidHandwritingRecognitionService(messenger: BinaryMessenger) 
      * the APK; this method never downloads or installs a model.
      */
     private fun recognizeWithOfflineFallbacks(
-        recognizer: TextRecognizer,
+        recognizer: TextRecognizer?,
         request: RecognitionRequest,
     ): RecognitionOutcome {
+        val startedNanos = System.nanoTime()
         val deadlineNanos = System.nanoTime() +
             TimeUnit.SECONDS.toNanos(RECOGNITION_TIMEOUT_SECONDS)
         var attempts = 0
         var completedAttempt = false
         var timedOut = false
-        var lastFailure: Exception? = null
-        val candidates = ArrayList<OcrCandidate>(RENDER_STYLES.size + 1)
-        val lines = splitIntoLines(request.strokes)
+        var lastFailure: Throwable? = null
+        val candidates = ArrayList<OcrCandidate>(
+            PRIMARY_RENDER_STYLES.size + RECOVERY_RENDER_STYLES.size + 2,
+        )
+        val lines = HandwritingInkPreprocessor
+            .splitIntoLines(request.strokes)
+            .ifEmpty { listOf(request.strokes) }
         val lineCountHint = lines.size.coerceIn(1, MAX_LINE_FALLBACKS)
-        for (style in RENDER_STYLES) {
-            if (disposed || Thread.currentThread().isInterrupted) break
+        val normalizedRequest = RecognitionRequest(lines.flatten())
+        val wordsByLine = lines.map(HandwritingInkPreprocessor::splitIntoWords)
+        val expectedWordCount = wordsByLine.sumOf { it.size }
+
+        fun runPaddleProfile(
+            engine: PaddleOcrHandwritingRecognizer,
+            style: RenderStyle,
+            label: String,
+        ): OcrCandidate? {
+            val recognizedLines = ArrayList<OcrCandidate>(lines.size)
+            var completePaddleResult = true
+            for (line in lines.take(MAX_LINE_FALLBACKS)) {
+                if (System.nanoTime() >= deadlineNanos) {
+                    timedOut = true
+                    completePaddleResult = false
+                    break
+                }
+                attempts++
+                val bitmap = renderInk(
+                    RecognitionRequest(line),
+                    style,
+                    1,
+                )
+                try {
+                    val recognized = engine.recognize(bitmap)
+                    completedAttempt = true
+                    // ORT runs synchronously, but recognition is already off the
+                    // UI thread. Enforce the shared budget immediately after
+                    // native inference and discard an over-budget result.
+                    if (System.nanoTime() >= deadlineNanos) {
+                        timedOut = true
+                        completePaddleResult = false
+                        break
+                    }
+                    if (recognized == null) {
+                        completePaddleResult = false
+                        break
+                    }
+                    recognizedLines += OcrCandidate(
+                        text = recognized.text,
+                        confidence = recognized.confidence,
+                        quality = candidateTextQuality(recognized.text),
+                        layoutFidelity = 1.0,
+                    )
+                } catch (error: Throwable) {
+                    completePaddleResult = false
+                    lastFailure = error
+                    if (error is InterruptedException) {
+                        Thread.currentThread().interrupt()
+                    }
+                    disablePaddleRecognizer(engine, error)
+                    break
+                } finally {
+                    bitmap.recycle()
+                }
+            }
+            if (!completePaddleResult || recognizedLines.size != lines.size) {
+                return null
+            }
+            Log.d(TAG, "Bundled PP-OCRv5 $label profile completed")
+            return combineLineCandidates(recognizedLines)
+        }
+
+        fun successfulPaddleOutcome(candidate: OcrCandidate): RecognitionOutcome {
+            val durationMillis = TimeUnit.NANOSECONDS
+                .toMillis(System.nanoTime() - startedNanos)
+                .coerceIn(0L, Int.MAX_VALUE.toLong())
+                .toInt()
+            return RecognitionOutcome(
+                candidate = candidate,
+                attemptCount = attempts,
+                lineCountHint = lines.size,
+                wordCountHint = expectedWordCount,
+                durationMillis = durationMillis,
+                timedOut = timedOut,
+            )
+        }
+
+        // A single moderate-confidence raster must not replace the selected ink
+        // before any independent evidence is available. Very strong geometry-
+        // consistent output may return directly; otherwise use a second raster
+        // profile and then the adaptive ML Kit ensemble below.
+        val localPaddle = paddleRecognizer
+        if (localPaddle != null &&
+            !disposed &&
+            !Thread.currentThread().isInterrupted
+        ) {
+            val primaryPaddle = runPaddleProfile(
+                localPaddle,
+                PADDLE_RENDER_STYLES.first(),
+                "primary",
+            )
+            if (primaryPaddle != null) {
+                candidates += primaryPaddle
+                if (PaddleCandidatePolicy.isStrongStandalone(
+                        text = primaryPaddle.text,
+                        confidence = primaryPaddle.confidence,
+                        quality = primaryPaddle.quality,
+                        expectedLineCount = lines.size,
+                        expectedWordCount = expectedWordCount,
+                    )
+                ) {
+                    return successfulPaddleOutcome(primaryPaddle)
+                }
+            }
+
+            if (!timedOut &&
+                paddleRecognizer === localPaddle &&
+                PADDLE_RENDER_STYLES.size > 1
+            ) {
+                val confirmingPaddle = runPaddleProfile(
+                    localPaddle,
+                    PADDLE_RENDER_STYLES[1],
+                    "confirmation",
+                )
+                if (confirmingPaddle != null) {
+                    candidates += confirmingPaddle
+                    if (primaryPaddle != null &&
+                        PaddleCandidatePolicy.hasIndependentRasterConsensus(
+                            firstConfidence = primaryPaddle.confidence,
+                            firstQuality = primaryPaddle.quality,
+                            secondConfidence = confirmingPaddle.confidence,
+                            secondQuality = confirmingPaddle.quality,
+                            similarity = candidateSimilarity(
+                                primaryPaddle.text,
+                                confirmingPaddle.text,
+                            ),
+                        )
+                    ) {
+                        val agreed = chooseBestCandidate(
+                            listOf(primaryPaddle, confirmingPaddle),
+                            expectedLineCount = lines.size,
+                            expectedWordCount = expectedWordCount,
+                        ) ?: primaryPaddle
+                        return successfulPaddleOutcome(agreed)
+                    }
+                }
+            }
+        }
+
+        fun runAttempt(
+            attemptRequest: RecognitionRequest,
+            style: RenderStyle,
+            expectedLines: Int,
+            label: String,
+        ): OcrCandidate? {
+            if (recognizer == null ||
+                timedOut ||
+                disposed ||
+                Thread.currentThread().isInterrupted ||
+                System.nanoTime() >= deadlineNanos
+            ) {
+                return null
+            }
             attempts++
-            val bitmap = renderInk(request, style, lineCountHint)
+            val bitmap = renderInk(attemptRequest, style, expectedLines)
             try {
                 val candidate = recognizeBitmap(recognizer, bitmap, deadlineNanos)
                 completedAttempt = true
-                if (candidate != null) candidates += candidate
+                return candidate
             } catch (error: TimeoutException) {
                 lastFailure = error
                 timedOut = true
-                Log.w(TAG, "Handwriting recognition reached its global deadline", error)
-                break
+                Log.w(TAG, "Handwriting $label reached its global deadline", error)
             } catch (error: Exception) {
                 if (error is InterruptedException) {
                     Thread.currentThread().interrupt()
                     throw error
                 }
                 lastFailure = error
-                Log.w(TAG, "Handwriting raster attempt $attempts failed", error)
+                Log.w(TAG, "Handwriting $label attempt $attempts failed", error)
             }
+            return null
         }
 
-        // A multi-line selection can still be ambiguous after normalization.
-        // Retry spatially separated lines when the page pass missed one or
-        // more expected lines. Preserve top-to-bottom order and never replace
-        // all selected ink with only a partial transcription.
-        val bestPageCandidate = chooseBestCandidate(
-            candidates,
-            expectedLineCount = lines.size,
-        )
-        val pageResultLooksIncomplete =
-            bestPageCandidate == null ||
-                bestPageCandidate.text.lines().size != lines.size ||
-                bestPageCandidate.confidence == null ||
-                bestPageCandidate.confidence < LINE_FALLBACK_CONFIDENCE
-        if (!timedOut &&
-            lines.size in 2..MAX_LINE_FALLBACKS &&
-            pageResultLooksIncomplete &&
-            !disposed &&
-            !Thread.currentThread().isInterrupted
-        ) {
+        // Start with one balanced page profile. On slower classroom panels the
+        // old implementation spent the complete deadline on four page OCR
+        // passes before reaching the more accurate geometric segmentation.
+        runAttempt(
+            normalizedRequest,
+            PRIMARY_RENDER_STYLES.first(),
+            lineCountHint,
+            "primary raster",
+        )?.let(candidates::add)
+
+        // Multi-line ink is always recognized line-by-line once. High OCR
+        // confidence alone is not evidence that a printed-text model retained
+        // every handwritten line.
+        if (lines.size in 2..MAX_LINE_FALLBACKS && !timedOut) {
             val recognizedLines = ArrayList<OcrCandidate>(lines.size)
             var completeLineResult = true
             for (line in lines) {
-                attempts++
-                val bitmap = renderInk(
+                val candidate = runAttempt(
                     RecognitionRequest(line),
                     LINE_RENDER_STYLE,
                     1,
+                    "line",
                 )
-                try {
-                    val candidate = recognizeBitmap(recognizer, bitmap, deadlineNanos)
-                    completedAttempt = true
-                    if (candidate == null) {
-                        completeLineResult = false
-                        break
-                    }
-                    recognizedLines += candidate
-                } catch (error: TimeoutException) {
-                    lastFailure = error
-                    timedOut = true
+                if (candidate == null) {
                     completeLineResult = false
-                    Log.w(TAG, "Handwriting line fallback reached its deadline", error)
-                    break
-                } catch (error: Exception) {
-                    if (error is InterruptedException) {
-                        Thread.currentThread().interrupt()
-                        throw error
-                    }
-                    lastFailure = error
-                    completeLineResult = false
-                    Log.w(TAG, "Handwriting line attempt $attempts failed", error)
                     break
                 }
+                recognizedLines += candidate
             }
             // Never replace all selected ink with a partial transcription.
             if (completeLineResult && recognizedLines.size == lines.size) {
@@ -346,17 +502,21 @@ internal class AndroidHandwritingRecognitionService(messenger: BinaryMessenger) 
             }
         }
 
-        // Printed-text OCR occasionally merges neighbouring handwritten words
-        // on large panels because the natural space is small relative to a
-        // long, thin line bitmap. Geometry still contains that information.
-        // Retry clearly separated word groups and reassemble their spacing.
-        // Cursive/single-stroke words stay intact and therefore continue to use
-        // the whole-line profiles above.
-        val wordsByLine = lines.map(::splitIntoWords)
-        val expectedWordCount = wordsByLine.sumOf { it.size }
+        // A deliberately sharp profile retains corners that board firmware may
+        // already have smoothed (M/N, V/U, 1/7).
+        if (!timedOut && PRIMARY_RENDER_STYLES.size > 1) {
+            runAttempt(
+                normalizedRequest,
+                PRIMARY_RENDER_STYLES[1],
+                lineCountHint,
+                "sharp raster",
+            )?.let(candidates::add)
+        }
+
         val currentBest = chooseBestCandidate(
             candidates,
             expectedLineCount = lines.size,
+            expectedWordCount = expectedWordCount,
         )
         val currentWordCount = currentBest?.text
             ?.split(WHITESPACE)
@@ -365,8 +525,11 @@ internal class AndroidHandwritingRecognitionService(messenger: BinaryMessenger) 
             expectedWordCount in 2..MAX_WORD_FALLBACKS &&
                 (currentBest == null ||
                     currentWordCount != expectedWordCount ||
-                    currentBest.confidence == null ||
-                    currentBest.confidence < WORD_FALLBACK_CONFIDENCE)
+                    !candidateLooksReliable(
+                        currentBest,
+                        expectedLineCount = lines.size,
+                        expectedWordCount = expectedWordCount,
+                    ))
         if (!timedOut &&
             wordFallbackNeeded &&
             !disposed &&
@@ -377,38 +540,19 @@ internal class AndroidHandwritingRecognitionService(messenger: BinaryMessenger) 
             wordLoop@ for (words in wordsByLine) {
                 val recognizedWords = ArrayList<OcrCandidate>(words.size)
                 for (word in words) {
-                    attempts++
-                    val bitmap = renderInk(
+                    val candidate = runAttempt(
                         RecognitionRequest(word),
                         WORD_RENDER_STYLE,
                         1,
+                        "word",
                     )
-                    try {
-                        val candidate = recognizeBitmap(recognizer, bitmap, deadlineNanos)
-                        completedAttempt = true
-                        if (candidate == null) {
-                            completeWordResult = false
-                            break@wordLoop
-                        }
-                        recognizedWords += candidate.copy(
-                            text = candidate.text.replace(WHITESPACE, " ").trim(),
-                        )
-                    } catch (error: TimeoutException) {
-                        lastFailure = error
-                        timedOut = true
+                    if (candidate == null) {
                         completeWordResult = false
-                        Log.w(TAG, "Handwriting word fallback reached its deadline", error)
-                        break@wordLoop
-                    } catch (error: Exception) {
-                        if (error is InterruptedException) {
-                            Thread.currentThread().interrupt()
-                            throw error
-                        }
-                        lastFailure = error
-                        completeWordResult = false
-                        Log.w(TAG, "Handwriting word attempt $attempts failed", error)
                         break@wordLoop
                     }
+                    recognizedWords += candidate.copy(
+                        text = candidate.text.replace(WHITESPACE, " ").trim(),
+                    )
                 }
                 if (recognizedWords.size == words.size) {
                     recognizedLines += combineWordCandidates(recognizedWords)
@@ -418,19 +562,92 @@ internal class AndroidHandwritingRecognitionService(messenger: BinaryMessenger) 
                 candidates += combineLineCandidates(recognizedLines)
             }
         }
-        val candidate = chooseBestCandidate(
+
+        // Expensive scale extremes are recovery profiles, not the default
+        // path. They remain useful for unusually small or broad board writing.
+        var best = chooseBestCandidate(
             candidates,
             expectedLineCount = lines.size,
             expectedWordCount = expectedWordCount,
         )
-        if (candidate != null) return RecognitionOutcome(candidate, attempts)
+        if (!timedOut &&
+            (best == null ||
+                !candidateIsAcceptable(
+                    best,
+                    candidates = candidates,
+                    expectedLineCount = lines.size,
+                    expectedWordCount = expectedWordCount,
+                ))
+        ) {
+            for (style in RECOVERY_RENDER_STYLES) {
+                runAttempt(
+                    normalizedRequest,
+                    style,
+                    lineCountHint,
+                    "recovery raster",
+                )?.let(candidates::add)
+                best = chooseBestCandidate(
+                    candidates,
+                    expectedLineCount = lines.size,
+                    expectedWordCount = expectedWordCount,
+                )
+                if (best != null &&
+                    candidateIsAcceptable(
+                        best,
+                        candidates = candidates,
+                        expectedLineCount = lines.size,
+                        expectedWordCount = expectedWordCount,
+                    )
+                ) {
+                    break
+                }
+                if (timedOut) break
+            }
+        }
+
+        // The highest raw score is not necessarily the best safe result. A
+        // slightly lower-scoring line/word-segmented candidate carries real
+        // geometric evidence and must not be hidden by a direct OCR guess.
+        val candidate = chooseBestCandidate(
+            candidates.filter {
+                candidateIsAcceptable(
+                    it,
+                    candidates = candidates,
+                    expectedLineCount = lines.size,
+                    expectedWordCount = expectedWordCount,
+                )
+            },
+            expectedLineCount = lines.size,
+            expectedWordCount = expectedWordCount,
+        )
+        val durationMillis = TimeUnit.NANOSECONDS
+            .toMillis(System.nanoTime() - startedNanos)
+            .coerceIn(0L, Int.MAX_VALUE.toLong())
+            .toInt()
+        if (candidate != null) {
+            return RecognitionOutcome(
+                candidate = candidate,
+                attemptCount = attempts,
+                lineCountHint = lines.size,
+                wordCountHint = expectedWordCount,
+                durationMillis = durationMillis,
+                timedOut = timedOut,
+            )
+        }
         // A deadline on a slow first invocation is an ordinary absence of a
         // candidate, not malformed handwriting. Only propagate a real engine
         // error when not one native attempt completed successfully.
         if (!completedAttempt && lastFailure != null && lastFailure !is TimeoutException) {
             throw lastFailure
         }
-        return RecognitionOutcome(null, attempts)
+        return RecognitionOutcome(
+            candidate = null,
+            attemptCount = attempts,
+            lineCountHint = lines.size,
+            wordCountHint = expectedWordCount,
+            durationMillis = durationMillis,
+            timedOut = timedOut,
+        )
     }
 
     /**
@@ -483,15 +700,49 @@ internal class AndroidHandwritingRecognitionService(messenger: BinaryMessenger) 
             activeNativeTasks.set(0)
             Log.e(TAG, "Native handwriting task accounting became negative")
         }
+        synchronized(nativeTaskMonitor) {
+            nativeTaskMonitor.notifyAll()
+        }
         if (disposed) closeRecognizerWhenIdle()
+    }
+
+    private fun releasePendingRequest() {
+        val remaining = pendingRequests.decrementAndGet()
+        if (remaining < 0) {
+            pendingRequests.set(0)
+            Log.e(TAG, "Pending handwriting request accounting became negative")
+        }
+        if (disposed && remaining <= 0) closeRecognizerWhenIdle()
+    }
+
+    private fun awaitNativeTasksIdle(timeoutSeconds: Long): Boolean {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSeconds)
+        synchronized(nativeTaskMonitor) {
+            while (activeNativeTasks.get() > 0 && !disposed) {
+                val remaining = deadline - System.nanoTime()
+                if (remaining <= 0L) return false
+                try {
+                    TimeUnit.NANOSECONDS.timedWait(nativeTaskMonitor, remaining)
+                } catch (error: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return false
+                }
+            }
+        }
+        return activeNativeTasks.get() == 0 && !disposed
     }
 
     private fun closeRecognizerWhenIdle() {
         if (activeNativeTasks.get() != 0 ||
+            pendingRequests.get() != 0 ||
             !recognizerClosed.compareAndSet(false, true)
         ) return
         runCatching { recognizer?.close() }
             .onFailure { Log.w(TAG, "Could not close handwriting recognizer", it) }
+        val localPaddle = paddleRecognizer
+        paddleRecognizer = null
+        runCatching { localPaddle?.close() }
+            .onFailure { Log.w(TAG, "Could not close PP-OCRv5 recognizer", it) }
     }
 
     private fun candidateFromRecognition(recognition: Text): OcrCandidate? {
@@ -518,6 +769,7 @@ internal class AndroidHandwritingRecognitionService(messenger: BinaryMessenger) 
             text = text,
             confidence = confidence,
             quality = candidateTextQuality(text),
+            layoutFidelity = 0.0,
         )
     }
 
@@ -531,7 +783,9 @@ internal class AndroidHandwritingRecognitionService(messenger: BinaryMessenger) 
                 confidenceTotal += confidence * weight
             }
         }
-        val text = lines.joinToString("\n") { it.text }
+        val text = lines.joinToString("\n") {
+            it.text.replace(WHITESPACE, " ").trim()
+        }
         return OcrCandidate(
             text = text,
             confidence = if (confidenceWeight == 0) {
@@ -540,6 +794,7 @@ internal class AndroidHandwritingRecognitionService(messenger: BinaryMessenger) 
                 (confidenceTotal / confidenceWeight).coerceIn(0.0, 1.0)
             },
             quality = candidateTextQuality(text),
+            layoutFidelity = 1.0,
         )
     }
 
@@ -562,6 +817,7 @@ internal class AndroidHandwritingRecognitionService(messenger: BinaryMessenger) 
                 (confidenceTotal / confidenceWeight).coerceIn(0.0, 1.0)
             },
             quality = candidateTextQuality(text),
+            layoutFidelity = 1.0,
         )
     }
 
@@ -574,31 +830,116 @@ internal class AndroidHandwritingRecognitionService(messenger: BinaryMessenger) 
         val agreement = candidates.groupingBy { canonicalCandidate(it.text) }.eachCount()
         return candidates.maxWithOrNull(
             compareBy<OcrCandidate> {
-                val repetitions = agreement[canonicalCandidate(it.text)] ?: 1
-                val confidence = it.confidence ?: UNKNOWN_CONFIDENCE
-                val consensus = candidates
-                    .asSequence()
-                    .filter { other -> other !== it }
-                    .map { other -> candidateSimilarity(it.text, other.text) }
-                    .averageOrZero()
-                val lineLayout = expectedLineCount?.let { expected ->
-                    countSimilarity(it.text.lines().size, expected)
-                } ?: 0.0
-                val wordLayout = expectedWordCount?.let { expected ->
-                    val actual = it.text
-                        .split(WHITESPACE)
-                        .count { word -> word.isNotBlank() }
-                    countSimilarity(actual, expected)
-                } ?: 0.0
-                confidence * CONFIDENCE_WEIGHT +
-                    it.quality * QUALITY_WEIGHT +
-                    min(MAX_AGREEMENT_BONUS, (repetitions - 1) * AGREEMENT_BONUS) +
-                    consensus * CONSENSUS_WEIGHT +
-                    lineLayout * LINE_LAYOUT_WEIGHT +
-                    wordLayout * WORD_LAYOUT_WEIGHT
+                candidateScore(
+                    candidate = it,
+                    candidates = candidates,
+                    agreement = agreement,
+                    expectedLineCount = expectedLineCount,
+                    expectedWordCount = expectedWordCount,
+                )
             }.thenBy { it.confidence ?: UNKNOWN_CONFIDENCE }
                 .thenBy { it.text.count(Char::isLetterOrDigit) },
         )
+    }
+
+    private fun candidateScore(
+        candidate: OcrCandidate,
+        candidates: List<OcrCandidate>,
+        agreement: Map<String, Int> =
+            candidates.groupingBy { canonicalCandidate(it.text) }.eachCount(),
+        expectedLineCount: Int? = null,
+        expectedWordCount: Int? = null,
+    ): Double {
+        val repetitions = agreement[canonicalCandidate(candidate.text)] ?: 1
+        val confidence = candidate.confidence ?: UNKNOWN_CONFIDENCE
+        val consensus = candidates
+            .asSequence()
+            .filter { other -> other !== candidate }
+            .map { other -> candidateSimilarity(candidate.text, other.text) }
+            .averageOrZero()
+        val lineLayout = expectedLineCount?.let { expected ->
+            countSimilarity(candidate.text.lines().size, expected)
+        } ?: 0.0
+        val wordLayout = expectedWordCount?.let { expected ->
+            val actual = candidate.text
+                .split(WHITESPACE)
+                .count { word -> word.isNotBlank() }
+            countSimilarity(actual, expected)
+        } ?: 0.0
+        return confidence * CONFIDENCE_WEIGHT +
+            candidate.quality * QUALITY_WEIGHT +
+            min(MAX_AGREEMENT_BONUS, (repetitions - 1) * AGREEMENT_BONUS) +
+            consensus * CONSENSUS_WEIGHT +
+            lineLayout * LINE_LAYOUT_WEIGHT +
+            wordLayout * WORD_LAYOUT_WEIGHT +
+            candidate.layoutFidelity * GEOMETRY_LAYOUT_WEIGHT
+    }
+
+    private fun candidateLooksReliable(
+        candidate: OcrCandidate,
+        expectedLineCount: Int,
+        expectedWordCount: Int,
+    ): Boolean {
+        val actualWords = candidate.text
+            .split(WHITESPACE)
+            .count { it.isNotBlank() }
+        return candidate.quality >= RELIABLE_TEXT_QUALITY &&
+            (candidate.confidence ?: 0.0) >= RELIABLE_CONFIDENCE &&
+            (candidate.layoutFidelity >= 1.0 ||
+                (candidate.text.lines().size == expectedLineCount &&
+                    actualWords == expectedWordCount))
+    }
+
+    private fun candidateIsAcceptable(
+        candidate: OcrCandidate,
+        candidates: List<OcrCandidate>,
+        expectedLineCount: Int,
+        expectedWordCount: Int,
+    ): Boolean {
+        if (candidate.text.none(Char::isLetterOrDigit) ||
+            candidate.quality < MINIMUM_TEXT_QUALITY
+        ) {
+            return false
+        }
+        val strongestAgreement = candidates
+            .asSequence()
+            .filter { it !== candidate }
+            .map { candidateSimilarity(candidate.text, it.text) }
+            .maxOrNull() ?: 0.0
+        val confidence = candidate.confidence
+        val directSingleWordLayoutMatches =
+            expectedLineCount == 1 &&
+                expectedWordCount == 1 &&
+                candidate.text.lines().size == 1 &&
+                candidate.text.split(WHITESPACE).count { it.isNotBlank() } == 1
+        if (confidence != null &&
+            confidence >= VERIFIED_SINGLE_WORD_CONFIDENCE &&
+            directSingleWordLayoutMatches
+        ) {
+            return true
+        }
+        if (confidence != null &&
+            confidence >= HIGH_CONFIDENCE_ACCEPTANCE &&
+            (candidate.layoutFidelity >= 1.0 ||
+                strongestAgreement >= HIGH_CONFIDENCE_MINIMUM_AGREEMENT)
+        ) {
+            return true
+        }
+        if (candidate.layoutFidelity >= 1.0 &&
+            confidence != null &&
+            confidence >= SEGMENTED_CONFIDENCE_ACCEPTANCE &&
+            strongestAgreement >= SEGMENTED_MINIMUM_AGREEMENT
+        ) {
+            return true
+        }
+        val score = candidateScore(
+            candidate = candidate,
+            candidates = candidates,
+            expectedLineCount = expectedLineCount,
+            expectedWordCount = expectedWordCount,
+        )
+        return strongestAgreement >= MINIMUM_CANDIDATE_AGREEMENT &&
+            score >= MINIMUM_CANDIDATE_SCORE
     }
 
     private fun Sequence<Double>.averageOrZero(): Double {
@@ -682,7 +1023,7 @@ internal class AndroidHandwritingRecognitionService(messenger: BinaryMessenger) 
         }
 
         var totalPoints = 0
-        val strokes = ArrayList<List<InkPoint>>(rawStrokes.size)
+        val strokes = ArrayList<List<HandwritingInkPoint>>(rawStrokes.size)
         rawStrokes.forEach { rawStroke ->
             val stroke = rawStroke as? Map<*, *>
                 ?: throw ChannelException("invalid_ink", "Ein Strich ist ungültig.")
@@ -698,7 +1039,7 @@ internal class AndroidHandwritingRecognitionService(messenger: BinaryMessenger) 
                         "invalid_ink",
                         "Ein Handschriftpunkt ist ungültig.",
                     )
-                InkPoint(
+                HandwritingInkPoint(
                     x = finiteCoordinate(point["x"], "x"),
                     y = finiteCoordinate(point["y"], "y"),
                     timestampMicros = optionalTimestamp(point["timestampMicros"]),
@@ -825,7 +1166,7 @@ internal class AndroidHandwritingRecognitionService(messenger: BinaryMessenger) 
      * commands while retaining both endpoints and every meaningful turn.
      */
     private fun rasterPoints(
-        source: List<InkPoint>,
+        source: List<HandwritingInkPoint>,
         scale: Float,
         offsetX: Float,
         offsetY: Float,
@@ -876,104 +1217,6 @@ internal class AndroidHandwritingRecognitionService(messenger: BinaryMessenger) 
         return dx * dx + dy * dy
     }
 
-    private fun splitIntoLines(strokes: List<List<InkPoint>>): List<List<List<InkPoint>>> {
-        if (strokes.size < 2) return listOf(strokes)
-        val positioned = strokes.map { stroke ->
-            var left = Float.POSITIVE_INFINITY
-            var top = Float.POSITIVE_INFINITY
-            var right = Float.NEGATIVE_INFINITY
-            var bottom = Float.NEGATIVE_INFINITY
-            stroke.forEach { point ->
-                left = min(left, point.x)
-                top = min(top, point.y)
-                right = max(right, point.x)
-                bottom = max(bottom, point.y)
-            }
-            PositionedStroke(stroke, left, top, right, bottom)
-        }.sortedWith(compareBy<PositionedStroke> { it.centerY }.thenBy { it.left })
-
-        val lines = ArrayList<MutableInkLine>()
-        for (positionedStroke in positioned) {
-            val best = lines
-                .filter { it.accepts(positionedStroke) }
-                .minByOrNull { abs(it.centerY - positionedStroke.centerY) }
-            if (best == null) {
-                lines += MutableInkLine(positionedStroke)
-            } else {
-                best.add(positionedStroke)
-            }
-        }
-        return lines
-            .sortedBy { it.top }
-            .map { line -> line.strokes.sortedBy { it.left }.map { it.points } }
-    }
-
-    /**
-     * Splits only at unambiguous horizontal whitespace. The threshold scales
-     * with the actual line height, so a word written very large on an
-     * interactive panel behaves like the same word written on a tablet.
-     * Overlapping letter strokes, detached dots and cursive words remain one
-     * group.
-     */
-    private fun splitIntoWords(line: List<List<InkPoint>>): List<List<List<InkPoint>>> {
-        if (line.size < 2) return listOf(line)
-        val positioned = line.map { stroke ->
-            var left = Float.POSITIVE_INFINITY
-            var top = Float.POSITIVE_INFINITY
-            var right = Float.NEGATIVE_INFINITY
-            var bottom = Float.NEGATIVE_INFINITY
-            stroke.forEach { point ->
-                left = min(left, point.x)
-                top = min(top, point.y)
-                right = max(right, point.x)
-                bottom = max(bottom, point.y)
-            }
-            PositionedStroke(stroke, left, top, right, bottom)
-        }.sortedWith(compareBy<PositionedStroke> { it.left }.thenBy { it.top })
-
-        val lineTop = positioned.minOf { it.top }
-        val lineBottom = positioned.maxOf { it.bottom }
-        val lineHeight = max(1f, lineBottom - lineTop)
-        val minimumWordGap = max(MIN_WORD_GAP_WORLD, lineHeight * WORD_GAP_HEIGHT_RATIO)
-        val temporalWordGap = max(
-            MIN_TEMPORAL_WORD_GAP_WORLD,
-            lineHeight * TEMPORAL_WORD_GAP_HEIGHT_RATIO,
-        )
-        val words = ArrayList<MutableList<PositionedStroke>>()
-        var current = arrayListOf(positioned.first())
-        var occupiedRight = positioned.first().right
-        var latestTimestamp = positioned.first().endMicros
-        for (index in 1 until positioned.size) {
-            val stroke = positioned[index]
-            val gap = stroke.left - occupiedRight
-            val pause = if (stroke.startMicros != null && latestTimestamp != null) {
-                stroke.startMicros - latestTimestamp
-            } else {
-                0L
-            }
-            val startsNewWord =
-                gap > minimumWordGap ||
-                    (gap > temporalWordGap && pause >= WORD_PAUSE_MICROS)
-            if (startsNewWord) {
-                words += current
-                current = arrayListOf(stroke)
-                occupiedRight = stroke.right
-                latestTimestamp = stroke.endMicros
-            } else {
-                current += stroke
-                occupiedRight = max(occupiedRight, stroke.right)
-                val endMicros = stroke.endMicros
-                if (endMicros != null &&
-                    (latestTimestamp == null || endMicros > latestTimestamp)
-                ) {
-                    latestTimestamp = endMicros
-                }
-            }
-        }
-        words += current
-        return words.map { word -> word.map { it.points } }
-    }
-
     private fun normalizeRecognizedText(raw: String): String = raw
         .replace('\u0000', ' ')
         .lines()
@@ -1007,28 +1250,30 @@ internal class AndroidHandwritingRecognitionService(messenger: BinaryMessenger) 
     }
 
     private fun postSuccess(result: MethodChannel.Result, value: Any) {
-        mainHandler.post { if (!disposed) result.success(value) }
+        mainHandler.post { result.success(value) }
     }
 
     private fun postError(result: MethodChannel.Result, code: String, message: String) {
-        mainHandler.post { if (!disposed) result.error(code, message, null) }
+        mainHandler.post { result.error(code, message, null) }
     }
 
-    private data class InkPoint(
-        val x: Float,
-        val y: Float,
-        val timestampMicros: Long?,
-    )
     private data class RasterPoint(val x: Float, val y: Float)
-    private data class RecognitionRequest(val strokes: List<List<InkPoint>>)
+    private data class RecognitionRequest(
+        val strokes: List<List<HandwritingInkPoint>>,
+    )
     private data class RecognitionOutcome(
         val candidate: OcrCandidate?,
         val attemptCount: Int,
+        val lineCountHint: Int,
+        val wordCountHint: Int,
+        val durationMillis: Int,
+        val timedOut: Boolean,
     )
     private data class OcrCandidate(
         val text: String,
         val confidence: Double?,
         val quality: Double,
+        val layoutFidelity: Double,
     )
     private data class RenderStyle(
         val targetLineHeight: Float,
@@ -1037,48 +1282,6 @@ internal class AndroidHandwritingRecognitionService(messenger: BinaryMessenger) 
         val strokeWidth: Float,
         val smoothPath: Boolean = true,
     )
-
-    private data class PositionedStroke(
-        val points: List<InkPoint>,
-        val left: Float,
-        val top: Float,
-        val right: Float,
-        val bottom: Float,
-    ) {
-        val centerY: Float get() = (top + bottom) * .5f
-        val height: Float get() = max(1f, bottom - top)
-        val startMicros: Long? = points.mapNotNull { it.timestampMicros }.minOrNull()
-        val endMicros: Long? = points.mapNotNull { it.timestampMicros }.maxOrNull()
-    }
-
-    private class MutableInkLine(first: PositionedStroke) {
-        val strokes = ArrayList<PositionedStroke>().apply { add(first) }
-        var top = first.top
-            private set
-        private var bottom = first.bottom
-        private var referenceStrokeHeight = first.height
-        val centerY: Float get() = (top + bottom) * .5f
-
-        fun accepts(stroke: PositionedStroke): Boolean {
-            // Detached dots and umlauts must stay with their letter body.
-            // Base the threshold on individual strokes, not the growing union
-            // height: one accidental merge must not chain all following
-            // baselines into the same line.
-            val tolerance = max(
-                12f,
-                max(referenceStrokeHeight, stroke.height) *
-                    LINE_CENTER_TOLERANCE_RATIO,
-            )
-            return abs(centerY - stroke.centerY) <= tolerance
-        }
-
-        fun add(stroke: PositionedStroke) {
-            strokes += stroke
-            top = min(top, stroke.top)
-            bottom = max(bottom, stroke.bottom)
-            referenceStrokeHeight = max(referenceStrokeHeight, stroke.height)
-        }
-    }
 
     private class ChannelException(
         val code: String,
@@ -1089,7 +1292,7 @@ internal class AndroidHandwritingRecognitionService(messenger: BinaryMessenger) 
         const val CHANNEL_NAME = "de.flowboardx/handwriting_recognition"
         const val DEFAULT_LANGUAGE_TAG = "de-DE"
         const val TAG = "FlowboardHandwriting"
-        const val ENGINE_NAME = "bundledLatinOcr16"
+        const val ENGINE_NAME = "bundledPaddleOcrV5WithLatinOcrFallback"
         const val MODEL_DELIVERY = "bundled-apk"
         const val MAX_LANGUAGE_TAG_LENGTH = 64
         const val MAX_STROKES = 4_096
@@ -1104,39 +1307,47 @@ internal class AndroidHandwritingRecognitionService(messenger: BinaryMessenger) 
         const val MAX_SCALE = 64f
         const val MIN_BITMAP_SIZE = 128
         const val MAX_BITMAP_SIZE = 2_048
-        // Cold model initialization is noticeably slower on some integrated
-        // classroom boards. Work remains off the UI thread and globally
-        // bounded, so a longer first-call budget improves reliability without
-        // affecting writing latency.
-        const val MODEL_WARMUP_TIMEOUT_SECONDS = 8L
-        const val RECOGNITION_TIMEOUT_SECONDS = 14L
+        const val MAX_PENDING_REQUESTS = 3
+        const val NATIVE_DRAIN_TIMEOUT_SECONDS = 8L
+        // Cold inference is part of the first real queued request. It no longer
+        // races a speculative warm-up, so this full budget is deterministic.
+        const val RECOGNITION_TIMEOUT_SECONDS = 18L
         const val MAX_LINE_FALLBACKS = 6
         const val MAX_WORD_FALLBACKS = 16
-        const val LINE_FALLBACK_CONFIDENCE = 0.58
-        const val WORD_FALLBACK_CONFIDENCE = 0.62
-        const val MIN_WORD_GAP_WORLD = 10f
-        const val WORD_GAP_HEIGHT_RATIO = 0.42f
-        const val MIN_TEMPORAL_WORD_GAP_WORLD = 4f
-        const val TEMPORAL_WORD_GAP_HEIGHT_RATIO = 0.18f
-        const val WORD_PAUSE_MICROS = 380_000L
-        const val LINE_CENTER_TOLERANCE_RATIO = 0.86f
-        const val UNKNOWN_CONFIDENCE = 0.42
-        const val CONFIDENCE_WEIGHT = 0.62
-        const val QUALITY_WEIGHT = 0.20
-        const val CONSENSUS_WEIGHT = 0.12
-        const val LINE_LAYOUT_WEIGHT = 0.05
-        const val WORD_LAYOUT_WEIGHT = 0.03
+        const val UNKNOWN_CONFIDENCE = 0.40
+        const val CONFIDENCE_WEIGHT = 0.44
+        const val QUALITY_WEIGHT = 0.16
+        const val CONSENSUS_WEIGHT = 0.16
+        const val LINE_LAYOUT_WEIGHT = 0.08
+        const val WORD_LAYOUT_WEIGHT = 0.07
+        const val GEOMETRY_LAYOUT_WEIGHT = 0.10
         const val AGREEMENT_BONUS = 0.08
         const val MAX_AGREEMENT_BONUS = 0.16
+        const val RELIABLE_CONFIDENCE = 0.72
+        const val RELIABLE_TEXT_QUALITY = 0.65
+        const val MINIMUM_TEXT_QUALITY = 0.48
+        const val HIGH_CONFIDENCE_ACCEPTANCE = 0.82
+        const val VERIFIED_SINGLE_WORD_CONFIDENCE = 0.84
+        const val HIGH_CONFIDENCE_MINIMUM_AGREEMENT = 0.30
+        const val SEGMENTED_CONFIDENCE_ACCEPTANCE = 0.62
+        const val SEGMENTED_MINIMUM_AGREEMENT = 0.42
+        const val MINIMUM_CANDIDATE_AGREEMENT = 0.50
+        const val MINIMUM_CANDIDATE_SCORE = 0.48
         val DIRECT_EXECUTOR = Executor { command -> command.run() }
-        val RENDER_STYLES = listOf(
+        val PRIMARY_RENDER_STYLES = listOf(
             RenderStyle(112f, 1_900f, 30f, 7f),
             RenderStyle(96f, 1_900f, 28f, 3.25f, smoothPath = false),
+        )
+        val RECOVERY_RENDER_STYLES = listOf(
             RenderStyle(76f, 1_900f, 24f, 5f),
             RenderStyle(176f, 1_900f, 40f, 10.5f),
         )
         val LINE_RENDER_STYLE = RenderStyle(128f, 1_900f, 32f, 8f)
         val WORD_RENDER_STYLE = RenderStyle(144f, 1_500f, 34f, 7f)
+        val PADDLE_RENDER_STYLES = listOf(
+            RenderStyle(112f, 1_900f, 24f, 7f),
+            RenderStyle(96f, 1_700f, 26f, 4.5f, smoothPath = false),
+        )
         val WHITESPACE = Regex("\\s+")
         val LANGUAGE_TAG = Regex("^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
         val LATIN_LANGUAGE_CODES = setOf(

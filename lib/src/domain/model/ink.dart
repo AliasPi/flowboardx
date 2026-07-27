@@ -66,7 +66,21 @@ final class InkStroke {
     this.authorId = 'local',
     this.pointerId,
   }) : points = List.unmodifiable(points),
+       _boundsCache = null,
        createdAt = (createdAt ?? DateTime.now().toUtc()).toUtc();
+
+  InkStroke._trusted({
+    required this.id,
+    required this.points,
+    required this.colorArgb,
+    required this.width,
+    required this.type,
+    required this.zIndex,
+    required this.createdAt,
+    required this.authorId,
+    required this.pointerId,
+    required Rect2? knownBounds,
+  }) : _boundsCache = knownBounds;
 
   final String id;
   final List<InkPoint> points;
@@ -80,7 +94,8 @@ final class InkStroke {
 
   bool get isEmpty => points.isEmpty;
 
-  late final Rect2 bounds = _calculateBounds();
+  Rect2? _boundsCache;
+  Rect2 get bounds => _boundsCache ??= _calculateBounds();
 
   Rect2 _calculateBounds() {
     if (points.isEmpty) return const Rect2.zero();
@@ -119,19 +134,28 @@ final class InkStroke {
     String? authorId,
     int? pointerId,
     bool clearPointerId = false,
-  }) => InkStroke(
-    id: id ?? this.id,
-    points: points ?? this.points,
-    colorArgb: colorArgb ?? this.colorArgb,
-    // Object-bound ink uses normalized coordinates, so a normal 8 px nib can
-    // legitimately be far below 0.1 for a large embedded object.
-    width: math.max(0.0001, width ?? this.width),
-    type: type ?? this.type,
-    zIndex: zIndex ?? this.zIndex,
-    createdAt: createdAt ?? this.createdAt,
-    authorId: authorId ?? this.authorId,
-    pointerId: clearPointerId ? null : pointerId ?? this.pointerId,
-  );
+  }) {
+    final nextPoints = points == null || identical(points, this.points)
+        ? this.points
+        : List<InkPoint>.unmodifiable(points);
+    final nextWidth = math.max(0.0001, width ?? this.width);
+    return InkStroke._trusted(
+      id: id ?? this.id,
+      points: nextPoints,
+      colorArgb: colorArgb ?? this.colorArgb,
+      // Object-bound ink uses normalized coordinates, so a normal 8 px nib can
+      // legitimately be far below 0.1 for a large embedded object.
+      width: nextWidth,
+      type: type ?? this.type,
+      zIndex: zIndex ?? this.zIndex,
+      createdAt: (createdAt ?? this.createdAt).toUtc(),
+      authorId: authorId ?? this.authorId,
+      pointerId: clearPointerId ? null : pointerId ?? this.pointerId,
+      knownBounds: identical(nextPoints, this.points) && nextWidth == this.width
+          ? _boundsCache
+          : null,
+    );
+  }
 
   Map<String, Object?> toJson() => {
     'id': id,

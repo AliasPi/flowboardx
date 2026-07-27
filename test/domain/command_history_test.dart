@@ -73,6 +73,38 @@ void main() {
       ]);
     });
 
+    test('anchorless participant redo preserves the prior insertion index', () {
+      var initial = WhiteboardDocument.create(id: 'anchorless', now: now);
+      final pageId = initial.currentPage.id;
+      initial = AddStrokeCommand(
+        pageId,
+        stroke('anchor', 0),
+        now: now,
+      ).apply(initial);
+      final history = CommandHistory(initial);
+
+      history.execute(
+        AddStrokeCommand(pageId, stroke('left-addition', 20), now: now),
+        ownerId: 'left',
+      );
+      history.undo(ownerId: 'left');
+      history.execute(
+        DeleteItemsCommand(pageId, const ['anchor'], now: now),
+        ownerId: 'right',
+      );
+      history.execute(
+        AddStrokeCommand(pageId, stroke('foreign', 40), now: now),
+        ownerId: 'right',
+      );
+
+      history.redo(ownerId: 'left');
+
+      expect(history.document.currentPage.strokes.map((item) => item.id), [
+        'foreign',
+        'left-addition',
+      ]);
+    });
+
     test('later foreign edits win when both participants touched one item', () {
       var initial = WhiteboardDocument.create(id: 'shared-item', now: now);
       final pageId = initial.currentPage.id;

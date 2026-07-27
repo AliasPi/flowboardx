@@ -226,7 +226,7 @@ final class LocalPdfShareServer {
   Timer? _idleTimer;
   bool _closed = false;
   int _operation = 0;
-  int _activeTransfers = 0;
+  final Map<int, int> _activeTransfersByOperation = <int, int>{};
 
   Stream<LocalPdfShareEvent> get events => _events.stream;
   LocalPdfShareSession? get session => _session;
@@ -328,6 +328,7 @@ final class LocalPdfShareServer {
     _server = null;
     _session = null;
     _source = null;
+    _activeTransfersByOperation.clear();
     if (server != null) {
       await server.close(force: true);
     }
@@ -351,6 +352,17 @@ final class LocalPdfShareServer {
   }
 
   Future<void> _handleRequest(HttpRequest request, int operation) async {
+    try {
+      await _handleRequestCore(request, operation);
+    } on Object {
+      // The HttpServer listener does not await callback futures. Contain every
+      // late socket/source failure here so a disconnected browser can never
+      // become an unhandled asynchronous application error.
+      await request.response.close().catchError((_) {});
+    }
+  }
+
+  Future<void> _handleRequestCore(HttpRequest request, int operation) async {
     if (operation != _operation) {
       await _closeWithStatus(request.response, HttpStatus.serviceUnavailable);
       return;
@@ -388,6 +400,15 @@ final class LocalPdfShareServer {
     } on FileSystemException {
       await _closeWithStatus(response, HttpStatus.gone);
       return;
+    } on Object {
+      await _closeWithStatus(response, HttpStatus.internalServerError);
+      return;
+    }
+    if (operation != _operation ||
+        _session == null ||
+        !identical(_source, source)) {
+      await _closeWithStatus(response, HttpStatus.serviceUnavailable);
+      return;
     }
     try {
       response.statusCode = HttpStatus.ok;
@@ -401,15 +422,33 @@ final class LocalPdfShareServer {
           _contentDisposition(activeSession.fileName),
         );
       if (request.method == 'GET') {
-        _activeTransfers++;
+        _activeTransfersByOperation[operation] =
+            (_activeTransfersByOperation[operation] ?? 0) + 1;
         try {
           await response.addStream(source.openRead());
         } finally {
-          _activeTransfers = max(0, _activeTransfers - 1);
-          _armIdleTimer();
+          final remaining = max(
+            0,
+            (_activeTransfersByOperation[operation] ?? 1) - 1,
+          );
+          if (remaining == 0) {
+            _activeTransfersByOperation.remove(operation);
+          } else {
+            _activeTransfersByOperation[operation] = remaining;
+          }
+          if (operation == _operation &&
+              _session != null &&
+              identical(_source, source)) {
+            _armIdleTimer();
+          }
         }
       }
       await response.close();
+      if (operation != _operation ||
+          _session == null ||
+          !identical(_source, source)) {
+        return;
+      }
       final latest = _session;
       if (latest != null && request.method == 'GET') {
         final updated = latest.copyWith(
@@ -437,7 +476,7 @@ final class LocalPdfShareServer {
     final operation = _operation;
     _idleTimer = Timer(idleTimeout, () {
       if (operation == _operation) {
-        if (_activeTransfers > 0) {
+        if ((_activeTransfersByOperation[operation] ?? 0) > 0) {
           _armIdleTimer();
         } else {
           unawaited(stop(reason: LocalPdfShareStopReason.expired));

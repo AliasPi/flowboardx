@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flowboard_x/src/domain/model/board_object.dart';
 import 'package:flowboard_x/src/domain/model/document.dart';
 import 'package:flowboard_x/src/domain/model/geometry.dart';
@@ -89,6 +91,53 @@ void main() {
     expect(candidates.first.id, 'ink');
   });
 
+  test('stroke bounds fast path preserves a hit near the visible ink', () {
+    final page = BoardPage(
+      id: 'p',
+      name: 'P',
+      strokes: [
+        InkStroke(
+          id: 'wide-ink',
+          points: const [InkPoint(x: 0, y: 0), InkPoint(x: 100, y: 0)],
+          width: 8,
+        ),
+      ],
+    );
+
+    final candidates = const SelectionEngine().candidatesAt(
+      page,
+      const Vec2(50, 15),
+      tolerance: 12,
+    );
+
+    expect(candidates.map((candidate) => candidate.id), contains('wide-ink'));
+  });
+
+  test('stroke bounds fast path preserves precise rejection far from ink', () {
+    final page = BoardPage(
+      id: 'p',
+      name: 'P',
+      strokes: [
+        InkStroke(
+          id: 'diagonal-ink',
+          points: const [InkPoint(x: 0, y: 0), InkPoint(x: 100, y: 100)],
+          width: 8,
+        ),
+      ],
+    );
+
+    final candidates = const SelectionEngine().candidatesAt(
+      page,
+      const Vec2(0, 100),
+      tolerance: 12,
+    );
+
+    expect(
+      candidates.map((candidate) => candidate.id),
+      isNot(contains('diagonal-ink')),
+    );
+  });
+
   test(
     'persistent groups are selected atomically by tap rectangle and lasso',
     () {
@@ -137,4 +186,58 @@ void main() {
       expect(engine.allItems(page), <String>{'persistent'});
     },
   );
+
+  test('dense smartboard lassos are turn-preserving and strictly bounded', () {
+    final dense = List<Vec2>.generate(4096, (index) {
+      final angle = math.pi * 2 * index / 4095;
+      return Vec2(100 + math.cos(angle) * 80, 100 + math.sin(angle) * 60);
+    }, growable: false);
+
+    final simplified = SelectionEngine.simplifyLasso(dense);
+
+    expect(simplified.length, lessThanOrEqualTo(256));
+    expect(simplified.first, same(dense.first));
+    expect(simplified.last, same(dense.last));
+
+    final page = BoardPage(
+      id: 'dense-lasso',
+      name: 'Dense',
+      objects: <BoardObject>[
+        ShapeObject(
+          id: 'inside',
+          transform: const ObjectTransform(x: 90, y: 90, width: 20, height: 20),
+        ),
+        ShapeObject(
+          id: 'outside',
+          transform: const ObjectTransform(
+            x: 400,
+            y: 400,
+            width: 20,
+            height: 20,
+          ),
+        ),
+      ],
+    );
+    expect(const SelectionEngine().itemsInLasso(page, dense), const <String>{
+      'inside',
+    });
+  });
+
+  test('near-limit concave lasso buckets never select duplicate vertices', () {
+    final star = List<Vec2>.generate(261, (index) {
+      final angle = math.pi * 2 * index / 260;
+      final radius = index.isEven ? 100.0 : 62.0;
+      return Vec2(
+        150 + math.cos(angle) * radius,
+        150 + math.sin(angle) * radius,
+      );
+    }, growable: false);
+
+    final simplified = SelectionEngine.simplifyLasso(star);
+
+    expect(simplified, hasLength(256));
+    expect(simplified.toSet(), hasLength(simplified.length));
+    expect(simplified.first, same(star.first));
+    expect(simplified.last, same(star.last));
+  });
 }

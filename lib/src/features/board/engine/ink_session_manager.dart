@@ -54,6 +54,8 @@ class InkSessionManager extends ChangeNotifier {
   final int maxConcurrentPointers;
   final Uuid _uuid;
   final Map<int, ActiveInkSession> _sessions = <int, ActiveInkSession>{};
+  List<InkStroke> _frozenPreviewSnapshot = const <InkStroke>[];
+  bool _frozenPreviewDirty = false;
 
   UnmodifiableMapView<int, ActiveInkSession> get sessions =>
       UnmodifiableMapView(_sessions);
@@ -67,12 +69,14 @@ class InkSessionManager extends ChangeNotifier {
     required Offset worldPosition,
     required ActivePenStyle style,
     required String authorId,
+    Offset? samplingPosition,
   }) {
     if (_sessions.length >= maxConcurrentPointers ||
         _sessions.containsKey(event.pointer)) {
       return false;
     }
-    final sampler = StrokeSampler()..addEvent(event, worldPosition);
+    final sampler = StrokeSampler(minimumDistance: _minimumScreenDistance)
+      ..addEvent(event, worldPosition, samplingPosition: samplingPosition);
     _sessions[event.pointer] = ActiveInkSession(
       pointer: event.pointer,
       deviceKind: event.kind,
@@ -84,18 +88,39 @@ class InkSessionManager extends ChangeNotifier {
     return true;
   }
 
-  void update(PointerMoveEvent event, Offset worldPosition) {
+  void update(
+    PointerMoveEvent event,
+    Offset worldPosition, {
+    Offset? samplingPosition,
+  }) {
     final session = _sessions[event.pointer];
     if (session == null) return;
-    session.sampler.addEvent(event, worldPosition);
+    if (!session.sampler.addEvent(
+      event,
+      worldPosition,
+      samplingPosition: samplingPosition,
+    )) {
+      return;
+    }
     _freezeCompletePreviewSegments(session);
     notifyListeners();
   }
 
-  InkStroke? end(PointerEvent event, Offset worldPosition) {
+  InkStroke? end(
+    PointerEvent event,
+    Offset worldPosition, {
+    Offset? samplingPosition,
+  }) {
     final session = _sessions.remove(event.pointer);
     if (session == null) return null;
-    session.sampler.addEvent(event, worldPosition);
+    if (session.frozenPreviewSegments.isNotEmpty) {
+      _frozenPreviewDirty = true;
+    }
+    session.sampler.addEvent(
+      event,
+      worldPosition,
+      samplingPosition: samplingPosition,
+    );
     final samples = session.sampler.samples;
     if (samples.isEmpty) {
       notifyListeners();
@@ -128,10 +153,32 @@ class InkSessionManager extends ChangeNotifier {
   }
 
   void cancel(int pointer) {
-    if (_sessions.remove(pointer) != null) notifyListeners();
+    final removed = _sessions.remove(pointer);
+    if (removed == null) return;
+    if (removed.frozenPreviewSegments.isNotEmpty) {
+      _frozenPreviewDirty = true;
+    }
+    notifyListeners();
   }
 
-  List<InkStroke> buildPreviewStrokes() => _sessions.values
+  List<InkStroke> buildPreviewStrokes() => <InkStroke>[
+    ...buildFrozenPreviewStrokes(),
+    ...buildActivePreviewStrokes(),
+  ];
+
+  /// Immutable chunks change only after a segment boundary, pointer end or
+  /// cancellation. Returning the same outer list between those events lets the
+  /// frozen RepaintBoundary stay untouched for ordinary pointer updates.
+  List<InkStroke> buildFrozenPreviewStrokes() {
+    if (!_frozenPreviewDirty) return _frozenPreviewSnapshot;
+    _frozenPreviewSnapshot = List<InkStroke>.unmodifiable(
+      _sessions.values.expand((session) => session.frozenPreviewSegments),
+    );
+    _frozenPreviewDirty = false;
+    return _frozenPreviewSnapshot;
+  }
+
+  List<InkStroke> buildActivePreviewStrokes() => _sessions.values
       .expand((session) {
         final samples = session.sampler.samples;
         if (samples.isEmpty) return const <InkStroke>[];
@@ -145,7 +192,6 @@ class InkSessionManager extends ChangeNotifier {
         }
         final tail = samples.sublist(session.previewStartIndex);
         return <InkStroke>[
-          ...session.frozenPreviewSegments,
           if (tail.isNotEmpty)
             _previewStroke(
               session,
@@ -156,21 +202,24 @@ class InkSessionManager extends ChangeNotifier {
       })
       .toList(growable: false);
 
-  static const int _previewSegmentPointCount = 64;
+  static const double _minimumScreenDistance = .75;
+  static const int _previewSegmentPointCount = 192;
+  static const int _markerPreviewSegmentPointCount = 192;
   static const int _dashedPreviewSegmentPointCount = 512;
 
   void _freezeCompletePreviewSegments(ActiveInkSession session) {
-    if (session.style.type == InkToolType.straightLine ||
-        session.style.type == InkToolType.marker) {
+    if (session.style.type == InkToolType.straightLine) {
       return;
     }
     final samples = session.sampler.samples;
-    // Dashed segments are converted to one bounded Path per preview stroke.
-    // Larger frozen chunks keep a long gesture from creating hundreds of
-    // CustomPaint/RepaintBoundary children while retaining incremental paints.
-    final segmentPointCount = session.style.type == InkToolType.dashed
-        ? _dashedPreviewSegmentPointCount
-        : _previewSegmentPointCount;
+    // Each completed chunk becomes one immutable cached vector picture. The
+    // active tail stays bounded, so one more pointer sample never rebuilds the
+    // full stroke regardless of how long or circular the gesture becomes.
+    final segmentPointCount = switch (session.style.type) {
+      InkToolType.dashed => _dashedPreviewSegmentPointCount,
+      InkToolType.marker => _markerPreviewSegmentPointCount,
+      _ => _previewSegmentPointCount,
+    };
     while (samples.length - session.previewStartIndex > segmentPointCount) {
       final end = session.previewStartIndex + segmentPointCount;
       final segment = samples.sublist(session.previewStartIndex, end);
@@ -181,6 +230,7 @@ class InkSessionManager extends ChangeNotifier {
           'live-${session.pointer}-segment-${session.frozenPreviewSegments.length}',
         ),
       );
+      _frozenPreviewDirty = true;
       // Keep one shared endpoint so adjacent cached layers join seamlessly.
       session.previewStartIndex = end - 1;
     }

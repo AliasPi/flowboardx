@@ -8,7 +8,7 @@ Canvas-, Persistenz- und Exportmodule bleiben für Desktop-Plattformen nutzbar.
 
 | Plattform | Status | Plattformspezifische Integration |
 | --- | --- | --- |
-| Android 7.0+ (API 24+) | Primärziel | Offline-ML-Kit, Systemwidget, SAF-PDF-Speicherung und Quick Share/Systemfreigabe |
+| Android 7.0+ (API 24+) | Primärziel | Eingebettetes PP-OCRv5/ONNX mit Offline-Fallback, Systemwidget, SAF-PDF-Speicherung und Quick Share/Systemfreigabe |
 | Windows 10/11 | Unterstütztes Entwicklungs- und Desktopziel | Windows Ink mit lokalem OCR-Fallback sowie Google Bilder über WebView2 |
 | Web | Buildziel, noch keine produktive Freigabe | PDFium-WASM bleibt erforderlich; Dateisystem-, LAN-Server- und Handschriftfunktionen sind nativ ausgelegt |
 | iOS, macOS, Linux | Vorbereitete Flutter-Runner | Gemeinsame Domain-, Rendering- und UI-Schichten sind vorhanden; native Feature-Parität und Release-Qualifizierung stehen aus |
@@ -82,9 +82,11 @@ ist.
 - seitenweise, speicherbegrenzte PDF-Erzeugung sowie lokaler, tokenisierter
   HTTP-Download per WLAN/Ethernet und QR-Code; auf Android zusätzlich Teilen
   über Quick Share beziehungsweise das System-Share-Sheet
-- lokale Handschrifterkennung ohne Laufzeit-Download: unter Android mit dem im
-  APK gebündelten lateinischen ML-Kit-Modell, unter Windows primär mit Windows
-  Ink und bei nicht installiertem Handschrift-Feature mit lokaler Windows OCR
+- lokale Handschrifterkennung ohne Laufzeit-Download: unter Android primär mit
+  dem im APK gebündelten, handschriftfähigen PP-OCRv5-Latin-Modell über ONNX
+  Runtime und mit gebündeltem ML-Kit-Latin-Modell als defensivem Fallback;
+  unter Windows primär mit Windows Ink und bei nicht installiertem
+  Handschrift-Feature mit lokaler Windows OCR
 - erkannter Text erhält automatisch eine exakt vermessene, gepolsterte
   Inhaltsbox; Messung, Canvas-Darstellung, Export und Inline-Caret verwenden
   dieselben theme- und zoomunabhängigen Schriftmetriken. Schrift und Rahmen
@@ -445,36 +447,46 @@ nach Editor-Rückkehr, Umbenennen und Löschen.
 Die App enthält eine unabhängige `HandwritingRecognitionService`-Grenze und eine
 echte Auswahlaktion „Handschrift in Text umwandeln“. Android implementiert den
 Channel `de.flowboardx/handwriting_recognition`. Android rastert die ausgewählte
-Vektortinte außerhalb des UI-Threads und erkennt sie mit
-`com.google.mlkit:text-recognition:16.0.1`. Das lateinische Modell ist statisch
-im APK enthalten und sofort offline verfügbar; die Play-Services-Variante mit
-nachgeladenem Modell wird nicht verwendet. Der Release-Wrapper prüft nach
-jedem APK-/AAB-Build die tatsächlich gepackten Modelldateien und bricht den
-Build ab, wenn Detector, Layout-, Sprach- oder Latin-CTC-Modell fehlen. In den
-ABI-Split-Artefakten wurden jeweils 21 Modelldateien mit zusammen 1.486.803
-unkomprimierten Bytes nachgewiesen.
+Vektortinte außerhalb des UI-Threads und führt als primäre Engine das offizielle
+`latin_PP-OCRv5_mobile_rec` aus. Dieses Modell ist auf lateinische Sprachen und
+komplexe Handschrift ausgelegt. Die Inferenz läuft lokal über ONNX Runtime:
+Modell (8.042.023 Bytes), Originalkonfiguration und Lizenztexte sind vollständig
+im APK enthalten. Es findet weder beim ersten Start noch später ein
+Modell-Download statt. Falls ONNX Runtime auf einem ungewöhnlichen Gerät nicht
+initialisiert werden kann, bleibt das ebenfalls gebündelte
+`com.google.mlkit:text-recognition:16.0.1` als defensiver Offline-Fallback
+verfügbar; die Play-Services-Variante wird nicht verwendet.
+
+Modellquelle:
+[`PaddlePaddle/latin_PP-OCRv5_mobile_rec_onnx`](https://huggingface.co/PaddlePaddle/latin_PP-OCRv5_mobile_rec_onnx),
+SHA-256
+`7888113072263cb471b93f66dd5e2ad70548dc526fa1ace760d0d973dd121498`.
+
+Der Release-Build prüft Modell, Konfiguration und Lizenzen vor dem Verpacken
+bytegenau per SHA-256. Der nachgelagerte APK-Verifier kontrolliert zusätzlich
+die wirklich gepackten Assets und die ML-Kit-Fallbackmodelle. Ein Release ohne
+vollständige lokale Erkennung bricht deshalb ab, statt eine erst auf dem
+Zielgerät unvollständige APK auszuliefern.
 
 Androids geräteunabhängige Vorverarbeitung entfernt dichte
-Sampling-Duplikate, begrenzt Pfadkommandos, skaliert pro erkannter Textzeile
-und probiert glatte, eckentreue sowie unterschiedlich starke Rasterprofile.
-Strichreihenfolge und Zeitstempel unterstützen die räumlich-zeitliche
-Worttrennung; mehrzeilige beziehungsweise klar getrennte Wörter werden bei
-unsicherem Gesamtergebnis separat erkannt und wieder layouttreu
-zusammengesetzt. Ergebnisse werden anhand nativer Zeilen-Confidence,
-Zeichenqualität, erwarteter Zeilen-/Wortstruktur und der Übereinstimmung aller
-Rasterprofile gewählt. Der Platform-Channel ist auf 80.000
-kurvencharakteristische Punkte begrenzt, parallele Aufrufe werden nicht
-aufgestaut und Modell-/Bitmap-Lebenszyklen bleiben auch bei Timeout und
-App-Ende serialisiert. Ein gültiger, aber nicht erkannter Strich ist ein
-`notRecognized`-Ergebnis und keine `FormatException`.
+Sampling-Duplikate, begrenzt Pfadkommandos und segmentiert die Vektortinte
+geometrisch in Zeilen. Für PP-OCRv5 wird jede Zeile seitenverhältnistreu auf
+48 Pixel Höhe skaliert, in BGR/CHW angeordnet und exakt wie in der offiziellen
+Modellkonfiguration normalisiert. Ein eigener, getesteter CTC-Decoder bildet
+die 838 Ausgabeklassen einschließlich Leerzeichen und deutscher Sonderzeichen
+zurück. Mehrzeilige Ergebnisse werden erst übernommen, wenn jede Zeile erkannt
+wurde; bei unsicherem Ergebnis greift die bestehende Profil-, Wort- und
+Zeilenheuristik des Offline-Fallbacks.
 
-Das gebündelte Modell ist Googles lateinisches **Bild-OCR-Modell**, nicht das
-separate ML-Kit-Digital-Ink-Sprachmodell. Google bietet Digital-Ink-Modelle
-offiziell nur als dynamischen Download an; diese Variante wird bewusst nicht
-verwendet, weil Flowboard X direkt nach einer Offline-Installation
-funktionieren muss. Dadurch ist freie, stark verbundene Kursivschrift
-prinzipbedingt schwieriger als klare Druckschrift beziehungsweise
-halbverbundene Handschrift.
+Strichreihenfolge und Zeitstempel unterstützen weiterhin die
+räumlich-zeitliche Worttrennung. Der Platform-Channel ist auf 250.000 Punkte
+begrenzt, parallele Aufrufe sind begrenzt und Modell-/Bitmap-Lebenszyklen
+bleiben auch bei Timeout und App-Ende serialisiert. Ein gültiger, aber nicht
+erkannter Strich ist ein `notRecognized`-Ergebnis und keine `FormatException`.
+Wie jede lokale Handschrifterkennung bleibt auch diese probabilistisch; sie
+verwendet jedoch auf allen unterstützten Android-Geräten dasselbe
+handschrifttrainierte Modell und hängt nicht von herstellerspezifisch
+installierten Sprachmodulen ab.
 
 Windows übergibt die Vektorstriche
 zuerst an `Windows.UI.Input.Inking.InkRecognizerContainer`. Fehlt dieses
@@ -517,7 +529,7 @@ lib/src/
     pages/             echte Thumbnail-Rasterung
     export_share/      PDF-Writer, LAN-Server, QR-UI und Quick Share
     library/           Dokumentübersicht, Ordner, ZIP- und Systemfreigabe
-    handwriting/       Recognition-Port und Android-ML-Kit-Adapter
+    handwriting/       Recognition-Port und native Offline-Adapter
   platform/            kleine, typisierte Android-Channels
 ```
 

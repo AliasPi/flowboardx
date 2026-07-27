@@ -21,7 +21,7 @@ import 'board_navigator.dart';
 import 'board_pointer_indicator.dart';
 import 'inline_text_editor_overlay.dart';
 import 'board_scene_layer.dart';
-import 'ink_painter.dart';
+import 'live_ink_preview_layer.dart';
 
 typedef EmptyBoardLongPress =
     void Function(Offset screenPosition, Offset worldPosition);
@@ -94,10 +94,19 @@ class BoardSurface extends StatefulWidget {
 }
 
 class _BoardSurfaceState extends State<BoardSurface> {
+  // Native Android palm traces do not carry a Flutter pointer ID. Keeping one
+  // reserved ID lets their calibrated contact footprint use the same cursor
+  // overlay as ordinary broad touch contacts.
+  static const int _nativePalmIndicatorPointer = -0x50414C4D;
+
   final Map<int, PointerRole> _roles = {};
   final Map<int, PointerDeviceKind> _pointerKinds = {};
   final Map<int, Offset> _pointerLocalPositions = {};
   final Map<int, Offset> _navigationPointers = {};
+  final Map<int, Offset> _navigationStartPositions = {};
+  bool _navigationGestureHadMultiplePointers = false;
+  bool _navigationGestureMovedBeyondTapSlop = false;
+  bool _navigationGestureLongPressTriggered = false;
   final Map<int, _EraserPointerState> _eraserPointers = {};
   final Set<int> _priorityEraserPointers = <int>{};
   final Set<int> _globalTouchStartsInside = <int>{};
@@ -112,6 +121,7 @@ class _BoardSurfaceState extends State<BoardSurface> {
   double? _selectionPinchStartDistance;
   Offset? _selectionPinchAnchor;
   String? _selectionTransformOwner;
+  int _selectionGestureEpoch = 0;
   Size _size = Size.zero;
   final _BoardPointerIndicatorController _pointerIndicators =
       _BoardPointerIndicatorController();
@@ -216,7 +226,11 @@ class _BoardSurfaceState extends State<BoardSurface> {
   }
 
   void _handleNativePalmStroke(NativePalmStroke stroke) {
-    if (!mounted || _inputSuppressed) return;
+    if (!mounted ||
+        _inputSuppressed ||
+        controller.inkSessions.hasActiveStylus) {
+      return;
+    }
     if (_handledNativePalmSessions.contains(stroke.sessionId)) return;
     final nativeSamples = stroke.samples.isNotEmpty
         ? stroke.samples
@@ -262,11 +276,23 @@ class _BoardSurfaceState extends State<BoardSurface> {
     _cancelSelectionTransientsForEraser(-1);
     _rollbackNavigationForEraser(-1);
     List<_WorldEraserStamp>? previous;
+    final sweeps = <InkEraserSweep>[];
     for (final sample in localSamples) {
       final current = _screenFootprintToWorld(sample.footprint);
-      _eraseStampTransition(previous, current);
+      sweeps.addAll(_eraserSweepsForTransition(previous, current));
       previous = current;
     }
+    controller.eraseSweeps(sweeps);
+    final lastSample = localSamples.last;
+    _updateEraserIndicator(
+      pointer: _nativePalmIndicatorPointer,
+      position: lastSample.center,
+      radius: EraserContactGeometry.enclosingScreenRadius(
+        center: lastSample.center,
+        footprint: lastSample.footprint,
+        fallback: stroke.radius,
+      ),
+    );
     _scheduleNativePalmCommit();
     DiagnosticLogService.instance.info(
       'input.palm_native',
@@ -333,6 +359,7 @@ class _BoardSurfaceState extends State<BoardSurface> {
         return;
       }
       _nativePalmCommitTimer = null;
+      _pointerIndicators.removePointer(_nativePalmIndicatorPointer);
       controller.commitErase();
     });
   }
@@ -397,6 +424,7 @@ class _BoardSurfaceState extends State<BoardSurface> {
     _pointerKinds.clear();
     _pointerLocalPositions.clear();
     _navigationPointers.clear();
+    _resetNavigationGesture();
     _eraserPointers.clear();
     _priorityEraserPointers.clear();
     _globalTouchStartsInside.clear();
@@ -479,60 +507,43 @@ class _BoardSurfaceState extends State<BoardSurface> {
                               selectedIds: controller.selectedSceneItemIds,
                               worldClip: worldClip,
                             ),
-                            RepaintBoundary(
-                              child: AnimatedBuilder(
-                                animation: controller.inkSessions,
-                                builder: (context, _) => Stack(
-                                  fit: StackFit.expand,
-                                  children: [
-                                    for (final stroke
-                                        in controller.renderInkPreviews)
-                                      Positioned.fill(
-                                        key: ValueKey(stroke.id),
-                                        child: RepaintBoundary(
-                                          child: CustomPaint(
-                                            painter: InkPainter(
-                                              strokes: [stroke],
-                                              worldToScreenScale:
-                                                  viewport.scale,
-                                              worldToScreenOffset:
-                                                  viewport.offset,
-                                              worldClip: worldClip,
-                                            ),
-                                          ),
-                                        ),
-                                      ),
-                                  ],
-                                ),
-                              ),
+                            LiveInkPreviewLayer(
+                              sessions: controller.inkSessions,
+                              worldToScreenScale: viewport.scale,
+                              worldToScreenOffset: viewport.offset,
+                              worldClip: worldClip,
                             ),
                             IgnorePointer(
-                              child: CustomPaint(
-                                painter: _GestureOverlayPainter(
-                                  gestures: _selectionGestures.values.toList(
-                                    growable: false,
-                                  ),
-                                  viewportScale: viewport.scale,
-                                  viewportOffset: viewport.offset,
-                                ),
-                              ),
-                            ),
-                            IgnorePointer(
-                              child: AnimatedBuilder(
-                                animation: _pointerIndicators,
-                                builder: (context, _) => CustomPaint(
-                                  key: const ValueKey<String>(
-                                    'board-pointer-indicator',
-                                  ),
-                                  painter: BoardPointerIndicatorPainter(
-                                    indicators: _pointerIndicators.indicators,
-                                    hoverPosition:
-                                        _pointerIndicators.hoverPosition,
-                                    tool: activeTool,
-                                    brushWidth:
-                                        widget.participant?.penStyle.width ??
-                                        controller.penStyle.width,
+                              child: RepaintBoundary(
+                                child: CustomPaint(
+                                  painter: _GestureOverlayPainter(
+                                    gestures: _selectionGestures.values.toList(
+                                      growable: false,
+                                    ),
                                     viewportScale: viewport.scale,
+                                    viewportOffset: viewport.offset,
+                                  ),
+                                ),
+                              ),
+                            ),
+                            IgnorePointer(
+                              child: RepaintBoundary(
+                                child: AnimatedBuilder(
+                                  animation: _pointerIndicators,
+                                  builder: (context, _) => CustomPaint(
+                                    key: const ValueKey<String>(
+                                      'board-pointer-indicator',
+                                    ),
+                                    painter: BoardPointerIndicatorPainter(
+                                      indicators: _pointerIndicators.indicators,
+                                      hoverPosition:
+                                          _pointerIndicators.hoverPosition,
+                                      tool: activeTool,
+                                      brushWidth:
+                                          widget.participant?.penStyle.width ??
+                                          controller.penStyle.width,
+                                      viewportScale: viewport.scale,
+                                    ),
                                   ),
                                 ),
                               ),
@@ -547,7 +558,10 @@ class _BoardSurfaceState extends State<BoardSurface> {
                   IgnorePointer(
                     ignoring: _inputSuppressed || _eraserPointers.isNotEmpty,
                     child: _SelectionOverlay(
-                      key: ValueKey<bool>(_inputSuppressed),
+                      key: ValueKey<(bool, int)>((
+                        _inputSuppressed,
+                        _selectionGestureEpoch,
+                      )),
                       controller: controller,
                       viewport: viewport,
                       inlineTextEditing: _inlineTextObjectId != null,
@@ -587,6 +601,7 @@ class _BoardSurfaceState extends State<BoardSurface> {
                         child: BoardNavigator(
                           viewport: viewport,
                           viewportSize: _size,
+                          visibleScreenBounds: _viewportVisibleBounds,
                           objects: controller.renderObjects,
                           strokes: controller.renderStrokes,
                           onNavigate: (world) {
@@ -650,6 +665,18 @@ class _BoardSurfaceState extends State<BoardSurface> {
       '${widget.participantId}:$owner';
 
   void _handleGlobalPriorityPointerEvent(PointerEvent event) {
+    if ((event.kind == PointerDeviceKind.stylus ||
+            event.kind == PointerDeviceKind.invertedStylus) &&
+        event is PointerDownEvent) {
+      final local = _globalToLocal(event.position);
+      if (local != null && _localBounds.contains(local)) {
+        // This route also sees a pen-down when a selection handle is the
+        // hit-tested widget. Palm arbitration therefore cannot be bypassed by
+        // the overlay sitting above the board listener.
+        _neutralizeActiveTouchesForStylus();
+      }
+      return;
+    }
     if (event.kind != PointerDeviceKind.touch) return;
     final local = _globalToLocal(event.position);
     if (event is PointerDownEvent) {
@@ -669,8 +696,10 @@ class _BoardSurfaceState extends State<BoardSurface> {
             ),
           );
       trace.routedToBoard = _roles.containsKey(event.pointer);
+      trace.suppressedByStylus = controller.inkSessions.hasActiveStylus;
       _provisionalTouchTraces[event.pointer] = trace;
       if (!_inputSuppressed &&
+          !controller.inkSessions.hasActiveStylus &&
           !_roles.containsKey(event.pointer) &&
           controller.pointerPolicy.isEraserContact(event)) {
         _startPriorityErase(event, local, trace);
@@ -690,7 +719,10 @@ class _BoardSurfaceState extends State<BoardSurface> {
       ),
     );
     if (event is PointerMoveEvent) {
-      if (_priorityEraserPointers.contains(event.pointer)) {
+      if (controller.inkSessions.hasActiveStylus) {
+        if (trace != null) trace.suppressedByStylus = true;
+        _neutralizeActiveTouchesForStylus();
+      } else if (_priorityEraserPointers.contains(event.pointer)) {
         _continuePriorityErase(event, local);
       } else if (!_inputSuppressed &&
           !_roles.containsKey(event.pointer) &&
@@ -707,8 +739,10 @@ class _BoardSurfaceState extends State<BoardSurface> {
       _roles.remove(event.pointer);
       _finishErase(event.pointer);
     } else if (!_inputSuppressed &&
+        !controller.inkSessions.hasActiveStylus &&
         trace != null &&
         !trace.becameEraser &&
+        !trace.suppressedByStylus &&
         controller.pointerPolicy.isEraserContact(event)) {
       _eraseBufferedTouchTrace(trace);
       _roles[event.pointer] = PointerRole.ignored;
@@ -726,6 +760,100 @@ class _BoardSurfaceState extends State<BoardSurface> {
         _roles.remove(event.pointer);
       }
     });
+  }
+
+  /// Gives a newly arriving pen exclusive ownership of this participant's
+  /// surface without touching the other participant controller/surface.
+  ///
+  /// A hand can reach the glass a few milliseconds before the pen and initially
+  /// look like a tap, selection drag, pan, finger stroke, or fist eraser.
+  /// Merely changing its role to [PointerRole.ignored] would orphan the preview
+  /// and let its eventual UP replay an action. Roll every provisional touch
+  /// operation back first, then latch those pointers as ignored until they
+  /// leave the glass.
+  void _neutralizeActiveTouchesForStylus() {
+    final touchPointers = <int>{
+      for (final entry in _pointerKinds.entries)
+        if (entry.value == PointerDeviceKind.touch) entry.key,
+      ..._globalTouchStartsInside,
+      ..._provisionalTouchTraces.keys,
+    };
+    final hasTouchSelection =
+        touchPointers.any(
+          (pointer) =>
+              _roles[pointer] == PointerRole.select ||
+              _selectionPinchPointers.contains(pointer) ||
+              _selectionStarts.containsKey(pointer) ||
+              _selectionMoveStarts.containsKey(pointer) ||
+              _selectionGestures.containsKey(pointer),
+        ) ||
+        (_selectionTransformOwner != null && touchPointers.isNotEmpty);
+    final hasTouchNavigation = touchPointers.any(
+      _navigationPointers.containsKey,
+    );
+    final hasTouchErase = touchPointers.any(
+      (pointer) =>
+          _eraserPointers[pointer]?.touchContact == true ||
+          _priorityEraserPointers.contains(pointer),
+    );
+    final hasFingerInk = touchPointers.any(
+      (pointer) => _roles[pointer] == PointerRole.ink,
+    );
+    if (touchPointers.isEmpty &&
+        !hasTouchSelection &&
+        !hasTouchNavigation &&
+        !hasTouchErase &&
+        !hasFingerInk) {
+      return;
+    }
+
+    if (hasTouchNavigation) {
+      _cancelViewportPreview();
+      _navigatorHideTimer?.cancel();
+      _navigatorVisible = false;
+    }
+    if (hasTouchErase) {
+      // Erasing is staged until pointer-up, so rollback is lossless.
+      controller.cancelErase();
+    }
+    if (hasTouchSelection) {
+      controller.cancelSelectionTransform();
+      final owner = _selectionTransformOwner;
+      if (owner != null) _releaseSelectionTransform(owner);
+      // Recreate handle recognizers on the next frame. A recognizer that was
+      // already holding a touch must not publish another preview after the pen
+      // has claimed the surface.
+      _selectionGestureEpoch++;
+    }
+
+    for (final pointer in touchPointers) {
+      if (_roles[pointer] == PointerRole.ink) {
+        controller.cancelInk(pointer);
+      }
+      _roles[pointer] = PointerRole.ignored;
+      _navigationPointers.remove(pointer);
+      _navigationStartPositions.remove(pointer);
+      _eraserPointers.remove(pointer);
+      _priorityEraserPointers.remove(pointer);
+      _selectionStarts.remove(pointer);
+      _selectionMoveStarts.remove(pointer);
+      _selectionGestures.remove(pointer);
+      _selectionPinchPointers.remove(pointer);
+      _clusteredTouchEraser.remove(pointer);
+      _pointerIndicators.removePointer(pointer);
+      final trace = _provisionalTouchTraces[pointer];
+      if (trace != null) {
+        trace.suppressedByStylus = true;
+        trace.becameEraser = trace.becameEraser || hasTouchErase;
+      }
+    }
+    if (_navigationPointers.isEmpty) _resetNavigationGesture();
+    if (_selectionPinchPointers.isEmpty) {
+      _selectionPinchStartDistance = null;
+      _selectionPinchAnchor = null;
+    }
+    _clusteredTouchEraser.clear();
+    if (mounted) setState(() {});
   }
 
   void _startPriorityErase(
@@ -795,6 +923,10 @@ class _BoardSurfaceState extends State<BoardSurface> {
     final localPosition = _boundedLocalPosition(event.localPosition);
     _pointerLocalPositions[event.pointer] = localPosition;
     final world = viewport.screenToWorld(localPosition);
+    if (event.kind == PointerDeviceKind.stylus ||
+        event.kind == PointerDeviceKind.invertedStylus) {
+      _neutralizeActiveTouchesForStylus();
+    }
     if (_inlineTextObjectId != null) {
       _inlineTextObjectId = null;
       setState(() {});
@@ -802,8 +934,18 @@ class _BoardSurfaceState extends State<BoardSurface> {
     // Palm/fist classification must precede cover and shape shortcuts. A broad
     // contact also outranks an existing selection owner: a multi-contact fist
     // must roll that preview back rather than being ignored behind it.
-    final isReportedEraser = controller.pointerPolicy.isEraserContact(event);
-    if (event.kind == PointerDeviceKind.touch && !isReportedEraser) {
+    final stylusCurrentlyActive = controller.inkSessions.hasActiveStylus;
+    if (event.kind == PointerDeviceKind.touch &&
+        stylusCurrentlyActive &&
+        existingTrace != null) {
+      existingTrace.suppressedByStylus = true;
+    }
+    final isReportedEraser =
+        !(event.kind == PointerDeviceKind.touch && stylusCurrentlyActive) &&
+        controller.pointerPolicy.isEraserContact(event);
+    if (event.kind == PointerDeviceKind.touch &&
+        !stylusCurrentlyActive &&
+        !isReportedEraser) {
       _clusteredTouchEraser.add(event, localPosition);
     }
     if (isReportedEraser) {
@@ -865,7 +1007,7 @@ class _BoardSurfaceState extends State<BoardSurface> {
     if (event.kind == PointerDeviceKind.touch && widget.fingerDrawingEnabled) {
       _promoteFingerInkToNavigation();
     }
-    final role = controller.pointerPolicy.classifyDown(
+    var role = controller.pointerPolicy.classifyDown(
       event,
       tool: activeTool,
       selectionActive: _selectionActiveForParticipant,
@@ -873,12 +1015,28 @@ class _BoardSurfaceState extends State<BoardSurface> {
       activeNavigationTouches: _navigationPointers.length,
       fingerDrawingEnabled: widget.fingerDrawingEnabled,
     );
+    // In the normal editor a participant controller is present even in
+    // one-person mode. Its pen tool deliberately keeps ordinary touches in
+    // navigation so a finger can pan while the stylus writes. Once the user
+    // has selected content with a stationary finger tap, however, another
+    // touch directly on that selection must own a move immediately. Re-route
+    // only this hit-tested navigation contact; a touch elsewhere still pans,
+    // a resting hand while a stylus is active remains ignored by the policy,
+    // and a second touch can still promote the move into selection pinch.
+    if (role == PointerRole.navigate &&
+        event.kind == PointerDeviceKind.touch &&
+        !widget.fingerDrawingEnabled &&
+        controller.hasSelection &&
+        controller.selectionContains(world, tolerance: 12 / viewport.scale)) {
+      role = PointerRole.select;
+    }
     _roles[event.pointer] = role;
     switch (role) {
       case PointerRole.ink:
         if (!controller.beginInk(
           event,
           world,
+          samplingPosition: localPosition,
           style: widget.participant?.penStyle,
           authorId: widget.participant == null
               ? null
@@ -895,11 +1053,7 @@ class _BoardSurfaceState extends State<BoardSurface> {
       case PointerRole.erase:
         _beginErase(event, world, localPosition: localPosition);
       case PointerRole.navigate:
-        if (_navigationPointers.isEmpty) {
-          _viewportGestureStartScale = viewport.scale;
-          _viewportGestureStartOffset = viewport.offset;
-        }
-        _navigationPointers[event.pointer] = localPosition;
+        _beginNavigation(event.pointer, localPosition);
       case PointerRole.select:
         if (_selectionTransformOwner != null) {
           _roles[event.pointer] = PointerRole.ignored;
@@ -1069,15 +1223,35 @@ class _BoardSurfaceState extends State<BoardSurface> {
         .map((entry) => entry.key)
         .toList(growable: false);
     if (inkPointers.isEmpty) return;
-    _viewportGestureStartScale ??= viewport.scale;
-    _viewportGestureStartOffset ??= viewport.offset;
     for (final pointer in inkPointers) {
       controller.cancelInk(pointer);
       _roles[pointer] = PointerRole.navigate;
       _pointerIndicators.removePointer(pointer);
       final local = _pointerLocalPositions[pointer];
-      if (local != null) _navigationPointers[pointer] = local;
+      if (local != null) _beginNavigation(pointer, local);
     }
+  }
+
+  static const double _navigationTapSlop = 10;
+
+  void _beginNavigation(int pointer, Offset localPosition) {
+    if (_navigationPointers.isEmpty) {
+      _resetNavigationGesture();
+      _viewportGestureStartScale = viewport.scale;
+      _viewportGestureStartOffset = viewport.offset;
+    }
+    _navigationPointers[pointer] = localPosition;
+    _navigationStartPositions[pointer] = localPosition;
+    if (_navigationPointers.length > 1) {
+      _navigationGestureHadMultiplePointers = true;
+    }
+  }
+
+  void _resetNavigationGesture() {
+    _navigationStartPositions.clear();
+    _navigationGestureHadMultiplePointers = false;
+    _navigationGestureMovedBeyondTapSlop = false;
+    _navigationGestureLongPressTriggered = false;
   }
 
   bool _isInkTool(BoardTool tool) =>
@@ -1119,6 +1293,21 @@ class _BoardSurfaceState extends State<BoardSurface> {
     );
   }
 
+  void _updateEraserIndicator({
+    required int pointer,
+    required Offset position,
+    required double radius,
+  }) {
+    _pointerIndicators.updatePointer(
+      BoardPointerIndicator(
+        pointer: pointer,
+        position: _boundedLocalPosition(position),
+        kind: BoardPointerIndicatorKind.eraser,
+        radius: radius,
+      ),
+    );
+  }
+
   void _updatePointerIndicator(
     PointerMoveEvent event,
     Offset localPosition,
@@ -1126,7 +1315,10 @@ class _BoardSurfaceState extends State<BoardSurface> {
   ) {
     final kind = switch (role) {
       PointerRole.ink => BoardPointerIndicatorKind.ink,
-      PointerRole.erase => BoardPointerIndicatorKind.eraser,
+      // Erasing computes one calibrated footprint for both mutation and UI.
+      // Updating it here with a scalar fallback would briefly show a different
+      // size and, for a clustered fist, permanently shrink the cursor.
+      PointerRole.erase => null,
       PointerRole.select =>
         _selectionGestures[event.pointer]?.tool == BoardTool.shape
             ? BoardPointerIndicatorKind.shape
@@ -1150,6 +1342,14 @@ class _BoardSurfaceState extends State<BoardSurface> {
       _updateSelectionPinch();
       return;
     }
+    if (event.kind == PointerDeviceKind.touch &&
+        controller.inkSessions.hasActiveStylus) {
+      // Covers the driver ordering where the touch was delivered before the
+      // stylus DOWN reached the global route. Cleanup must remove ownership,
+      // not only relabel the pointer, otherwise its UP can replay a tap.
+      _neutralizeActiveTouchesForStylus();
+      return;
+    }
     if (event.kind == PointerDeviceKind.touch && role != PointerRole.erase) {
       final cluster = _clusteredTouchEraser.update(event, localPosition);
       if (cluster != null) {
@@ -1162,6 +1362,7 @@ class _BoardSurfaceState extends State<BoardSurface> {
           event,
           currentRole: role,
           activeNavigationTouches: _navigationPointers.length,
+          stylusCurrentlyActive: controller.inkSessions.hasActiveStylus,
         )) {
       if (role == PointerRole.navigate) {
         // A fist can initially look like two or more ordinary fingertips and
@@ -1189,7 +1390,7 @@ class _BoardSurfaceState extends State<BoardSurface> {
     }
     switch (role) {
       case PointerRole.ink:
-        controller.updateInk(event, world);
+        controller.updateInk(event, world, samplingPosition: localPosition);
       case PointerRole.erase:
         _continueErase(event, world, localPosition: localPosition);
       case PointerRole.navigate:
@@ -1244,13 +1445,37 @@ class _BoardSurfaceState extends State<BoardSurface> {
     );
     switch (role) {
       case PointerRole.ink:
-        controller.endInk(event, world);
+        controller.endInk(
+          event,
+          world,
+          samplingPosition: _boundedLocalPosition(event.localPosition),
+        );
       case PointerRole.erase:
         _finishErase(event.pointer);
       case PointerRole.navigate:
+        final shouldSelect =
+            event.kind == PointerDeviceKind.touch &&
+            !widget.fingerDrawingEnabled &&
+            _navigationPointers.length == 1 &&
+            !_navigationGestureHadMultiplePointers &&
+            !_navigationGestureMovedBeyondTapSlop &&
+            !_navigationGestureLongPressTriggered;
         _navigationPointers.remove(event.pointer);
+        _navigationStartPositions.remove(event.pointer);
         if (_navigationPointers.isEmpty) {
-          _commitViewportPreview();
+          if (shouldSelect) {
+            // Restore the exact persisted camera before hit testing. Small
+            // sensor jitter during a tap must neither pan the page nor offset
+            // the selected object.
+            _cancelViewportPreview();
+            final tapWorld = viewport.screenToWorld(
+              _boundedLocalPosition(event.localPosition),
+            );
+            controller.selectAt(tapWorld, viewportScale: viewport.scale);
+          } else {
+            _commitViewportPreview();
+          }
+          _resetNavigationGesture();
           _scheduleNavigatorHide();
         }
       case PointerRole.select:
@@ -1278,10 +1503,12 @@ class _BoardSurfaceState extends State<BoardSurface> {
     if (role == PointerRole.erase) _finishErase(event.pointer);
     if (role == PointerRole.navigate) {
       _navigationPointers.remove(event.pointer);
+      _navigationStartPositions.remove(event.pointer);
       if (_navigationPointers.isEmpty) {
         // Android palm rejection and interrupted system gestures surface as a
         // cancellation. A canceled provisional camera must never be persisted.
         _cancelViewportPreview();
+        _resetNavigationGesture();
         _scheduleNavigatorHide();
       }
     }
@@ -1301,6 +1528,11 @@ class _BoardSurfaceState extends State<BoardSurface> {
     final previous = _navigationPointers[event.pointer];
     if (previous == null) return;
     final localPosition = _boundedLocalPosition(event.localPosition);
+    final start = _navigationStartPositions[event.pointer];
+    if (start != null &&
+        (localPosition - start).distance > _navigationTapSlop) {
+      _navigationGestureMovedBeyondTapSlop = true;
+    }
     if (_navigationPointers.length == 1) {
       viewport.panBy(
         localPosition - previous,
@@ -1320,22 +1552,21 @@ class _BoardSurfaceState extends State<BoardSurface> {
     final newSecond = secondId == event.pointer ? localPosition : oldSecond;
     final oldCentroid = (oldFirst + oldSecond) / 2;
     final newCentroid = (newFirst + newSecond) / 2;
-    viewport.panBy(
-      newCentroid - oldCentroid,
-      _size,
+    final oldDistance = (oldFirst - oldSecond).distance;
+    final newDistance = (newFirst - newSecond).distance;
+    final zoomFactor =
+        oldDistance > 4 && newDistance > 4 && !_selectionActiveForParticipant
+        ? newDistance / oldDistance
+        : null;
+    viewport.applyGestureTransform(
+      panDelta: newCentroid - oldCentroid,
+      focalPoint: newCentroid,
+      viewportSize: _size,
+      zoomFactor: zoomFactor,
       visibleScreenBounds: _viewportVisibleBounds,
       horizontalConstraint: widget.horizontalViewportConstraint,
     );
-    final oldDistance = (oldFirst - oldSecond).distance;
-    final newDistance = (newFirst - newSecond).distance;
-    if (oldDistance > 4 && newDistance > 4 && !_selectionActiveForParticipant) {
-      viewport.zoomAt(
-        factor: newDistance / oldDistance,
-        focalPoint: newCentroid,
-        viewportSize: _size,
-        visibleScreenBounds: _viewportVisibleBounds,
-        horizontalConstraint: widget.horizontalViewportConstraint,
-      );
+    if (zoomFactor != null) {
       _showNavigatorDuringGesture();
     }
     _navigationPointers[event.pointer] = localPosition;
@@ -1381,18 +1612,21 @@ class _BoardSurfaceState extends State<BoardSurface> {
     final effectiveLocal = _boundedLocalPosition(
       localPosition ?? event.localPosition,
     );
-    _trackPointerIndicator(
-      event,
-      effectiveLocal,
-      BoardPointerIndicatorKind.eraser,
-    );
-    final stamps = _worldEraserStamps(
+    final geometry = _eraserGeometry(
       event,
       localPosition: effectiveLocal,
       fallbackWorld: effectiveWorld,
     );
-    _eraserPointers[event.pointer] = _EraserPointerState(stamps: stamps);
-    _eraseStampTransition(null, stamps);
+    _updateEraserIndicator(
+      pointer: event.pointer,
+      position: effectiveLocal,
+      radius: geometry.screenRadius,
+    );
+    _eraserPointers[event.pointer] = _EraserPointerState(
+      stamps: geometry.stamps,
+      touchContact: event.kind == PointerDeviceKind.touch,
+    );
+    _eraseStampTransition(null, geometry.stamps);
     if (mounted) setState(() {});
   }
 
@@ -1412,6 +1646,7 @@ class _BoardSurfaceState extends State<BoardSurface> {
     final scale = viewport.scale;
     final worldRadius =
         cluster.brushRadius / (scale.isFinite && scale > 0 ? scale : 1);
+    final sweeps = <InkEraserSweep>[];
     for (final pointer in pointers) {
       final previousRole = _roles[pointer];
       if (previousRole == PointerRole.ink) controller.cancelInk(pointer);
@@ -1436,9 +1671,12 @@ class _BoardSurfaceState extends State<BoardSurface> {
         stamps: <_WorldEraserStamp>[
           _WorldEraserStamp(center: world, radius: worldRadius),
         ],
+        fixedScreenRadius: cluster.brushRadius,
+        touchContact: true,
       );
-      controller.eraseAt(world, radius: worldRadius);
+      sweeps.add((start: world, end: world, radius: worldRadius));
     }
+    controller.eraseSweeps(sweeps);
     if (mounted) setState(() {});
   }
 
@@ -1471,6 +1709,7 @@ class _BoardSurfaceState extends State<BoardSurface> {
       if (pointer != eraserPointer) _roles[pointer] = PointerRole.ignored;
     }
     _navigationPointers.clear();
+    _resetNavigationGesture();
     _cancelViewportPreview();
     _navigatorHideTimer?.cancel();
     _navigatorVisible = false;
@@ -1488,40 +1727,72 @@ class _BoardSurfaceState extends State<BoardSurface> {
       _beginErase(event, world, localPosition: localPosition);
       return;
     }
-    final current = _worldEraserStamps(
-      event,
-      localPosition: _boundedLocalPosition(
-        localPosition ?? event.localPosition,
-      ),
-      fallbackWorld: world,
-    );
-    _trackPointerIndicator(
-      event,
+    final effectiveLocal = _boundedLocalPosition(
       localPosition ?? event.localPosition,
-      BoardPointerIndicatorKind.eraser,
     );
-    _eraseStampTransition(previous.stamps, current);
-    _eraserPointers[event.pointer] = _EraserPointerState(stamps: current);
+    final geometry = _eraserGeometry(
+      event,
+      localPosition: effectiveLocal,
+      fallbackWorld: world,
+      fixedScreenRadius: previous.fixedScreenRadius,
+    );
+    _updateEraserIndicator(
+      pointer: event.pointer,
+      position: effectiveLocal,
+      radius: geometry.screenRadius,
+    );
+    _eraseStampTransition(previous.stamps, geometry.stamps);
+    _eraserPointers[event.pointer] = _EraserPointerState(
+      stamps: geometry.stamps,
+      fixedScreenRadius: previous.fixedScreenRadius,
+      touchContact: previous.touchContact,
+    );
   }
 
-  List<_WorldEraserStamp> _worldEraserStamps(
+  ({List<_WorldEraserStamp> stamps, double screenRadius}) _eraserGeometry(
     PointerEvent event, {
     required Offset localPosition,
     required Offset fallbackWorld,
+    double? fixedScreenRadius,
   }) {
-    if (activeTool == BoardTool.eraser &&
-        event.kind != PointerDeviceKind.touch) {
+    if (event.kind != PointerDeviceKind.touch) {
       final width =
           widget.participant?.penStyle.width ?? controller.penStyle.width;
-      return <_WorldEraserStamp>[
-        _WorldEraserStamp(
-          center: fallbackWorld,
-          radius: EraserContactGeometry.stylusWorldRadius(width),
+      return (
+        stamps: <_WorldEraserStamp>[
+          _WorldEraserStamp(
+            center: fallbackWorld,
+            radius: EraserContactGeometry.stylusWorldRadius(width),
+          ),
+        ],
+        screenRadius: EraserContactGeometry.cursorScreenRadius(
+          logicalWidth: width,
+          viewportScale: viewport.scale,
         ),
-      ];
+      );
     }
-    return _screenFootprintToWorld(
-      controller.pointerPolicy.eraserFootprintFor(event, center: localPosition),
+    final fixedRadius =
+        fixedScreenRadius != null &&
+            fixedScreenRadius.isFinite &&
+            fixedScreenRadius > 0
+        ? fixedScreenRadius.clamp(1.0, 96.0)
+        : null;
+    final footprint = fixedRadius == null
+        ? controller.pointerPolicy.eraserFootprintFor(
+            event,
+            center: localPosition,
+          )
+        : <EraserBrushStamp>[
+            EraserBrushStamp(center: localPosition, radius: fixedRadius),
+          ];
+    return (
+      stamps: _screenFootprintToWorld(footprint),
+      screenRadius: EraserContactGeometry.enclosingScreenRadius(
+        center: localPosition,
+        footprint: footprint,
+        fallback:
+            fixedRadius ?? controller.pointerPolicy.eraserRadiusFor(event),
+      ),
     );
   }
 
@@ -1547,39 +1818,54 @@ class _BoardSurfaceState extends State<BoardSurface> {
   void _eraseStampTransition(
     List<_WorldEraserStamp>? previous,
     List<_WorldEraserStamp> current,
+  ) => controller.eraseSweeps(_eraserSweepsForTransition(previous, current));
+
+  List<InkEraserSweep> _eraserSweepsForTransition(
+    List<_WorldEraserStamp>? previous,
+    List<_WorldEraserStamp> current,
   ) {
-    if (current.isEmpty) return;
+    if (current.isEmpty) return const <InkEraserSweep>[];
+    final sweeps = <InkEraserSweep>[];
     if (previous == null || previous.isEmpty) {
       for (final stamp in current) {
-        controller.eraseAt(stamp.center, radius: stamp.radius);
+        sweeps.add((
+          start: stamp.center,
+          end: stamp.center,
+          radius: stamp.radius,
+        ));
       }
-      return;
+      return sweeps;
     }
     if (previous.length == current.length) {
       for (var index = 0; index < current.length; index++) {
         final from = previous[index];
         final to = current[index];
-        controller.eraseAlong(
-          from.center,
-          to.center,
+        sweeps.add((
+          start: from.center,
+          end: to.center,
           radius: math.max(from.radius, to.radius),
-        );
+        ));
       }
-      return;
+      return sweeps;
     }
     // Hardware can start reporting calibrated axes midway through a gesture,
     // changing a circular fallback into an ellipse. Stamp the new footprint
     // and bridge its centre so coalesced move events cannot leave a gap.
     for (final stamp in current) {
-      controller.eraseAt(stamp.center, radius: stamp.radius);
+      sweeps.add((
+        start: stamp.center,
+        end: stamp.center,
+        radius: stamp.radius,
+      ));
     }
     final from = previous[previous.length ~/ 2];
     final to = current[current.length ~/ 2];
-    controller.eraseAlong(
-      from.center,
-      to.center,
+    sweeps.add((
+      start: from.center,
+      end: to.center,
       radius: math.max(from.radius, to.radius),
-    );
+    ));
+    return sweeps;
   }
 
   void _finishErase(int pointer) {
@@ -1591,6 +1877,7 @@ class _BoardSurfaceState extends State<BoardSurface> {
     if (_eraserPointers.isEmpty) {
       _nativePalmCommitTimer?.cancel();
       _nativePalmCommitTimer = null;
+      _pointerIndicators.removePointer(_nativePalmIndicatorPointer);
       controller.commitErase();
       if (mounted) setState(() {});
     }
@@ -1714,8 +2001,14 @@ class _BoardSurfaceState extends State<BoardSurface> {
   void _handleLongPress(LongPressStartDetails details) {
     if (_inputSuppressed ||
         controller.inkSessions.isWriting ||
-        _eraserPointers.isNotEmpty) {
+        _eraserPointers.isNotEmpty ||
+        _navigationPointers.length > 1 ||
+        _navigationGestureHadMultiplePointers ||
+        _navigationGestureMovedBeyondTapSlop) {
       return;
+    }
+    if (_navigationPointers.length == 1) {
+      _navigationGestureLongPressTriggered = true;
     }
     final world = viewport.screenToWorld(
       _boundedLocalPosition(details.localPosition),
@@ -3026,6 +3319,7 @@ final class _ProvisionalTouchTrace {
   double maximumScreenRadius = 18;
   bool routedToBoard = false;
   bool becameEraser = false;
+  bool suppressedByStylus = false;
 
   void add(
     Offset point,
@@ -3064,9 +3358,15 @@ final class _ProvisionalTouchTrace {
 }
 
 final class _EraserPointerState {
-  const _EraserPointerState({required this.stamps});
+  const _EraserPointerState({
+    required this.stamps,
+    required this.touchContact,
+    this.fixedScreenRadius,
+  });
 
   final List<_WorldEraserStamp> stamps;
+  final bool touchContact;
+  final double? fixedScreenRadius;
 }
 
 final class _WorldEraserStamp {

@@ -125,6 +125,7 @@ void main() {
         finger,
         currentRole: PointerRole.navigate,
         activeNavigationTouches: 1,
+        stylusCurrentlyActive: false,
       ),
       isFalse,
     );
@@ -138,6 +139,7 @@ void main() {
         ),
         currentRole: PointerRole.navigate,
         activeNavigationTouches: 2,
+        stylusCurrentlyActive: false,
       ),
       isFalse,
     );
@@ -151,6 +153,7 @@ void main() {
         ),
         currentRole: PointerRole.navigate,
         activeNavigationTouches: 2,
+        stylusCurrentlyActive: false,
       ),
       isTrue,
     );
@@ -166,6 +169,7 @@ void main() {
         broadMove,
         currentRole: PointerRole.navigate,
         activeNavigationTouches: 1,
+        stylusCurrentlyActive: false,
       ),
       isTrue,
     );
@@ -174,6 +178,7 @@ void main() {
         broadMove,
         currentRole: PointerRole.ignored,
         activeNavigationTouches: 0,
+        stylusCurrentlyActive: false,
       ),
       isTrue,
     );
@@ -182,6 +187,7 @@ void main() {
         broadMove,
         currentRole: PointerRole.select,
         activeNavigationTouches: 0,
+        stylusCurrentlyActive: false,
       ),
       isTrue,
     );
@@ -195,6 +201,37 @@ void main() {
         penActive: true,
       ),
       PointerRole.ignored,
+    );
+  });
+
+  test('broad resting palm is ignored while a stylus writes', () {
+    const broadPalm = PointerDownEvent(
+      kind: PointerDeviceKind.touch,
+      size: .34,
+      radiusMajor: 32,
+      radiusMinor: 18,
+    );
+    expect(classify(broadPalm, penActive: true), PointerRole.ignored);
+    expect(
+      policy.shouldPromoteToEraser(
+        const PointerMoveEvent(
+          kind: PointerDeviceKind.touch,
+          size: .34,
+          radiusMajor: 32,
+          radiusMinor: 18,
+        ),
+        currentRole: PointerRole.ignored,
+        activeNavigationTouches: 0,
+        stylusCurrentlyActive: true,
+      ),
+      isFalse,
+    );
+    expect(
+      classify(
+        const PointerDownEvent(kind: PointerDeviceKind.invertedStylus),
+        penActive: true,
+      ),
+      PointerRole.erase,
     );
   });
 

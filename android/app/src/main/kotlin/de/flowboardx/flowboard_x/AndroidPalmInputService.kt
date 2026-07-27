@@ -17,9 +17,11 @@ import kotlin.math.max
  * Samsung/Android can classify an unintended touch only after Flutter has
  * already received part of its pointer stream. This service keeps a small,
  * bounded copy of touchscreen traces and reports native palm evidence over a
- * side channel. It never mutates, cancels, recycles or consumes MotionEvents.
+ * side channel. Touch streams which begin next to an active/hovering stylus
+ * are quarantined as a whole; mixed stylus/touch packets always pass through
+ * so an active pen stroke can never be interrupted by the guard.
  */
-internal class AndroidPalmInputService(
+class AndroidPalmInputService(
     context: Context,
     messenger: BinaryMessenger,
     private val coordinateViewProvider: () -> View? = { null },
@@ -29,17 +31,32 @@ internal class AndroidPalmInputService(
         .takeIf { it.isFinite() && it > 0f }
         ?: 1f
     private val traces = LinkedHashMap<Int, Trace>()
+    private val stylusPalmGuard = StylusPalmGuard()
 
     @Volatile
     private var disposed = false
 
-    /** Called on the activity UI thread before Flutter handles [event]. */
-    fun observe(event: MotionEvent) {
-        if (disposed ||
-            (!event.isFromSource(InputDevice.SOURCE_TOUCHSCREEN) &&
-                !event.hasPalmTool())
-        ) return
+    /**
+     * Called on the activity UI thread before Flutter handles [event].
+     *
+     * @return true only when the complete, touch-only stream must be consumed
+     * natively because it started in the protected area around a live stylus.
+     */
+    fun observe(event: MotionEvent): Boolean {
+        if (disposed) return false
         try {
+            observeStylusPointers(event)
+            markTracesOverlappingStylus(event.eventTime)
+            if (shouldSuppressForStylus(event)) {
+                discardEventTraces(event)
+                return true
+            }
+            if ((!event.isFromSource(InputDevice.SOURCE_TOUCHSCREEN) &&
+                    !event.hasPalmTool()) ||
+                !event.hasEligibleTouch()
+            ) {
+                return false
+            }
             expireOldTraces(event.eventTime)
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
@@ -77,7 +94,8 @@ internal class AndroidPalmInputService(
                         Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU &&
                             traces.size == 1 &&
                             traces.values.single().lastToolType ==
-                            MotionEvent.TOOL_TYPE_FINGER
+                            MotionEvent.TOOL_TYPE_FINGER &&
+                            traces.values.single().hasStrongPalmEvidence()
                     val systemPalmCancellation =
                         event.hasPalmCancellationFlag() || legacySingleFingerCancellation
                     for (pointerId in pointerIds) {
@@ -96,11 +114,49 @@ internal class AndroidPalmInputService(
             Log.w(TAG, "Palm input observation failed", error)
             traces.clear()
         }
+        return false
+    }
+
+    /** Observes stylus hover without consuming or changing the event. */
+    fun observeGenericMotion(event: MotionEvent) {
+        if (disposed) return
+        try {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_HOVER_ENTER,
+                MotionEvent.ACTION_HOVER_MOVE,
+                -> {
+                    for (pointerIndex in 0 until event.pointerCount) {
+                        if (!event.isStylusTool(pointerIndex)) continue
+                        stylusPalmGuard.stylusHover(
+                            event.stylusPointerKey(pointerIndex),
+                            event.guardPosition(pointerIndex),
+                            event.eventTime,
+                        )
+                    }
+                }
+
+                MotionEvent.ACTION_HOVER_EXIT -> {
+                    for (pointerIndex in 0 until event.pointerCount) {
+                        if (!event.isStylusTool(pointerIndex)) continue
+                        stylusPalmGuard.stylusHoverExit(
+                            event.stylusPointerKey(pointerIndex),
+                            event.guardPosition(pointerIndex),
+                            event.eventTime,
+                        )
+                    }
+                }
+            }
+        } catch (error: Throwable) {
+            // Hover is an optional optimisation. Never put platform dispatch at
+            // risk if a vendor driver supplies malformed pointer metadata.
+            Log.w(TAG, "Stylus hover observation failed", error)
+        }
     }
 
     fun dispose() {
         disposed = true
         traces.clear()
+        stylusPalmGuard.clear()
     }
 
     private fun appendCurrentSamples(event: MotionEvent) {
@@ -126,7 +182,22 @@ internal class AndroidPalmInputService(
                 trace.maximumRadiusDp,
                 contact.radiusMajorDp,
             )
+            trace.maximumMeasuredRadiusDp = max(
+                trace.maximumMeasuredRadiusDp,
+                if (contact.hasMeasuredAxes) contact.radiusMajorDp else 0.0,
+            )
+            trace.maximumNormalizedSize = max(
+                trace.maximumNormalizedSize,
+                contact.normalizedSize,
+            )
             val position = logicalViewPosition(event, pointerIndex)
+            if (stylusPalmGuard.isStylusNear(
+                    StylusPalmGuard.Position(position.first, position.second),
+                    event.eventTime,
+                )
+            ) {
+                trace.overlappedStylusProtection = true
+            }
             trace.add(
                 Sample(
                     xDp = position.first,
@@ -169,8 +240,20 @@ internal class AndroidPalmInputService(
         canceledBySystem: Boolean,
     ) {
         val trace = traces.remove(pointerId) ?: return
+        if (!PalmTraceDecision.shouldReplayAsEraser(
+                overlappedStylusProtection =
+                    trace.overlappedStylusProtection,
+                explicitNativePalm = trace.nativeReason != null,
+                canceledBySystem = canceledBySystem,
+                hasCancellationEvidence = trace.hasCancellationEvidence(),
+                pathLengthDp = trace.pathLengthDp,
+                displacementDp = trace.displacementDp(),
+            )
+        ) {
+            return
+        }
         val reason = trace.nativeReason
-            ?: if (canceledBySystem && trace.hasCancellationEvidence()) {
+            ?: if (canceledBySystem) {
                 REASON_SYSTEM_CANCELED
             } else {
                 null
@@ -233,14 +316,18 @@ internal class AndroidPalmInputService(
                 event.getAxisValue(MotionEvent.AXIS_TOOL_MINOR, pointerIndex),
             ) / density / 2.0
         }
+        val hasMeasuredAxes = major > 0.0 || minor > 0.0
+        val normalizedSize = event.getSize(pointerIndex)
+            .takeIf { it.isFinite() && it > 0f }
+            ?.coerceIn(0f, 1f)
+            ?.toDouble()
+            ?: 0.0
         if (major <= 0.0 && minor <= 0.0) {
-            val normalizedSize = event.getSize(pointerIndex)
+            val measuredSize = normalizedSize
                 .takeIf { it.isFinite() && it > 0f }
-                ?.coerceIn(0f, 1f)
-                ?.toDouble()
                 ?: 0.0
-            val fallback = if (normalizedSize > 0) {
-                18.0 + normalizedSize * 60.0
+            val fallback = if (measuredSize > 0) {
+                18.0 + measuredSize * 60.0
             } else {
                 DEFAULT_RADIUS_DP
             }
@@ -268,7 +355,114 @@ internal class AndroidPalmInputService(
             radiusMajorDp = safeMajor,
             radiusMinorDp = minor.coerceIn(1.0, safeMajor),
             orientation = orientation,
+            hasMeasuredAxes = hasMeasuredAxes,
+            normalizedSize = normalizedSize,
         )
+    }
+
+    private fun observeStylusPointers(event: MotionEvent) {
+        val stylusIndices = (0 until event.pointerCount)
+            .filter { pointerIndex -> event.isStylusTool(pointerIndex) }
+        if (stylusIndices.isEmpty()) return
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN,
+            MotionEvent.ACTION_POINTER_DOWN,
+            -> {
+                val actionIndex = event.actionIndex
+                if (actionIndex in stylusIndices) {
+                    stylusPalmGuard.stylusDown(
+                        event.stylusPointerKey(actionIndex),
+                        event.guardPosition(actionIndex),
+                        event.eventTime,
+                    )
+                }
+                for (pointerIndex in stylusIndices) {
+                    if (pointerIndex == actionIndex) continue
+                    stylusPalmGuard.stylusMove(
+                        event.stylusPointerKey(pointerIndex),
+                        event.guardPosition(pointerIndex),
+                        event.eventTime,
+                    )
+                }
+            }
+
+            MotionEvent.ACTION_MOVE -> {
+                for (pointerIndex in stylusIndices) {
+                    stylusPalmGuard.stylusMove(
+                        event.stylusPointerKey(pointerIndex),
+                        event.guardPosition(pointerIndex),
+                        event.eventTime,
+                    )
+                }
+            }
+
+            MotionEvent.ACTION_POINTER_UP,
+            MotionEvent.ACTION_UP,
+            -> {
+                val actionIndex = event.actionIndex
+                for (pointerIndex in stylusIndices) {
+                    if (pointerIndex == actionIndex) {
+                        stylusPalmGuard.stylusUp(
+                            event.stylusPointerKey(pointerIndex),
+                            event.guardPosition(pointerIndex),
+                            event.eventTime,
+                        )
+                    } else {
+                        stylusPalmGuard.stylusMove(
+                            event.stylusPointerKey(pointerIndex),
+                            event.guardPosition(pointerIndex),
+                            event.eventTime,
+                        )
+                    }
+                }
+            }
+
+            MotionEvent.ACTION_CANCEL -> stylusPalmGuard.cancelStyluses(
+                stylusIndices.map { pointerIndex ->
+                    event.stylusPointerKey(pointerIndex)
+                },
+                event.eventTime,
+            )
+        }
+    }
+
+    private fun shouldSuppressForStylus(event: MotionEvent): Boolean {
+        if ((!event.isFromSource(InputDevice.SOURCE_TOUCHSCREEN) &&
+                !event.hasPalmTool()) ||
+            !event.hasOnlyTouchTools()
+        ) {
+            return false
+        }
+        val phase = when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> StylusPalmGuard.TouchPhase.START
+            MotionEvent.ACTION_UP,
+            MotionEvent.ACTION_CANCEL,
+            -> StylusPalmGuard.TouchPhase.END
+            else -> StylusPalmGuard.TouchPhase.CONTINUE
+        }
+        return stylusPalmGuard.shouldSuppressTouch(
+            StylusPalmGuard.TouchStreamKey(event.deviceId, event.downTime),
+            phase,
+            (0 until event.pointerCount).map { pointerIndex ->
+                event.guardContact(pointerIndex)
+            },
+            event.eventTime,
+        )
+    }
+
+    private fun discardEventTraces(event: MotionEvent) {
+        for (pointerIndex in 0 until event.pointerCount) {
+            traces.remove(event.getPointerId(pointerIndex))
+        }
+    }
+
+    private fun markTracesOverlappingStylus(eventTimeMillis: Long) {
+        for (trace in traces.values) {
+            val position = trace.lastPosition() ?: continue
+            if (stylusPalmGuard.isStylusNear(position, eventTimeMillis)) {
+                trace.overlappedStylusProtection = true
+            }
+        }
     }
 
     /**
@@ -378,6 +572,8 @@ internal class AndroidPalmInputService(
         val radiusMajorDp: Double,
         val radiusMinorDp: Double,
         val orientation: Double,
+        val hasMeasuredAxes: Boolean,
+        val normalizedSize: Double,
     )
 
     private class Trace(
@@ -389,8 +585,11 @@ internal class AndroidPalmInputService(
     ) {
         var nativeReason: String? = null
         var maximumRadiusDp: Double = 0.0
+        var maximumMeasuredRadiusDp: Double = 0.0
+        var maximumNormalizedSize: Double = 0.0
         var peakContactCount: Int = 1
         var compactMultiContactEvidence: Boolean = false
+        var overlappedStylusProtection: Boolean = false
         var pathLengthDp: Double = 0.0
         private var firstSample: Sample? = null
         private var lastObservedSample: Sample? = null
@@ -437,11 +636,83 @@ internal class AndroidPalmInputService(
             return hypot(last.xDp - first.xDp, last.yDp - first.yDp)
         }
 
+        fun lastPosition(): StylusPalmGuard.Position? =
+            lastObservedSample?.let { sample ->
+                StylusPalmGuard.Position(sample.xDp, sample.yDp)
+            }
+
         fun hasCancellationEvidence(): Boolean =
             pathLengthDp >= MIN_CANCEL_PATH_LENGTH_DP ||
                 displacementDp() >= MIN_CANCEL_DISPLACEMENT_DP ||
-                maximumRadiusDp >= MIN_CANCEL_RADIUS_DP ||
+                hasStrongPalmEvidence() ||
                 compactMultiContactEvidence
+
+        fun hasStrongPalmEvidence(): Boolean =
+            maximumMeasuredRadiusDp >= MIN_CANCEL_RADIUS_DP ||
+                maximumNormalizedSize >= MIN_CANCEL_NORMALIZED_SIZE ||
+                compactMultiContactEvidence
+
+    }
+
+    private fun MotionEvent.isStylusTool(pointerIndex: Int): Boolean {
+        val toolType = getToolType(pointerIndex)
+        return toolType == MotionEvent.TOOL_TYPE_STYLUS ||
+            toolType == MotionEvent.TOOL_TYPE_ERASER
+    }
+
+    private fun MotionEvent.hasOnlyTouchTools(): Boolean {
+        if (pointerCount <= 0) return false
+        for (pointerIndex in 0 until pointerCount) {
+            val toolType = getToolType(pointerIndex)
+            if (toolType != MotionEvent.TOOL_TYPE_FINGER &&
+                toolType != HIDDEN_TOOL_TYPE_PALM
+            ) {
+                return false
+            }
+        }
+        return true
+    }
+
+    private fun MotionEvent.hasEligibleTouch(): Boolean {
+        for (pointerIndex in 0 until pointerCount) {
+            if (isEligibleTool(pointerIndex)) return true
+        }
+        return false
+    }
+
+    private fun MotionEvent.stylusPointerKey(
+        pointerIndex: Int,
+    ): StylusPalmGuard.PointerKey =
+        StylusPalmGuard.PointerKey(deviceId, getPointerId(pointerIndex))
+
+    private fun MotionEvent.guardPosition(
+        pointerIndex: Int,
+    ): StylusPalmGuard.Position {
+        val position = logicalViewPosition(this, pointerIndex)
+        return StylusPalmGuard.Position(position.first, position.second)
+    }
+
+    private fun MotionEvent.guardContact(
+        pointerIndex: Int,
+    ): StylusPalmGuard.TouchContact {
+        val geometry = contactGeometryDp(this, pointerIndex)
+        return StylusPalmGuard.TouchContact(
+            position = guardPosition(pointerIndex),
+            // The circular fallback is useful for eraser rendering but must not
+            // turn every device with missing axes into a native palm.
+            radiusMajorDp = if (geometry.hasMeasuredAxes) {
+                geometry.radiusMajorDp
+            } else {
+                0.0
+            },
+            radiusMinorDp = if (geometry.hasMeasuredAxes) {
+                geometry.radiusMinorDp
+            } else {
+                0.0
+            },
+            normalizedSize = geometry.normalizedSize,
+            explicitlyPalm = getToolType(pointerIndex) == HIDDEN_TOOL_TYPE_PALM,
+        )
     }
 
     private companion object {
@@ -462,6 +733,7 @@ internal class AndroidPalmInputService(
         const val MIN_CANCEL_PATH_LENGTH_DP = 12.0
         const val MIN_CANCEL_DISPLACEMENT_DP = 8.0
         const val MIN_CANCEL_RADIUS_DP = 13.0
+        const val MIN_CANCEL_NORMALIZED_SIZE = 0.24
         const val MIN_COMPACT_CONTACT_COUNT = 3
         const val MAX_COMPACT_CONTACT_COUNT = 4
         const val MAX_COMPACT_CLUSTER_DIAMETER_DP = 120.0

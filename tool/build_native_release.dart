@@ -105,7 +105,10 @@ Future<void> _verifyAndroidOfflineModels(String target) async {
     stdout.writeln(
       '> Offline-Handschriftmodell geprüft: ${report.artifactName}, '
       '${report.modelFileCount} Dateien, '
-      '${report.uncompressedModelBytes} Byte',
+      '${report.uncompressedModelBytes} Byte ML Kit; '
+      '${report.handwritingAssetCount} PP-OCRv5-Assets, '
+      '${report.handwritingAssetBytes} Byte; '
+      '${report.onnxRuntimeLibraryCount} ONNX-Runtime-Bibliotheken',
     );
   }
 }

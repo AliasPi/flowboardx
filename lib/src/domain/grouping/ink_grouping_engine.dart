@@ -16,6 +16,7 @@ final class InkGroupingConfig {
     this.sketchWidthThreshold = 220,
     this.sketchHeightThreshold = 160,
     this.maxLocalStrokes = 256,
+    this.maxCachedPages = 6,
   });
 
   final double spatialCellSize;
@@ -28,6 +29,7 @@ final class InkGroupingConfig {
   final double sketchWidthThreshold;
   final double sketchHeightThreshold;
   final int maxLocalStrokes;
+  final int maxCachedPages;
 }
 
 final class InkGroupingResult {
@@ -46,7 +48,9 @@ final class InkGroupingEngine {
   InkGroupingEngine({this.config = const InkGroupingConfig()});
 
   final InkGroupingConfig config;
-  final Map<String, InkSpatialIndex> _indices = {};
+  final Map<String, _PageInkIndex> _indices = {};
+
+  int get cachedPageCount => _indices.length;
 
   InkGroupingResult regroupAll(BoardPage page) {
     _indexFor(page);
@@ -65,9 +69,15 @@ final class InkGroupingEngine {
     required BoardPage page,
     required Iterable<String> changedStrokeIds,
     Rect2? dirtyRegion,
+    BoardPage? pageBeforeAppend,
+    InkStroke? appendedStroke,
   }) {
     final changed = changedStrokeIds.toSet();
-    final index = _indexFor(page);
+    final index = _indexFor(
+      page,
+      pageBeforeAppend: pageBeforeAppend,
+      appendedStroke: appendedStroke,
+    );
     Rect2? affected = dirtyRegion;
     for (final id in changed) {
       final stroke = index.strokeById(id);
@@ -145,13 +155,44 @@ final class InkGroupingEngine {
 
   void invalidatePage(String pageId) => _indices.remove(pageId);
 
-  InkSpatialIndex _indexFor(BoardPage page) {
-    final index = _indices.putIfAbsent(
-      page.id,
-      () => InkSpatialIndex(cellSize: config.spatialCellSize),
-    );
-    index.synchronize(page.strokes);
-    return index;
+  InkSpatialIndex _indexFor(
+    BoardPage page, {
+    BoardPage? pageBeforeAppend,
+    InkStroke? appendedStroke,
+  }) {
+    final existing = _indices.remove(page.id);
+    if (existing == null) {
+      final index = InkSpatialIndex(cellSize: config.spatialCellSize)
+        ..synchronize(page.strokes);
+      while (_indices.length >= math.max(1, config.maxCachedPages)) {
+        _indices.remove(_indices.keys.first);
+      }
+      _indices[page.id] = _PageInkIndex(index, page.strokes);
+      return index;
+    }
+    // Dart maps retain insertion order. Reinsert a hit to maintain a compact
+    // LRU of recently edited pages instead of retaining duplicate spatial maps
+    // for every page visited in a 100-page document.
+    _indices[page.id] = existing;
+    if (identical(existing.strokes, page.strokes)) return existing.index;
+
+    // The overwhelmingly common writing path appends exactly one immutable
+    // stroke. Keep the existing grid and index only that stroke. Any undo,
+    // transform or concurrent participant edit falls through to the complete
+    // synchronization below.
+    if (pageBeforeAppend != null &&
+        appendedStroke != null &&
+        identical(existing.strokes, pageBeforeAppend.strokes) &&
+        page.strokes.length == pageBeforeAppend.strokes.length + 1 &&
+        identical(page.strokes.last, appendedStroke)) {
+      existing.index.upsert(appendedStroke);
+      existing.strokes = page.strokes;
+      return existing.index;
+    }
+
+    existing.index.synchronize(page.strokes);
+    existing.strokes = page.strokes;
+    return existing.index;
   }
 
   List<InkGroup> _groupsFor(Iterable<InkStroke> source) {
@@ -304,6 +345,13 @@ final class InkGroupingEngine {
           .reduce((first, second) => first.isBefore(second) ? first : second),
     );
   }
+}
+
+final class _PageInkIndex {
+  _PageInkIndex(this.index, this.strokes);
+
+  final InkSpatialIndex index;
+  List<InkStroke> strokes;
 }
 
 final class InkSpatialIndex {

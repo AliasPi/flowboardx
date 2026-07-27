@@ -30,16 +30,19 @@ final class BoardSceneItem {
   String get id => object?.id ?? stroke!.id;
   int get zIndex => object?.zIndex ?? stroke!.zIndex;
 
-  BoardSceneItem withZIndex(int value) => switch (kind) {
-    BoardSceneItemKind.object => BoardSceneItem.object(
-      copyBoardObjectWithZIndex(object!, value),
-      stableOrder: stableOrder,
-    ),
-    BoardSceneItemKind.stroke => BoardSceneItem.stroke(
-      stroke!.copyWith(zIndex: value),
-      stableOrder: stableOrder,
-    ),
-  };
+  BoardSceneItem withZIndex(int value) {
+    if (value == zIndex) return this;
+    return switch (kind) {
+      BoardSceneItemKind.object => BoardSceneItem.object(
+        copyBoardObjectWithZIndex(object!, value),
+        stableOrder: stableOrder,
+      ),
+      BoardSceneItemKind.stroke => BoardSceneItem.stroke(
+        stroke!.copyWith(zIndex: value),
+        stableOrder: stableOrder,
+      ),
+    };
+  }
 }
 
 enum SceneArrangement { oneForward, oneBackward, toFront, toBack }
@@ -94,8 +97,12 @@ List<BoardSceneItem> arrangeBoardSceneItems({
   required SceneArrangement arrangement,
 }) {
   final values = orderedBoardSceneItems(objects: objects, strokes: strokes);
-  if (values.length > 1 &&
-      values.any((item) => selectedIds.contains(item.id))) {
+  if (values.length <= 1 ||
+      !values.any((item) => selectedIds.contains(item.id))) {
+    return values;
+  }
+  final originalOrder = values.map((item) => item.id).toList(growable: false);
+  {
     bool selected(BoardSceneItem item) => selectedIds.contains(item.id);
     switch (arrangement) {
       case SceneArrangement.toFront:
@@ -126,6 +133,14 @@ List<BoardSceneItem> arrangeBoardSceneItems({
         }
     }
   }
+  var orderChanged = false;
+  for (var index = 0; index < values.length; index++) {
+    if (values[index].id != originalOrder[index]) {
+      orderChanged = true;
+      break;
+    }
+  }
+  if (!orderChanged) return values;
   return <BoardSceneItem>[
     for (var index = 0; index < values.length; index++)
       values[index].withZIndex(index),

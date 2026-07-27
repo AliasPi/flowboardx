@@ -394,6 +394,44 @@ void main() {
     ]);
   });
 
+  test('one compound eraser footprint publishes one preview frame', () async {
+    final base = WhiteboardDocument.create(id: 'batched-eraser-preview');
+    final stroke = InkStroke(
+      id: 'wide-stroke',
+      points: const <InkPoint>[
+        InkPoint(x: 100, y: 200),
+        InkPoint(x: 500, y: 200),
+      ],
+      width: 10,
+    );
+    final controller = EditorController(
+      document: base.copyWith(
+        pages: <BoardPage>[
+          base.currentPage.copyWith(strokes: <InkStroke>[stroke]),
+        ],
+      ),
+      repository: _MemoryRepository(),
+      assetDirectory: Directory.current,
+    );
+    addTearDown(() async {
+      await controller.close();
+      controller.dispose();
+    });
+    var notifications = 0;
+    controller.addListener(() => notifications++);
+
+    controller.eraseSweeps(const <InkEraserSweep>[
+      (start: Offset(180, 200), end: Offset(200, 200), radius: 12),
+      (start: Offset(200, 200), end: Offset(220, 200), radius: 12),
+      (start: Offset(220, 200), end: Offset(240, 200), radius: 12),
+      (start: Offset(240, 200), end: Offset(260, 200), radius: 12),
+      (start: Offset(260, 200), end: Offset(280, 200), radius: 12),
+    ]);
+
+    expect(notifications, 1);
+    expect(controller.renderStrokes.length, greaterThan(1));
+  });
+
   test(
     'eraser rebases a dissolved selected group and removes dead selection ids',
     () async {
@@ -1635,113 +1673,120 @@ void main() {
     await controller.flush();
   });
 
-  testWidgets('broad palm erases without interrupting an active stylus', (
-    tester,
-  ) async {
-    tester.view.devicePixelRatio = 1;
-    tester.view.physicalSize = const Size(900, 700);
-    addTearDown(() {
-      tester.view.resetDevicePixelRatio();
-      tester.view.resetPhysicalSize();
-    });
-    final base = WhiteboardDocument.create(id: 'pen-and-palm-surface');
-    final existing = InkStroke(
-      id: 'existing',
-      points: const <InkPoint>[
-        InkPoint(x: 500, y: 295),
-        InkPoint(x: 500, y: 305),
-      ],
-      width: 8,
-    );
-    final controller = EditorController(
-      document: base.copyWith(
-        pages: <BoardPage>[
-          base.currentPage.copyWith(strokes: <InkStroke>[existing]),
+  testWidgets(
+    'broad palm rests without erasing or interrupting active stylus',
+    (tester) async {
+      tester.view.devicePixelRatio = 1;
+      tester.view.physicalSize = const Size(900, 700);
+      addTearDown(() {
+        tester.view.resetDevicePixelRatio();
+        tester.view.resetPhysicalSize();
+      });
+      final base = WhiteboardDocument.create(id: 'pen-and-palm-surface');
+      final existing = InkStroke(
+        id: 'existing',
+        points: const <InkPoint>[
+          InkPoint(x: 500, y: 295),
+          InkPoint(x: 500, y: 305),
         ],
-      ),
-      repository: _MemoryRepository(),
-      assetDirectory: Directory.current,
-    );
-    addTearDown(() async {
-      await controller.close();
-      controller.dispose();
-    });
-    await tester.pumpWidget(
-      MaterialApp(
-        home: Scaffold(body: BoardSurface(controller: controller)),
-      ),
-    );
+        width: 8,
+      );
+      final controller = EditorController(
+        document: base.copyWith(
+          pages: <BoardPage>[
+            base.currentPage.copyWith(strokes: <InkStroke>[existing]),
+          ],
+        ),
+        repository: _MemoryRepository(),
+        assetDirectory: Directory.current,
+      );
+      addTearDown(() async {
+        await controller.close();
+        controller.dispose();
+      });
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(body: BoardSurface(controller: controller)),
+        ),
+      );
 
-    await tester.sendEventToBinding(
-      const PointerDownEvent(
-        pointer: 41,
-        device: 11,
-        kind: PointerDeviceKind.stylus,
-        position: Offset(100, 100),
-      ),
-    );
-    await tester.sendEventToBinding(
-      const PointerMoveEvent(
-        pointer: 41,
-        device: 11,
-        kind: PointerDeviceKind.stylus,
-        position: Offset(170, 140),
-        delta: Offset(70, 40),
-        buttons: kPrimaryButton,
-      ),
-    );
-    expect(controller.inkSessions.hasActiveStylus, isTrue);
+      await tester.sendEventToBinding(
+        const PointerDownEvent(
+          pointer: 41,
+          device: 11,
+          kind: PointerDeviceKind.stylus,
+          position: Offset(100, 100),
+        ),
+      );
+      await tester.sendEventToBinding(
+        const PointerMoveEvent(
+          pointer: 41,
+          device: 11,
+          kind: PointerDeviceKind.stylus,
+          position: Offset(170, 140),
+          delta: Offset(70, 40),
+          buttons: kPrimaryButton,
+        ),
+      );
+      expect(controller.inkSessions.hasActiveStylus, isTrue);
 
-    await tester.sendEventToBinding(
-      const PointerDownEvent(
-        pointer: 42,
-        device: 22,
-        kind: PointerDeviceKind.touch,
-        position: Offset(420, 300),
-        radiusMajor: 32,
-        radiusMinor: 20,
-        size: .36,
-      ),
-    );
-    await tester.sendEventToBinding(
-      const PointerMoveEvent(
-        pointer: 42,
-        device: 22,
-        kind: PointerDeviceKind.touch,
-        position: Offset(580, 300),
-        delta: Offset(160, 0),
-        radiusMajor: 32,
-        radiusMinor: 20,
-        size: .36,
-        buttons: kPrimaryButton,
-      ),
-    );
-    await tester.sendEventToBinding(
-      const PointerUpEvent(
-        pointer: 42,
-        device: 22,
-        kind: PointerDeviceKind.touch,
-        position: Offset(580, 300),
-      ),
-    );
-    await tester.pump();
-    expect(controller.inkSessions.hasActiveStylus, isTrue);
-    expect(controller.page.strokeById('existing'), isNull);
+      await tester.sendEventToBinding(
+        const PointerDownEvent(
+          pointer: 42,
+          device: 22,
+          kind: PointerDeviceKind.touch,
+          position: Offset(420, 300),
+          radiusMajor: 32,
+          radiusMinor: 20,
+          size: .36,
+        ),
+      );
+      await tester.sendEventToBinding(
+        const PointerMoveEvent(
+          pointer: 42,
+          device: 22,
+          kind: PointerDeviceKind.touch,
+          position: Offset(580, 300),
+          delta: Offset(160, 0),
+          radiusMajor: 32,
+          radiusMinor: 20,
+          size: .36,
+          buttons: kPrimaryButton,
+        ),
+      );
+      await tester.sendEventToBinding(
+        const PointerUpEvent(
+          pointer: 42,
+          device: 22,
+          kind: PointerDeviceKind.touch,
+          position: Offset(580, 300),
+        ),
+      );
+      await tester.pump();
+      expect(controller.inkSessions.hasActiveStylus, isTrue);
+      expect(controller.page.strokeById('existing'), isNotNull);
 
-    await tester.sendEventToBinding(
-      const PointerUpEvent(
-        pointer: 41,
-        device: 11,
-        kind: PointerDeviceKind.stylus,
-        position: Offset(210, 170),
-      ),
-    );
-    await tester.pump();
-    expect(controller.inkSessions.isWriting, isFalse);
-    expect(controller.page.strokes, hasLength(1));
-    expect(controller.page.strokes.single.authorId, 'pointer-11');
-    await controller.flush();
-  });
+      await tester.sendEventToBinding(
+        const PointerUpEvent(
+          pointer: 41,
+          device: 11,
+          kind: PointerDeviceKind.stylus,
+          position: Offset(210, 170),
+        ),
+      );
+      await tester.pump();
+      expect(controller.inkSessions.isWriting, isFalse);
+      expect(controller.page.strokes, hasLength(2));
+      expect(
+        controller.page.strokes
+            .where((stroke) => stroke.id != 'existing')
+            .single
+            .authorId,
+        'pointer-11',
+      );
+      await controller.flush();
+    },
+  );
 
   testWidgets('multiple fist contacts commit one combined undo operation', (
     tester,
@@ -2330,6 +2375,47 @@ void main() {
     expect(controller.page.objectById('selected-object')!.zIndex, 2);
     expect(controller.page.strokeById('front-ink')!.zIndex, 1);
   });
+
+  test(
+    'already-satisfied layer arrangement creates no history entry',
+    () async {
+      final base = WhiteboardDocument.create(
+        id: 'layer-noop',
+        now: DateTime.utc(2026, 7, 22),
+      );
+      final selected = ShapeObject(
+        id: 'selected',
+        transform: const ObjectTransform(x: 0, y: 0, width: 40, height: 40),
+        zIndex: 7,
+      );
+      final document = base.copyWith(
+        pages: <BoardPage>[
+          base.currentPage.copyWith(
+            objects: <BoardObject>[selected],
+            selection: SelectionState(
+              selectedItemIds: const <String>['selected'],
+            ),
+          ),
+        ],
+      );
+      final controller = EditorController(
+        document: document,
+        repository: _MemoryRepository(),
+        assetDirectory: Directory.current,
+      );
+      addTearDown(() async {
+        await controller.close();
+        controller.dispose();
+      });
+      final revision = controller.document.revision;
+
+      controller.arrangeSelection(LayerArrangement.toFront);
+
+      expect(controller.document.revision, revision);
+      expect(controller.canUndo, isFalse);
+      expect(controller.page.objectById('selected'), same(selected));
+    },
+  );
 
   test(
     'user template imports media and annotations in one undoable command',

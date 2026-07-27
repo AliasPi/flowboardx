@@ -9,6 +9,8 @@ final class AutosaveController {
     this.documentId, {
     this.debounce = const Duration(milliseconds: 350),
     this.maxLatency = const Duration(seconds: 2),
+    this.retryBaseDelay = const Duration(seconds: 1),
+    this.retryMaximumDelay = const Duration(seconds: 30),
   }) {
     if (debounce.isNegative) {
       throw ArgumentError.value(
@@ -20,18 +22,25 @@ final class AutosaveController {
     if (maxLatency <= Duration.zero) {
       throw ArgumentError.value(maxLatency, 'maxLatency', 'muss positiv sein');
     }
+    if (retryBaseDelay <= Duration.zero || retryMaximumDelay < retryBaseDelay) {
+      throw ArgumentError('Auto-Save-Wiederholungsintervalle sind ungültig.');
+    }
   }
 
   final DocumentRepository repository;
   final String documentId;
   final Duration debounce;
   final Duration maxLatency;
+  final Duration retryBaseDelay;
+  final Duration retryMaximumDelay;
   final StreamController<Object> _errors = StreamController.broadcast();
   Timer? _timer;
   Timer? _maxTimer;
+  Timer? _retryTimer;
   WhiteboardDocument? _pending;
   Future<void>? _activeSave;
   bool _disposed = false;
+  int _retryAttempt = 0;
 
   bool get hasPendingChanges => _pending != null || _activeSave != null;
   Stream<Object> get errors => _errors.stream;
@@ -46,16 +55,24 @@ final class AutosaveController {
       );
     }
     _pending = document;
+    _retryTimer?.cancel();
+    _retryTimer = null;
     _timer?.cancel();
     _timer = Timer(debounce, _triggerSave);
     _maxTimer ??= Timer(maxLatency, _triggerSave);
   }
 
   void _triggerSave() {
+    _retryTimer?.cancel();
+    _retryTimer = null;
     _timer?.cancel();
     _timer = null;
     _maxTimer?.cancel();
     _maxTimer = null;
+    if (_activeSave != null) {
+      _scheduleRetry();
+      return;
+    }
     _startDrain().catchError((Object _) {
       // Error is emitted through [errors] and retried by flush/next schedule.
     });
@@ -67,6 +84,8 @@ final class AutosaveController {
     _timer = null;
     _maxTimer?.cancel();
     _maxTimer = null;
+    _retryTimer?.cancel();
+    _retryTimer = null;
     final active = _activeSave;
     if (active != null) {
       await active;
@@ -83,6 +102,8 @@ final class AutosaveController {
     _timer = null;
     _maxTimer?.cancel();
     _maxTimer = null;
+    _retryTimer?.cancel();
+    _retryTimer = null;
     if (flushPending) {
       final active = _activeSave;
       if (active != null) {
@@ -94,6 +115,7 @@ final class AutosaveController {
       }
     }
     _disposed = true;
+    if (!flushPending) _pending = null;
     await _errors.close();
   }
 
@@ -120,9 +142,13 @@ final class AutosaveController {
       _pending = null;
       try {
         await repository.save(document);
+        _retryAttempt = 0;
+        _retryTimer?.cancel();
+        _retryTimer = null;
       } catch (error) {
         _pending ??= document;
         if (!_errors.isClosed) _errors.add(error);
+        _scheduleRetry();
         rethrow;
       }
     } while (drainAll && _pending != null);
@@ -135,6 +161,20 @@ final class AutosaveController {
       _timer ??= Timer(debounce, _triggerSave);
       _maxTimer ??= Timer(maxLatency, _triggerSave);
     }
+  }
+
+  void _scheduleRetry() {
+    if (_disposed || _retryTimer != null || _pending == null) return;
+    final exponent = _retryAttempt.clamp(0, 10).toInt();
+    _retryAttempt++;
+    final multiplier = 1 << exponent;
+    final delayMicros = (retryBaseDelay.inMicroseconds * multiplier)
+        .clamp(retryBaseDelay.inMicroseconds, retryMaximumDelay.inMicroseconds)
+        .toInt();
+    _retryTimer = Timer(Duration(microseconds: delayMicros), () {
+      _retryTimer = null;
+      _triggerSave();
+    });
   }
 
   void _ensureActive() {

@@ -32,14 +32,24 @@ class StrokeSampler {
   final int _sessionStartedMicros;
   Duration? _firstEventTimestamp;
   final List<StrokeSample> _samples = <StrokeSample>[];
+  // The last spatially accepted sample remains fixed while one lightweight
+  // pending endpoint follows sub-threshold motion. Measuring against the raw
+  // previous event would prevent slow, high-frequency stylus movement from
+  // ever accumulating enough distance to form a real curve.
+  Offset? _lastSamplingPosition;
+  bool _hasPendingEndpoint = false;
 
   late final List<StrokeSample> _readOnlySamples =
       UnmodifiableListView<StrokeSample>(_samples);
   List<StrokeSample> get samples => _readOnlySamples;
   bool get isEmpty => _samples.isEmpty;
 
-  void addEvent(PointerEvent event, Offset worldPosition) {
-    add(
+  bool addEvent(
+    PointerEvent event,
+    Offset worldPosition, {
+    Offset? samplingPosition,
+  }) {
+    return add(
       StrokeSample(
         position: worldPosition,
         timestampMicros: _absoluteTimestamp(event.timeStamp),
@@ -49,6 +59,7 @@ class StrokeSampler {
           event.tilt * math.sin(event.orientation),
         ),
       ),
+      samplingPosition: samplingPosition,
     );
   }
 
@@ -58,9 +69,10 @@ class StrokeSampler {
     return _sessionStartedMicros + math.max(0, delta.inMicroseconds);
   }
 
-  void add(StrokeSample sample) {
-    if (_samples.length >= maxSamples) return;
-    if (!sample.position.dx.isFinite || !sample.position.dy.isFinite) return;
+  bool add(StrokeSample sample, {Offset? samplingPosition}) {
+    if (!sample.position.dx.isFinite || !sample.position.dy.isFinite) {
+      return false;
+    }
     final safeSample = StrokeSample(
       position: sample.position,
       timestampMicros: sample.timestampMicros,
@@ -70,17 +82,49 @@ class StrokeSampler {
         sample.tilt.dy.isFinite ? sample.tilt.dy.clamp(-1, 1) : 0,
       ),
     );
-    final distance = _samples.isEmpty
-        ? null
-        : (_samples.last.position - safeSample.position).distance;
-    if (_samples.isNotEmpty &&
-        distance!.isFinite &&
-        distance < minimumDistance) {
-      // Preserve the freshest pressure and timestamp without growing the path.
+    final requestedSamplingPosition = samplingPosition ?? safeSample.position;
+    final safeSamplingPosition =
+        requestedSamplingPosition.dx.isFinite &&
+            requestedSamplingPosition.dy.isFinite
+        ? requestedSamplingPosition
+        : safeSample.position;
+    if (_samples.length >= maxSamples) {
       _samples[_samples.length - 1] = safeSample;
-      return;
+      return true;
     }
-    _samples.add(safeSample);
+
+    if (_samples.isEmpty) {
+      _samples.add(safeSample);
+      _lastSamplingPosition = safeSamplingPosition;
+      _hasPendingEndpoint = false;
+      return true;
+    }
+
+    final distance =
+        ((_lastSamplingPosition ?? _samples.last.position) -
+                safeSamplingPosition)
+            .distance;
+    if (distance.isFinite && distance < minimumDistance) {
+      // Keep accepted anchors intact. A separate pending endpoint makes the
+      // live nib follow slow movement without resetting the distance origin
+      // on every high-rate hardware event.
+      if (_hasPendingEndpoint) {
+        _samples[_samples.length - 1] = safeSample;
+      } else {
+        _samples.add(safeSample);
+        _hasPendingEndpoint = true;
+      }
+      return true;
+    }
+
+    if (_hasPendingEndpoint) {
+      _samples[_samples.length - 1] = safeSample;
+    } else {
+      _samples.add(safeSample);
+    }
+    _lastSamplingPosition = safeSamplingPosition;
+    _hasPendingEndpoint = false;
+    return true;
   }
 
   List<Offset> smoothedPositions() {

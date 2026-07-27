@@ -44,6 +44,62 @@ void main() {
     await autosave.dispose();
   });
 
+  test(
+    'retries a transient save failure without requiring another edit',
+    () async {
+      final repository = _MemoryRepository()..failuresRemaining = 1;
+      final document = WhiteboardDocument.create(
+        id: 'automatic-retry',
+        now: DateTime.utc(2026),
+      );
+      final autosave = AutosaveController(
+        repository,
+        document.id,
+        debounce: const Duration(milliseconds: 1),
+        retryBaseDelay: const Duration(milliseconds: 5),
+        retryMaximumDelay: const Duration(milliseconds: 20),
+      );
+
+      autosave.schedule(document);
+      final deadline = DateTime.now().add(const Duration(seconds: 1));
+      while (repository.saved.isEmpty && DateTime.now().isBefore(deadline)) {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+
+      expect(repository.saved.single.id, document.id);
+      expect(autosave.hasPendingChanges, isFalse);
+      await autosave.dispose();
+    },
+  );
+
+  test('dispose without flushing cancels a scheduled retry', () async {
+    final repository = _MemoryRepository()..failuresRemaining = 10;
+    final document = WhiteboardDocument.create(
+      id: 'cancel-retry',
+      now: DateTime.utc(2026),
+    );
+    final autosave = AutosaveController(
+      repository,
+      document.id,
+      debounce: const Duration(milliseconds: 1),
+      retryBaseDelay: const Duration(milliseconds: 80),
+      retryMaximumDelay: const Duration(milliseconds: 80),
+    );
+
+    autosave.schedule(document);
+    final deadline = DateTime.now().add(const Duration(seconds: 1));
+    while (repository.saveAttempts == 0 && DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 2));
+    }
+    expect(repository.saveAttempts, 1);
+
+    await autosave.dispose(flushPending: false);
+    await Future<void>.delayed(const Duration(milliseconds: 120));
+
+    expect(repository.saveAttempts, 1);
+    expect(autosave.hasPendingChanges, isFalse);
+  });
+
   test('hard latency saves even while changes keep arriving', () async {
     final repository = _MemoryRepository();
     final base = WhiteboardDocument.create(id: 'doc', now: DateTime.utc(2026));
@@ -70,9 +126,11 @@ void main() {
 final class _MemoryRepository implements DocumentRepository {
   final List<WhiteboardDocument> saved = [];
   int failuresRemaining = 0;
+  int saveAttempts = 0;
 
   @override
   Future<void> save(WhiteboardDocument document) async {
+    saveAttempts++;
     if (failuresRemaining > 0) {
       failuresRemaining--;
       throw StateError('simulierter Schreibfehler');

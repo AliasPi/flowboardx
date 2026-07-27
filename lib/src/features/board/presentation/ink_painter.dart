@@ -49,6 +49,26 @@ class InkPainter extends CustomPainter {
   static void drawStroke(Canvas canvas, InkStroke stroke) =>
       _drawStroke(canvas, stroke);
 
+  static void drawSelectionHalo(
+    Canvas canvas,
+    InkStroke stroke,
+    double worldToScreenScale,
+  ) => _drawSelectionHalo(canvas, stroke, worldToScreenScale);
+
+  /// Draws one bounded live-preview chunk.
+  ///
+  /// Marker chunks use flat caps while the pointer is down. Adjacent cached
+  /// chunks can therefore meet without repeatedly alpha-blending square end
+  /// caps into the dark dots that used to appear on long marker strokes.
+  static void drawLivePreviewStroke(Canvas canvas, InkStroke stroke) =>
+      _drawStroke(
+        canvas,
+        stroke,
+        markerStrokeCap: stroke.type == InkToolType.marker
+            ? StrokeCap.butt
+            : null,
+      );
+
   /// Maps an object-local annotation (`0..1` in both axes) into the object's
   /// paint space without applying a non-uniform canvas scale to the pen tip.
   ///
@@ -87,7 +107,11 @@ class InkPainter extends CustomPainter {
     Size objectSize,
   ) => _drawStroke(canvas, objectLocalStrokeToCanvas(stroke, objectSize));
 
-  static void _drawStroke(Canvas canvas, InkStroke stroke) {
+  static void _drawStroke(
+    Canvas canvas,
+    InkStroke stroke, {
+    StrokeCap? markerStrokeCap,
+  }) {
     final points = _renderablePoints(stroke.points);
     if (points.isEmpty) return;
     final width = _safeWidth(stroke.width);
@@ -98,7 +122,9 @@ class InkPainter extends CustomPainter {
       ..color = isMarker
           ? color.withValues(alpha: color.a < .999 ? color.a : .36)
           : color
-      ..strokeCap = isMarker ? StrokeCap.square : StrokeCap.round
+      ..strokeCap = isMarker
+          ? markerStrokeCap ?? StrokeCap.square
+          : StrokeCap.round
       ..strokeJoin = StrokeJoin.round
       ..style = PaintingStyle.stroke
       ..blendMode = isMarker ? BlendMode.multiply : BlendMode.srcOver;
@@ -148,20 +174,35 @@ class InkPainter extends CustomPainter {
       return;
     }
 
-    // Segment painting preserves pressure without creating a costly mesh. The
-    // midpoint curve removes visible corners while staying deterministic.
+    // Quantized pressure paths keep pressure feedback while bounding the
+    // number of draw calls. A long circular stroke used to issue one drawLine
+    // per point pair on every preview frame. Grouping segments by pressure
+    // reduces that to at most [_pressureBucketCount] drawPath calls.
+    final paths = List<Path?>.filled(_pressureBucketCount, null);
     for (var i = 1; i < points.length; i++) {
       final previous = points[i - 1];
       final current = points[i];
-      paint.strokeWidth =
-          width *
-          (_pressure(previous.pressure) + _pressure(current.pressure)) /
-          2;
-      canvas.drawLine(
-        Offset(previous.x, previous.y),
-        Offset(current.x, current.y),
-        paint,
-      );
+      final pressure =
+          (_pressure(previous.pressure) + _pressure(current.pressure)) / 2;
+      final bucket =
+          ((pressure - _minimumPressure) /
+                  (1 - _minimumPressure) *
+                  (_pressureBucketCount - 1))
+              .round()
+              .clamp(0, _pressureBucketCount - 1);
+      final path = paths[bucket] ??= Path();
+      path
+        ..moveTo(previous.x, previous.y)
+        ..lineTo(current.x, current.y);
+    }
+    for (var bucket = 0; bucket < paths.length; bucket++) {
+      final path = paths[bucket];
+      if (path == null) continue;
+      final pressure =
+          _minimumPressure +
+          (1 - _minimumPressure) * bucket / (_pressureBucketCount - 1);
+      paint.strokeWidth = width * pressure;
+      canvas.drawPath(path, paint);
     }
   }
 
@@ -256,8 +297,12 @@ class InkPainter extends CustomPainter {
     return width.clamp(.0001, 512.0);
   }
 
+  static const int _pressureBucketCount = 12;
+  static const double _minimumPressure = .52;
+
   static double _pressure(double pressure) =>
-      .52 + (pressure.isFinite ? pressure.clamp(0, 1) : 1) * .48;
+      _minimumPressure +
+      (pressure.isFinite ? pressure.clamp(0, 1) : 1) * (1 - _minimumPressure);
 
   @override
   bool shouldRepaint(covariant InkPainter oldDelegate) {

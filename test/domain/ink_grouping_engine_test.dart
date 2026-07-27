@@ -107,4 +107,57 @@ void main() {
     index.synchronize(const []);
     expect(index.length, 0);
   });
+
+  test('consecutive stroke appends retain the indexed snapshot', () {
+    final engine = InkGroupingEngine();
+    var page = BoardPage(id: 'append-page', name: 'Page');
+    engine.regroupAll(page);
+
+    for (var index = 0; index < 12; index++) {
+      final stroke = verticalStroke(
+        'append-$index',
+        index * 18,
+        time: index * 2000,
+      );
+      final before = page;
+      final withStroke = page.copyWith(
+        strokes: <InkStroke>[...page.strokes, stroke],
+      );
+      final result = engine.regroupIncrementally(
+        page: withStroke,
+        changedStrokeIds: <String>[stroke.id],
+        dirtyRegion: stroke.bounds,
+        pageBeforeAppend: before,
+        appendedStroke: stroke,
+      );
+      page = withStroke.copyWith(groups: result.groups);
+      expect(page.strokes, same(withStroke.strokes));
+    }
+
+    final complete = InkGroupingEngine().regroupAll(page);
+    expect(
+      page.groups.map((group) => group.id).toSet(),
+      complete.groups.map((group) => group.id).toSet(),
+    );
+  });
+
+  test('spatial indexes retain only recently visited pages', () {
+    final engine = InkGroupingEngine(
+      config: const InkGroupingConfig(maxCachedPages: 3),
+    );
+
+    for (var index = 0; index < 20; index++) {
+      engine.regroupAll(
+        BoardPage(
+          id: 'page-$index',
+          name: 'Page $index',
+          strokes: <InkStroke>[
+            verticalStroke('stroke-$index', index.toDouble()),
+          ],
+        ),
+      );
+    }
+
+    expect(engine.cachedPageCount, 3);
+  });
 }

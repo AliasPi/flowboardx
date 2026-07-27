@@ -60,13 +60,14 @@ class BoardViewport extends ChangeNotifier {
     Rect? visibleScreenBounds,
     BoardViewportHorizontalConstraint? horizontalConstraint,
   }) {
+    final previousOffset = _offset;
     _offset += delta;
     _clamp(
       viewportSize,
       visibleScreenBounds: visibleScreenBounds,
       horizontalConstraint: horizontalConstraint,
     );
-    notifyListeners();
+    if (_offset != previousOffset) notifyListeners();
   }
 
   void zoomAt({
@@ -77,6 +78,8 @@ class BoardViewport extends ChangeNotifier {
     BoardViewportHorizontalConstraint? horizontalConstraint,
   }) {
     if (!factor.isFinite || factor <= 0) return;
+    final previousScale = _scale;
+    final previousOffset = _offset;
     final worldFocal = screenToWorld(focalPoint);
     _scale = (_scale * factor).clamp(minScale, maxScale);
     _offset = focalPoint - worldFocal * _scale;
@@ -85,7 +88,63 @@ class BoardViewport extends ChangeNotifier {
       visibleScreenBounds: visibleScreenBounds,
       horizontalConstraint: horizontalConstraint,
     );
-    notifyListeners();
+    if (_scale != previousScale || _offset != previousOffset) {
+      notifyListeners();
+    }
+  }
+
+  /// Applies one two-pointer camera sample as a single atomic state change.
+  ///
+  /// The operation deliberately retains the established gesture order:
+  ///
+  /// 1. move the previous centroid to the new centroid and clamp;
+  /// 2. zoom around the new centroid and clamp again.
+  ///
+  /// This is geometrically identical to calling [panBy] followed by [zoomAt],
+  /// but listeners observe only the final camera. A hardware move event can
+  /// therefore invalidate the board at most once.
+  void applyGestureTransform({
+    required Offset panDelta,
+    required Offset focalPoint,
+    required Size viewportSize,
+    double? zoomFactor,
+    Rect? visibleScreenBounds,
+    BoardViewportHorizontalConstraint? horizontalConstraint,
+  }) {
+    final previousScale = _scale;
+    final previousOffset = _offset;
+
+    if (panDelta.dx.isFinite && panDelta.dy.isFinite) {
+      _offset += panDelta;
+    }
+    _clamp(
+      viewportSize,
+      visibleScreenBounds: visibleScreenBounds,
+      horizontalConstraint: horizontalConstraint,
+    );
+
+    final factor = zoomFactor;
+    if (factor != null &&
+        factor.isFinite &&
+        factor > 0 &&
+        focalPoint.dx.isFinite &&
+        focalPoint.dy.isFinite) {
+      final worldFocal = screenToWorld(focalPoint);
+      final nextScale = (_scale * factor).clamp(minScale, maxScale);
+      if (nextScale != _scale) {
+        _scale = nextScale;
+        _offset = focalPoint - worldFocal * _scale;
+      }
+      _clamp(
+        viewportSize,
+        visibleScreenBounds: visibleScreenBounds,
+        horizontalConstraint: horizontalConstraint,
+      );
+    }
+
+    if (_scale != previousScale || _offset != previousOffset) {
+      notifyListeners();
+    }
   }
 
   void centerOn(

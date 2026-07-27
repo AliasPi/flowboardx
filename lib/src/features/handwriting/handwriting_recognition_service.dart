@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
@@ -17,27 +19,53 @@ final class HandwritingRecognitionRequest {
   bool get hasSerializableInk =>
       strokes.any((stroke) => stroke.points.any(_isSerializablePoint));
 
+  bool get exceedsPlatformStrokeLimit =>
+      strokes
+          .where((stroke) => stroke.points.any(_isSerializablePoint))
+          .take(maximumChannelStrokeCount + 1)
+          .length >
+      maximumChannelStrokeCount;
+
   /// Serializes a bounded, turn-preserving representation for the platform
   /// channel. Dense SMART Board packets can otherwise allocate hundreds of
   /// thousands of nested maps on the UI isolate before Android gets a chance
   /// to apply its own defensive limit.
   Map<String, Object?> toMap() {
-    final nonEmptyStrokeCount = strokes
-        .where((stroke) => stroke.points.any(_isSerializablePoint))
-        .length;
-    final perStrokeBudget = nonEmptyStrokeCount == 0
-        ? 1
-        : (maximumChannelPointCount ~/ nonEmptyStrokeCount).clamp(
-            2,
-            maximumChannelPointsPerStroke,
-          );
+    final validPointCounts = <int>[
+      for (final stroke in strokes)
+        stroke.points.where(_isSerializablePoint).length,
+    ];
+    final desiredPointCounts = <int>[
+      for (final count in validPointCounts)
+        count.clamp(0, maximumChannelPointsPerStroke),
+    ];
+    final desiredSuffix = List<int>.filled(desiredPointCounts.length + 1, 0);
+    final nonEmptySuffix = List<int>.filled(desiredPointCounts.length + 1, 0);
+    for (var index = desiredPointCounts.length - 1; index >= 0; index--) {
+      desiredSuffix[index] =
+          desiredSuffix[index + 1] + desiredPointCounts[index];
+      nonEmptySuffix[index] =
+          nonEmptySuffix[index + 1] + (desiredPointCounts[index] > 0 ? 1 : 0);
+    }
     var remaining = maximumChannelPointCount;
     final serializedStrokes = <Map<String, Object?>>[];
-    for (final stroke in strokes) {
+    for (var strokeIndex = 0; strokeIndex < strokes.length; strokeIndex++) {
       if (remaining <= 0) break;
+      final stroke = strokes[strokeIndex];
+      final validPointCount = validPointCounts[strokeIndex];
+      final desired = desiredPointCounts[strokeIndex];
+      if (desired == 0) continue;
+      final remainingDesired = desiredSuffix[strokeIndex];
+      final remainingNonEmpty = nonEmptySuffix[strokeIndex + 1];
+      final proportionalBudget = remainingDesired <= remaining
+          ? desired
+          : (remaining * desired ~/ remainingDesired)
+                .clamp(1, math.max(1, remaining - remainingNonEmpty))
+                .toInt();
       final points = _boundedPoints(
         stroke.points,
-        perStrokeBudget.clamp(1, remaining),
+        math.min(desired, proportionalBudget),
+        validPointCount: validPointCount,
       );
       if (points.isEmpty) continue;
       remaining -= points.length;
@@ -65,8 +93,17 @@ final class HandwritingRecognitionRequest {
   @visibleForTesting
   static const int maximumChannelPointsPerStroke = 12000;
 
-  static List<InkPoint> _boundedPoints(List<InkPoint> source, int maximum) {
-    final valid = source.where(_isSerializablePoint).toList(growable: false);
+  @visibleForTesting
+  static const int maximumChannelStrokeCount = 4096;
+
+  static List<InkPoint> _boundedPoints(
+    List<InkPoint> source,
+    int maximum, {
+    required int validPointCount,
+  }) {
+    final valid = validPointCount == source.length
+        ? source
+        : source.where(_isSerializablePoint).toList(growable: false);
     if (valid.length <= maximum) return valid;
     if (maximum <= 1) return <InkPoint>[valid.first];
     if (maximum == 2) return <InkPoint>[valid.first, valid.last];
@@ -87,7 +124,12 @@ final class HandwritingRecognitionRequest {
               .clamp(1, interiorCount)
               .toInt();
       var selectedIndex = start;
-      var selectedTurn = -1.0;
+      var selectedImportance = -1.0;
+      final chordStart = valid[start - 1];
+      final chordEnd = valid[math.min(valid.length - 1, endExclusive)];
+      final chordX = chordEnd.x - chordStart.x;
+      final chordY = chordEnd.y - chordStart.y;
+      final chordLength = math.sqrt(chordX * chordX + chordY * chordY);
       for (var index = start; index < endExclusive; index++) {
         final previous = valid[index - 1];
         final current = valid[index];
@@ -96,9 +138,30 @@ final class HandwritingRecognitionRequest {
         final firstY = current.y - previous.y;
         final secondX = next.x - current.x;
         final secondY = next.y - current.y;
-        final turn = (firstX * secondY - firstY * secondX).abs();
-        if (turn > selectedTurn) {
-          selectedTurn = turn;
+        final firstLength = math.sqrt(firstX * firstX + firstY * firstY);
+        final secondLength = math.sqrt(secondX * secondX + secondY * secondY);
+        final normalizedTurn = firstLength <= 1e-9 || secondLength <= 1e-9
+            ? 0.0
+            : (firstX * secondY - firstY * secondX).abs() /
+                  (firstLength * secondLength);
+        final chordDistance = chordLength <= 1e-9
+            ? math.sqrt(
+                math.pow(current.x - chordStart.x, 2) +
+                    math.pow(current.y - chordStart.y, 2),
+              )
+            : ((current.x - chordStart.x) * chordY -
+                          (current.y - chordStart.y) * chordX)
+                      .abs() /
+                  chordLength;
+        // Normalize both terms. The previous raw cross product strongly
+        // preferred long Smartboard packets and could discard a tight loop or
+        // corner made from short, densely sampled segments.
+        final importance =
+            normalizedTurn +
+            chordDistance / math.max(1.0, chordLength) +
+            (index == start || index == endExclusive - 1 ? 1e-6 : 0);
+        if (importance > selectedImportance) {
+          selectedImportance = importance;
           selectedIndex = index;
         }
       }
@@ -124,6 +187,10 @@ final class HandwritingRecognitionResult {
     this.engine,
     this.modelDelivery,
     this.attemptCount,
+    this.lineCountHint,
+    this.wordCountHint,
+    this.durationMillis,
+    this.timedOut = false,
   }) : status = HandwritingRecognitionStatus.recognized,
        message = null;
 
@@ -132,6 +199,10 @@ final class HandwritingRecognitionResult {
     this.engine,
     this.modelDelivery,
     this.attemptCount,
+    this.lineCountHint,
+    this.wordCountHint,
+    this.durationMillis,
+    this.timedOut = false,
   }) : text = '',
        confidence = null,
        status = HandwritingRecognitionStatus.notRecognized;
@@ -148,6 +219,10 @@ final class HandwritingRecognitionResult {
   /// path is included in this metadata.
   final String? modelDelivery;
   final int? attemptCount;
+  final int? lineCountHint;
+  final int? wordCountHint;
+  final int? durationMillis;
+  final bool timedOut;
 
   bool get isRecognized =>
       status == HandwritingRecognitionStatus.recognized && text.isNotEmpty;
@@ -231,6 +306,15 @@ final class PlatformHandwritingRecognitionService
       _recordNotRecognized(result);
       return result;
     }
+    if (request.exceedsPlatformStrokeLimit) {
+      const result = HandwritingRecognitionResult.notRecognized(
+        message:
+            'Die Auswahl enthält zu viele einzelne Striche. '
+            'Bitte ein Wort, eine Zeile oder einen kleineren Bereich markieren.',
+      );
+      _recordNotRecognized(result);
+      return result;
+    }
     Map<Object?, Object?>? response;
     try {
       // The native side also ensures the exact request model. Recognition is
@@ -273,6 +357,21 @@ final class PlatformHandwritingRecognitionService
       );
       _recordFailure(unavailable, stackTrace);
       throw unavailable;
+    } on FormatException catch (error, stackTrace) {
+      final failure = HandwritingRecognitionFailure(
+        HandwritingRecognitionFailureKind.invalidResponse,
+        'Die lokale Erkennung hat unlesbare Antwortdaten geliefert: '
+        '${error.message}',
+      );
+      _recordFailure(failure, stackTrace);
+      throw failure;
+    } on TypeError catch (error, stackTrace) {
+      const failure = HandwritingRecognitionFailure(
+        HandwritingRecognitionFailureKind.invalidResponse,
+        'Die lokale Erkennung hat unerwartete Antwortdaten geliefert.',
+      );
+      _recordFailure(error, stackTrace);
+      throw failure;
     }
     if (response == null) {
       const failure = HandwritingRecognitionFailure(
@@ -293,9 +392,30 @@ final class PlatformHandwritingRecognitionService
     final attemptCount = rawAttempts is num && rawAttempts.isFinite
         ? rawAttempts.toInt().clamp(0, 100).toInt()
         : null;
+    final lineCountHint = _boundedDiagnosticInteger(
+      response['lineCountHint'],
+      maximum: 100,
+    );
+    final wordCountHint = _boundedDiagnosticInteger(
+      response['wordCountHint'],
+      maximum: 1000,
+    );
+    final durationMillis = _boundedDiagnosticInteger(
+      response['durationMillis'],
+      maximum: 120000,
+    );
+    final timedOut = response['timedOut'] == true;
     final text = response['text'] is String
         ? (response['text']! as String).trim()
         : '';
+    if (status == 'recognized' && text.isEmpty) {
+      const failure = HandwritingRecognitionFailure(
+        HandwritingRecognitionFailureKind.invalidResponse,
+        'Die lokale Erkennung hat einen Treffer ohne Text geliefert.',
+      );
+      _recordFailure(failure, StackTrace.current);
+      throw failure;
+    }
     if (status == 'notRecognized' || (status == null && text.isEmpty)) {
       final result = HandwritingRecognitionResult.notRecognized(
         message:
@@ -304,6 +424,10 @@ final class PlatformHandwritingRecognitionService
         engine: engine,
         modelDelivery: modelDelivery,
         attemptCount: attemptCount,
+        lineCountHint: lineCountHint,
+        wordCountHint: wordCountHint,
+        durationMillis: durationMillis,
+        timedOut: timedOut,
       );
       _recordNotRecognized(result);
       return result;
@@ -316,22 +440,53 @@ final class PlatformHandwritingRecognitionService
       _recordFailure(failure, StackTrace.current);
       throw failure;
     }
-    if (text.isEmpty) {
-      const result = HandwritingRecognitionResult.notRecognized(
-        message: 'Die Handschrift wurde nicht sicher erkannt.',
-      );
-      _recordNotRecognized(result);
-      return result;
-    }
     final confidence = response['confidence'];
-    return HandwritingRecognitionResult(
+    final result = HandwritingRecognitionResult(
       text: text,
       engine: engine,
       modelDelivery: modelDelivery,
       attemptCount: attemptCount,
+      lineCountHint: lineCountHint,
+      wordCountHint: wordCountHint,
+      durationMillis: durationMillis,
+      timedOut: timedOut,
       confidence: confidence is num && confidence.toDouble().isFinite
           ? confidence.toDouble().clamp(0.0, 1.0).toDouble()
           : null,
+    );
+    _recordRecognized(
+      result,
+      inputStrokeCount: request.strokes.length,
+      inputPointCount: request.strokes.fold<int>(
+        0,
+        (total, stroke) => total + stroke.points.length,
+      ),
+    );
+    return result;
+  }
+
+  static void _recordRecognized(
+    HandwritingRecognitionResult result, {
+    required int inputStrokeCount,
+    required int inputPointCount,
+  }) {
+    DiagnosticLogService.instance.info(
+      'recognition.recognized',
+      fields: <String, Object?>{
+        'platform': defaultTargetPlatform.name,
+        'engine': result.engine ?? 'unknown',
+        'model_delivery': result.modelDelivery ?? 'unknown',
+        'input_stroke_count': inputStrokeCount,
+        'input_point_count': inputPointCount,
+        if (result.confidence != null) 'confidence': result.confidence,
+        if (result.attemptCount != null) 'attempt_count': result.attemptCount,
+        if (result.lineCountHint != null)
+          'line_count_hint': result.lineCountHint,
+        if (result.wordCountHint != null)
+          'word_count_hint': result.wordCountHint,
+        if (result.durationMillis != null) 'duration_ms': result.durationMillis,
+        'timed_out': result.timedOut,
+      },
     );
   }
 
@@ -343,8 +498,19 @@ final class PlatformHandwritingRecognitionService
         'engine': result.engine ?? 'unknown',
         'model_delivery': result.modelDelivery ?? 'unknown',
         if (result.attemptCount != null) 'attempt_count': result.attemptCount,
+        if (result.lineCountHint != null)
+          'line_count_hint': result.lineCountHint,
+        if (result.wordCountHint != null)
+          'word_count_hint': result.wordCountHint,
+        if (result.durationMillis != null) 'duration_ms': result.durationMillis,
+        'timed_out': result.timedOut,
       },
     );
+  }
+
+  static int? _boundedDiagnosticInteger(Object? value, {required int maximum}) {
+    if (value is! num || !value.isFinite) return null;
+    return value.toInt().clamp(0, maximum).toInt();
   }
 
   static void _recordFailure(Object error, StackTrace stackTrace) {

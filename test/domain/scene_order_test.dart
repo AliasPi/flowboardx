@@ -63,6 +63,69 @@ void main() {
     expect(arranged.map((item) => item.zIndex), <int>[0, 1, 2]);
   });
 
+  test('a z-index-only stroke copy reuses its immutable point buffer', () {
+    final original = stroke('long-ink', 8);
+    final originalBounds = original.bounds;
+    final changed = original.copyWith(zIndex: 9);
+
+    expect(identical(changed.points, original.points), isTrue);
+    expect(changed.bounds, same(originalBounds));
+  });
+
+  test('a no-op layer arrangement preserves items and sparse z-indices', () {
+    final back = stroke('back', 40);
+    final front = object('front', 90);
+
+    final arranged = arrangeBoardSceneItems(
+      objects: <BoardObject>[front],
+      strokes: <InkStroke>[back],
+      selectedIds: const <String>{'front'},
+      arrangement: SceneArrangement.toFront,
+    );
+
+    expect(arranged.map((item) => item.zIndex), <int>[40, 90]);
+    expect(identical(arranged.first.stroke, back), isTrue);
+    expect(identical(arranged.last.object, front), isTrue);
+  });
+
+  test('document metadata copies reuse unchanged immutable collections', () {
+    final original = WhiteboardDocument.create(
+      id: 'copy-identity',
+      now: DateTime.utc(2026, 7, 27),
+    );
+
+    final changed = original.copyWith(title: 'Neuer Titel');
+
+    expect(identical(changed.pages, original.pages), isTrue);
+    expect(identical(changed.presets, original.presets), isTrue);
+    expect(identical(changed.assets, original.assets), isTrue);
+  });
+
+  test('sanitizing a valid page preserves its complete object graph', () {
+    final validStroke = stroke('valid', 4);
+    final page = BoardPage(
+      id: 'valid-page',
+      name: 'Valid',
+      strokes: <InkStroke>[validStroke],
+      groups: <InkGroup>[
+        InkGroup(
+          id: 'valid-group',
+          kind: InkGroupKind.word,
+          strokeIds: const <String>['valid'],
+          bounds: validStroke.bounds,
+        ),
+      ],
+      selection: SelectionState(selectedItemIds: const <String>['valid']),
+    );
+
+    final sanitized = page.sanitized();
+
+    expect(sanitized, same(page));
+    expect(sanitized.strokes, same(page.strokes));
+    expect(sanitized.groups, same(page.groups));
+    expect(sanitized.selection, same(page.selection));
+  });
+
   test('ink z-index serializes and missing legacy value defaults to zero', () {
     final encoded = stroke('ink', 27).toJson();
     expect(InkStroke.fromJson(encoded).zIndex, 27);

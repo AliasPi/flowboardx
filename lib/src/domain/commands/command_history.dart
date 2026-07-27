@@ -219,7 +219,7 @@ WhiteboardDocument _applyTransition({
     from: from.presets,
     to: to.presets,
     idOf: (preset) => preset.id,
-    same: (left, right) => _sameJson(left.toJson(), right.toJson()),
+    same: (left, right) => _sameEncoded(left, right, (value) => value.toJson()),
     mergeModified: _mergePreset,
   );
   final mergedAssets = _mergeItems<DocumentAsset>(
@@ -227,7 +227,7 @@ WhiteboardDocument _applyTransition({
     from: from.assets,
     to: to.assets,
     idOf: (asset) => asset.id,
-    same: (left, right) => _sameJson(left.toJson(), right.toJson()),
+    same: (left, right) => _sameEncoded(left, right, (value) => value.toJson()),
     mergeModified: _mergeAsset,
   );
   final thumbnailChanged = from.thumbnailAssetId != to.thumbnailAssetId;
@@ -281,7 +281,8 @@ BoardPage _mergePage(BoardPage current, BoardPage from, BoardPage to) {
           from: from.strokes,
           to: to.strokes,
           idOf: (stroke) => stroke.id,
-          same: (left, right) => _sameJson(left.toJson(), right.toJson()),
+          same: (left, right) =>
+              _sameEncoded(left, right, (value) => value.toJson()),
           mergeModified: _mergeStroke,
           canRemove: (stroke, _) => !protectedItemIds.contains(stroke.id),
         ),
@@ -290,7 +291,8 @@ BoardPage _mergePage(BoardPage current, BoardPage from, BoardPage to) {
           from: from.objects,
           to: to.objects,
           idOf: (object) => object.id,
-          same: (left, right) => _sameJson(left.toJson(), right.toJson()),
+          same: (left, right) =>
+              _sameEncoded(left, right, (value) => value.toJson()),
           mergeModified: _mergeBoardObject,
           canRemove: (object, _) => !protectedItemIds.contains(object.id),
         ),
@@ -299,7 +301,8 @@ BoardPage _mergePage(BoardPage current, BoardPage from, BoardPage to) {
           from: from.annotationLayers,
           to: to.annotationLayers,
           idOf: (layer) => layer.id,
-          same: (left, right) => _sameJson(left.toJson(), right.toJson()),
+          same: (left, right) =>
+              _sameEncoded(left, right, (value) => value.toJson()),
           mergeModified: _mergeAnnotationLayer,
         ),
         groups: _mergeItems<InkGroup>(
@@ -307,7 +310,8 @@ BoardPage _mergePage(BoardPage current, BoardPage from, BoardPage to) {
           from: from.groups,
           to: to.groups,
           idOf: (group) => group.id,
-          same: (left, right) => _sameJson(left.toJson(), right.toJson()),
+          same: (left, right) =>
+              _sameEncoded(left, right, (value) => value.toJson()),
           mergeModified: _mergeInkGroup,
         ),
         contentGroups: _mergeItems<ContentGroup>(
@@ -315,10 +319,16 @@ BoardPage _mergePage(BoardPage current, BoardPage from, BoardPage to) {
           from: from.contentGroups,
           to: to.contentGroups,
           idOf: (group) => group.id,
-          same: (left, right) => _sameJson(left.toJson(), right.toJson()),
+          same: (left, right) =>
+              _sameEncoded(left, right, (value) => value.toJson()),
           mergeModified: _mergeContentGroup,
         ),
-        selection: !_sameJson(from.selection.toJson(), to.selection.toJson())
+        selection:
+            !_sameEncoded(
+              from.selection,
+              to.selection,
+              (value) => value.toJson(),
+            )
             ? _mergeSelection(current.selection, from.selection, to.selection)
             : current.selection,
         template:
@@ -369,7 +379,7 @@ ObjectInkLayer _mergeAnnotationLayer(
     from: from.strokes,
     to: to.strokes,
     idOf: (stroke) => stroke.id,
-    same: (left, right) => _sameJson(left.toJson(), right.toJson()),
+    same: (left, right) => _sameEncoded(left, right, (value) => value.toJson()),
     mergeModified: _mergeStroke,
   ),
 );
@@ -419,7 +429,8 @@ Set<String> _foreignPersistentReferences(BoardPage current, BoardPage from) {
   };
   for (final layer in current.annotationLayers) {
     final source = sourceLayers[layer.id];
-    if (source == null || !_sameJson(source.toJson(), layer.toJson())) {
+    if (source == null ||
+        !_sameEncoded(source, layer, (value) => value.toJson())) {
       protected.add(layer.objectId);
     }
   }
@@ -428,7 +439,8 @@ Set<String> _foreignPersistentReferences(BoardPage current, BoardPage from) {
   };
   for (final group in current.contentGroups) {
     final source = sourceGroups[group.id];
-    if (source == null || !_sameJson(source.toJson(), group.toJson())) {
+    if (source == null ||
+        !_sameEncoded(source, group, (value) => value.toJson())) {
       protected.addAll(group.memberIds);
     }
   }
@@ -462,7 +474,7 @@ List<DocumentAsset> _retainReferencedAssets({
 }
 
 InkStroke _mergeStroke(InkStroke current, InkStroke from, InkStroke to) {
-  if (_sameJson(current.toJson(), from.toJson())) return to;
+  if (_sameEncoded(current, from, (value) => value.toJson())) return to;
   return InkStroke.fromJson(
     _mergeJsonObject(current.toJson(), from.toJson(), to.toJson()),
   );
@@ -473,14 +485,14 @@ BoardObject _mergeBoardObject(
   BoardObject from,
   BoardObject to,
 ) {
-  if (_sameJson(current.toJson(), from.toJson())) return to;
+  if (_sameEncoded(current, from, (value) => value.toJson())) return to;
   return BoardObject.fromJson(
     _mergeJsonObject(current.toJson(), from.toJson(), to.toJson()),
   );
 }
 
 InkGroup _mergeInkGroup(InkGroup current, InkGroup from, InkGroup to) {
-  if (_sameJson(current.toJson(), from.toJson())) return to;
+  if (_sameEncoded(current, from, (value) => value.toJson())) return to;
   return InkGroup.fromJson(
     _mergeJsonObject(current.toJson(), from.toJson(), to.toJson()),
   );
@@ -491,14 +503,14 @@ ContentGroup _mergeContentGroup(
   ContentGroup from,
   ContentGroup to,
 ) {
-  if (_sameJson(current.toJson(), from.toJson())) return to;
+  if (_sameEncoded(current, from, (value) => value.toJson())) return to;
   return ContentGroup.fromJson(
     _mergeJsonObject(current.toJson(), from.toJson(), to.toJson()),
   );
 }
 
 PenPreset _mergePreset(PenPreset current, PenPreset from, PenPreset to) {
-  if (_sameJson(current.toJson(), from.toJson())) return to;
+  if (_sameEncoded(current, from, (value) => value.toJson())) return to;
   return PenPreset.fromJson(
     _mergeJsonObject(current.toJson(), from.toJson(), to.toJson()),
   );
@@ -509,7 +521,7 @@ DocumentAsset _mergeAsset(
   DocumentAsset from,
   DocumentAsset to,
 ) {
-  if (_sameJson(current.toJson(), from.toJson())) return to;
+  if (_sameEncoded(current, from, (value) => value.toJson())) return to;
   return DocumentAsset.fromJson(
     _mergeJsonObject(current.toJson(), from.toJson(), to.toJson()),
   );
@@ -520,7 +532,7 @@ SelectionState _mergeSelection(
   SelectionState from,
   SelectionState to,
 ) {
-  if (_sameJson(current.toJson(), from.toJson())) return to;
+  if (_sameEncoded(current, from, (value) => value.toJson())) return to;
   return SelectionState.fromJson(
     _mergeJsonObject(current.toJson(), from.toJson(), to.toJson()),
   );
@@ -644,30 +656,32 @@ List<T> _mergeItems<T>({
 }) {
   final fromById = <String, T>{for (final item in from) idOf(item): item};
   final toById = <String, T>{for (final item in to) idOf(item): item};
-  final result = current.toList();
-  final ids = <String>{...fromById.keys, ...toById.keys};
+  final currentById = <String, T>{for (final item in current) idOf(item): item};
+  final resolvedById = <String, T>{};
+  final removedIds = <String>{};
+  final additions = <String, T>{};
+  final ids = <String>{...currentById.keys, ...fromById.keys, ...toById.keys};
   for (final id in ids) {
     final source = fromById[id];
     final target = toById[id];
+    final currentItem = currentById[id];
     if (source != null && target != null && same(source, target)) continue;
-    final currentIndex = result.indexWhere((item) => idOf(item) == id);
     if (target == null) {
-      if (currentIndex >= 0 &&
+      if (currentItem != null &&
           source != null &&
-          same(result[currentIndex], source) &&
-          (canRemove == null || canRemove(result[currentIndex], source))) {
-        result.removeAt(currentIndex);
+          same(currentItem, source) &&
+          (canRemove == null || canRemove(currentItem, source))) {
+        removedIds.add(id);
       }
       continue;
     }
-    if (currentIndex >= 0) {
+    if (currentItem != null) {
       if (source == null) {
         // An unrelated action has already claimed this supposedly new id.
         // Never overwrite it while replaying a participant redo.
         continue;
       }
-      final currentItem = result[currentIndex];
-      result[currentIndex] = mergeModified != null
+      resolvedById[id] = mergeModified != null
           ? mergeModified(currentItem, source, target)
           : same(currentItem, source)
           ? target
@@ -679,41 +693,66 @@ List<T> _mergeItems<T>({
       // action. Selective undo must not resurrect it.
       continue;
     }
-    result.insert(
-      _targetInsertionIndex(
-        targetId: id,
-        targetOrder: to,
-        current: result,
-        idOf: idOf,
-      ),
-      target,
-    );
+    additions[id] = target;
+  }
+
+  final base = <T>[
+    for (final item in current)
+      if (!removedIds.contains(idOf(item))) resolvedById[idOf(item)] ?? item,
+  ];
+  if (additions.isEmpty) return List<T>.unmodifiable(base);
+
+  final baseIds = base.map(idOf).toSet();
+  final beforeAnchor = <String, List<T>>{};
+  final afterAnchor = <String, List<T>>{};
+  final unanchored = <T>[];
+  var unanchoredInsertionIndex = 0;
+  final pending = <T>[];
+  String? previousAnchor;
+  for (final targetItem in to) {
+    final id = idOf(targetItem);
+    final addition = additions[id];
+    if (addition != null) {
+      pending.add(addition);
+      continue;
+    }
+    if (!baseIds.contains(id)) continue;
+    if (pending.isNotEmpty) {
+      beforeAnchor.putIfAbsent(id, () => <T>[]).addAll(pending);
+      pending.clear();
+    }
+    previousAnchor = id;
+  }
+  if (pending.isNotEmpty) {
+    if (previousAnchor == null) {
+      unanchored.addAll(pending);
+      final firstId = idOf(pending.first);
+      final targetIndex = to.indexWhere((item) => idOf(item) == firstId);
+      unanchoredInsertionIndex = targetIndex.clamp(0, base.length);
+    } else {
+      afterAnchor.putIfAbsent(previousAnchor, () => <T>[]).addAll(pending);
+    }
+  }
+
+  final result = <T>[];
+  for (final item in base) {
+    final id = idOf(item);
+    result
+      ..addAll(beforeAnchor[id] ?? const [])
+      ..add(item)
+      ..addAll(afterAnchor[id] ?? const []);
+  }
+  if (unanchored.isNotEmpty) {
+    result.insertAll(unanchoredInsertionIndex, unanchored);
   }
   return List<T>.unmodifiable(result);
 }
 
-int _targetInsertionIndex<T>({
-  required String targetId,
-  required List<T> targetOrder,
-  required List<T> current,
-  required String Function(T item) idOf,
-}) {
-  final targetIndex = targetOrder.indexWhere((item) => idOf(item) == targetId);
-  for (var index = targetIndex + 1; index < targetOrder.length; index++) {
-    final nextId = idOf(targetOrder[index]);
-    final currentIndex = current.indexWhere((item) => idOf(item) == nextId);
-    if (currentIndex >= 0) return currentIndex;
-  }
-  for (var index = targetIndex - 1; index >= 0; index--) {
-    final previousId = idOf(targetOrder[index]);
-    final currentIndex = current.indexWhere((item) => idOf(item) == previousId);
-    if (currentIndex >= 0) return currentIndex + 1;
-  }
-  return targetIndex.clamp(0, current.length);
-}
-
 bool _samePage(BoardPage left, BoardPage right) =>
-    identical(left, right) || _sameJson(left.toJson(), right.toJson());
+    _sameEncoded(left, right, (value) => value.toJson());
+
+bool _sameEncoded<T>(T left, T right, Object? Function(T value) encode) =>
+    identical(left, right) || _sameJson(encode(left), encode(right));
 
 bool _sameNullableJson(
   Map<String, Object?>? left,

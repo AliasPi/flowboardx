@@ -86,6 +86,8 @@ final class AddStrokeAndRegroupCommand implements DocumentCommand {
       page: withStroke,
       changedStrokeIds: [topmost.id],
       dirtyRegion: topmost.bounds,
+      pageBeforeAppend: page,
+      appendedStroke: topmost,
     );
     return document.replacePage(withStroke.copyWith(groups: groups.groups));
   }

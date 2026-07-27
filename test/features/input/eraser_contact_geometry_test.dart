@@ -68,6 +68,35 @@ void main() {
       expect(stamps.single.radius, 28);
     });
 
+    test('cursor radius contains the exact footprint used for erasing', () {
+      const center = Offset(240, 180);
+      final stamps = EraserContactGeometry.touchScreenFootprint(
+        center: center,
+        radiusMajor: 36,
+        radiusMinor: 14,
+        orientation: 0,
+        fallbackRadius: 30,
+      );
+      final cursorRadius = EraserContactGeometry.enclosingScreenRadius(
+        center: center,
+        footprint: stamps,
+      );
+
+      final furthestErasedPoint = stamps
+          .map((stamp) => (stamp.center - center).distance + stamp.radius)
+          .reduce(math.max);
+      expect(cursorRadius, closeTo(furthestErasedPoint, 1e-9));
+      expect(
+        stamps,
+        everyElement(
+          predicate<EraserBrushStamp>(
+            (stamp) =>
+                (stamp.center - center).distance + stamp.radius <= cursorRadius,
+          ),
+        ),
+      );
+    });
+
     test('cursor and stylus eraser use the same logical thickness', () {
       expect(EraserContactGeometry.stylusWorldRadius(2), 1);
       expect(EraserContactGeometry.stylusWorldRadius(32), 16);

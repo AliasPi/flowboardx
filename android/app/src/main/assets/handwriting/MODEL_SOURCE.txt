@@ -1,0 +1,34 @@
+Flowboard X bundled handwriting model
+====================================
+
+Model:
+  PaddlePaddle latin_PP-OCRv5_mobile_rec_onnx
+
+Upstream revision:
+  89d3a50e2c27e2e7cceeab0e944c25c807d5db4f
+
+Model source:
+  https://huggingface.co/PaddlePaddle/latin_PP-OCRv5_mobile_rec_onnx/resolve/89d3a50e2c27e2e7cceeab0e944c25c807d5db4f/inference.onnx
+
+Inference configuration source:
+  https://huggingface.co/PaddlePaddle/latin_PP-OCRv5_mobile_rec_onnx/resolve/89d3a50e2c27e2e7cceeab0e944c25c807d5db4f/inference.yml
+
+Model SHA-256:
+  7888113072263cb471b93f66dd5e2ad70548dc526fa1ace760d0d973dd121498
+
+Inference configuration SHA-256:
+  0bbe984570f597af3638e50bdf2e8276f3ab26a61966096538b3b0d1849f5c84
+
+Model size:
+  8,042,023 bytes
+
+License:
+  Apache License 2.0. The complete upstream license is included as
+  PADDLEOCR_APACHE_2_LICENSE.txt in this directory.
+
+Runtime:
+  Microsoft ONNX Runtime Android 1.23.2, MIT License. Its complete license is
+  included as ONNXRUNTIME_MIT_LICENSE.txt in this directory.
+
+The model and configuration are application assets. Recognition does not
+download, update, or contact a remote service at runtime.

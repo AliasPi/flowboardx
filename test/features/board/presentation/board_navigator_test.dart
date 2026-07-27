@@ -1,5 +1,6 @@
 import 'package:flowboard_x/src/features/board/engine/board_viewport.dart';
 import 'package:flowboard_x/src/features/board/presentation/board_navigator.dart';
+import 'package:flowboard_x/src/domain/model/ink.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -37,6 +38,31 @@ void main() {
         const Rect.fromLTWH(150, 75, 300, 150),
       );
     });
+
+    test('uses only the assigned participant half for the viewport frame', () {
+      const world = Rect.fromLTWH(0, 0, 3000, 1800);
+      const leftHalf = Rect.fromLTWH(0, 0, 500, 600);
+      const rightHalf = Rect.fromLTWH(500, 0, 500, 600);
+
+      expect(
+        BoardNavigatorGeometry.visibleWorldRect(
+          viewportScale: 1,
+          viewportOffset: Offset.zero,
+          visibleScreenBounds: leftHalf,
+          worldBounds: world,
+        ),
+        leftHalf,
+      );
+      expect(
+        BoardNavigatorGeometry.visibleWorldRect(
+          viewportScale: 1,
+          viewportOffset: Offset.zero,
+          visibleScreenBounds: rightHalf,
+          worldBounds: world,
+        ),
+        rightHalf,
+      );
+    });
   });
 
   group('BoardViewport.centerOn', () {
@@ -71,5 +97,29 @@ void main() {
       expect(viewport.offset, originalOffset);
       expect(notifications, 0);
     });
+  });
+
+  test('camera motion does not repaint static navigator content', () {
+    final strokes = <InkStroke>[
+      InkStroke(
+        id: 'navigator-ink',
+        points: const <InkPoint>[
+          InkPoint(x: 10, y: 10),
+          InkPoint(x: 80, y: 60),
+        ],
+      ),
+    ];
+    final before = BoardNavigatorContentPainter(
+      worldBounds: const Rect.fromLTWH(0, 0, 1000, 600),
+      objects: const [],
+      strokes: strokes,
+    );
+    final afterCameraMove = BoardNavigatorContentPainter(
+      worldBounds: const Rect.fromLTWH(0, 0, 1000, 600),
+      objects: const [],
+      strokes: strokes,
+    );
+
+    expect(afterCameraMove.shouldRepaint(before), isFalse);
   });
 }

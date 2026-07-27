@@ -66,6 +66,7 @@ class MainActivity : FlutterActivity() {
             channel.setMethodCallHandler(::handleFileSaverMethod)
         }
         handwritingRecognitionService = AndroidHandwritingRecognitionService(
+            this,
             flutterEngine.dartExecutor.binaryMessenger,
         )
         palmInputService?.dispose()
@@ -110,10 +111,20 @@ class MainActivity : FlutterActivity() {
 
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
         // Observe before Flutter/Android can transform or cancel the event,
-        // but always preserve the framework's original consumption result.
-        palmInputService?.observe(event)
+        // but preserve every mixed packet containing a stylus. Only a complete
+        // touch-only stream which started next to the pen is quarantined.
+        val suppressPalmRest = palmInputService?.observe(event) == true
         smartBoardCompatibilityService?.observe(event)
+        if (suppressPalmRest) return true
         return super.dispatchTouchEvent(event)
+    }
+
+    override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
+        // Stylus hover arrives here rather than through dispatchTouchEvent.
+        // Observing it lets the guard reject a hand which lands just before
+        // the pen tip, while the original hover packet still reaches Flutter.
+        palmInputService?.observeGenericMotion(event)
+        return super.dispatchGenericMotionEvent(event)
     }
 
     override fun onResume() {

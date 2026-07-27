@@ -300,6 +300,149 @@ void main() {
   );
 
   testWidgets(
+    'broad palm cannot erase while this participant stylus is writing',
+    (tester) async {
+      final document = withPage(
+        'stylus-palm-rejection-e2e',
+        update: (page) =>
+            page.copyWith(strokes: <InkStroke>[horizontalStroke()]),
+      );
+      final source = _PalmInputSource();
+      addTearDown(source.dispose);
+      final controller = await pumpBoard(
+        tester,
+        document,
+        palmInputSource: source,
+      );
+      final stylus = await tester.startGesture(
+        const Offset(120, 120),
+        pointer: 401,
+        kind: PointerDeviceKind.stylus,
+      );
+      await stylus.moveTo(const Offset(180, 130));
+
+      await tester.sendEventToBinding(
+        const PointerDownEvent(
+          pointer: 402,
+          device: 402,
+          kind: PointerDeviceKind.touch,
+          position: Offset(380, 300),
+          radiusMajor: 34,
+          radiusMinor: 20,
+          size: .36,
+        ),
+      );
+      await tester.sendEventToBinding(
+        const PointerMoveEvent(
+          pointer: 402,
+          device: 402,
+          kind: PointerDeviceKind.touch,
+          position: Offset(430, 300),
+          delta: Offset(50, 0),
+          radiusMajor: 34,
+          radiusMinor: 20,
+          size: .36,
+        ),
+      );
+      source.add(
+        const NativePalmStroke(
+          sessionId: 'stylus-native-palm',
+          points: <Offset>[Offset(380, 300), Offset(430, 300)],
+          radius: 34,
+          contactCount: 1,
+          source: 'tool_type_palm',
+        ),
+      );
+      // The supporting hand commonly remains on the board slightly longer
+      // than the pen. Its UP must not be reinterpreted as an eraser after the
+      // stylus session has already ended.
+      await stylus.up();
+      await tester.sendEventToBinding(
+        const PointerUpEvent(
+          pointer: 402,
+          device: 402,
+          kind: PointerDeviceKind.touch,
+          position: Offset(430, 300),
+          radiusMajor: 34,
+          radiusMinor: 20,
+          size: .36,
+        ),
+      );
+      await tester.pump();
+
+      final original = controller.page.strokes.singleWhere(
+        (stroke) => stroke.id == 'ink',
+      );
+      expect(original.points.first.x, 100);
+      expect(original.points.last.x, 700);
+      expect(_strokeCrossesX(<InkStroke>[original], 400), isTrue);
+      await controller.flush();
+    },
+  );
+
+  testWidgets(
+    'stylus cancels a broad palm preview which started just before it',
+    (tester) async {
+      final document = withPage(
+        'palm-before-stylus-e2e',
+        update: (page) =>
+            page.copyWith(strokes: <InkStroke>[horizontalStroke()]),
+      );
+      final controller = await pumpBoard(tester, document);
+
+      await tester.sendEventToBinding(
+        const PointerDownEvent(
+          pointer: 411,
+          device: 411,
+          kind: PointerDeviceKind.touch,
+          position: Offset(380, 300),
+          radiusMajor: 34,
+          radiusMinor: 20,
+          size: .36,
+        ),
+      );
+      final stylus = await tester.startGesture(
+        const Offset(120, 120),
+        pointer: 412,
+        kind: PointerDeviceKind.stylus,
+      );
+      await tester.sendEventToBinding(
+        const PointerMoveEvent(
+          pointer: 411,
+          device: 411,
+          kind: PointerDeviceKind.touch,
+          position: Offset(430, 300),
+          delta: Offset(50, 0),
+          radiusMajor: 34,
+          radiusMinor: 20,
+          size: .36,
+        ),
+      );
+      await stylus.up();
+      await tester.sendEventToBinding(
+        const PointerUpEvent(
+          pointer: 411,
+          device: 411,
+          kind: PointerDeviceKind.touch,
+          position: Offset(430, 300),
+          radiusMajor: 34,
+          radiusMinor: 20,
+          size: .36,
+        ),
+      );
+      await tester.pump();
+
+      final original = controller.page.strokes.singleWhere(
+        (stroke) => stroke.id == 'ink',
+      );
+      expect(original.points.first.x, 100);
+      expect(original.points.last.x, 700);
+      expect(_strokeCrossesX(<InkStroke>[original], 400), isTrue);
+      await controller.flush();
+    },
+  );
+
+  testWidgets(
     'native palm coordinates are centred in the offset Flutter surface',
     (tester) async {
       final document = withPage(

@@ -15,6 +15,7 @@ class BoardNavigator extends StatelessWidget {
   const BoardNavigator({
     required this.viewport,
     required this.viewportSize,
+    this.visibleScreenBounds,
     required this.objects,
     required this.strokes,
     required this.onNavigate,
@@ -29,6 +30,7 @@ class BoardNavigator extends StatelessWidget {
 
   final BoardViewport viewport;
   final Size viewportSize;
+  final Rect? visibleScreenBounds;
   final List<BoardObject> objects;
   final List<InkStroke> strokes;
   final ValueChanged<Offset> onNavigate;
@@ -114,14 +116,32 @@ class BoardNavigator extends StatelessWidget {
                       onPanUpdate: (details) => navigate(details.localPosition),
                       onPanEnd: (_) => onInteractionEnd(),
                       onPanCancel: onInteractionEnd,
-                      child: CustomPaint(
-                        painter: BoardNavigatorPainter(
-                          viewport: viewport,
-                          viewportSize: viewportSize,
-                          objects: objects,
-                          strokes: strokes,
-                        ),
-                        child: const SizedBox.expand(),
+                      child: Stack(
+                        fit: StackFit.expand,
+                        children: [
+                          RepaintBoundary(
+                            child: CustomPaint(
+                              painter: BoardNavigatorContentPainter(
+                                worldBounds: viewport.worldBounds,
+                                objects: objects,
+                                strokes: strokes,
+                              ),
+                            ),
+                          ),
+                          IgnorePointer(
+                            child: RepaintBoundary(
+                              child: CustomPaint(
+                                painter: BoardNavigatorViewportPainter(
+                                  viewport: viewport,
+                                  viewportSize: viewportSize,
+                                  visibleScreenBounds:
+                                      visibleScreenBounds ??
+                                      (Offset.zero & viewportSize),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
                       ),
                     ),
                   );
@@ -163,114 +183,114 @@ abstract final class BoardNavigatorGeometry {
     mapPoint(world.topLeft, size, bounds),
     mapPoint(world.bottomRight, size, bounds),
   );
+
+  static Rect visibleWorldRect({
+    required double viewportScale,
+    required Offset viewportOffset,
+    required Rect visibleScreenBounds,
+    required Rect worldBounds,
+  }) {
+    if (!viewportScale.isFinite || viewportScale <= 0) return Rect.zero;
+    return Rect.fromPoints(
+      (visibleScreenBounds.topLeft - viewportOffset) / viewportScale,
+      (visibleScreenBounds.bottomRight - viewportOffset) / viewportScale,
+    ).intersect(worldBounds);
+  }
 }
 
-class BoardNavigatorPainter extends CustomPainter {
-  BoardNavigatorPainter({
-    required BoardViewport viewport,
-    required this.viewportSize,
+/// Static page overview. Its repaint contract intentionally excludes camera
+/// state so pinch/pan only moves the lightweight red viewport rectangle.
+class BoardNavigatorContentPainter extends CustomPainter {
+  const BoardNavigatorContentPainter({
+    required this.worldBounds,
     required this.objects,
     required this.strokes,
+  });
+
+  final Rect worldBounds;
+  final List<BoardObject> objects;
+  final List<InkStroke> strokes;
+
+  @override
+  void paint(Canvas canvas, Size size) =>
+      _paintNavigatorContent(canvas, size, worldBounds, objects, strokes);
+
+  @override
+  bool shouldRepaint(covariant BoardNavigatorContentPainter oldDelegate) =>
+      oldDelegate.worldBounds != worldBounds ||
+      !identical(oldDelegate.objects, objects) ||
+      !identical(oldDelegate.strokes, strokes);
+}
+
+/// Dynamic navigator overlay containing only the current visible world rect.
+class BoardNavigatorViewportPainter extends CustomPainter {
+  BoardNavigatorViewportPainter({
+    required BoardViewport viewport,
+    required this.viewportSize,
+    Rect? visibleScreenBounds,
   }) : viewportScale = viewport.scale,
        viewportOffset = viewport.offset,
-       worldBounds = viewport.worldBounds;
+       worldBounds = viewport.worldBounds,
+       visibleScreenBounds =
+           visibleScreenBounds ?? (Offset.zero & viewportSize);
 
   final double viewportScale;
   final Offset viewportOffset;
   final Rect worldBounds;
   final Size viewportSize;
+  final Rect visibleScreenBounds;
+
+  @override
+  void paint(Canvas canvas, Size size) => _paintNavigatorViewport(
+    canvas,
+    size,
+    viewportScale: viewportScale,
+    viewportOffset: viewportOffset,
+    visibleScreenBounds: visibleScreenBounds,
+    worldBounds: worldBounds,
+  );
+
+  @override
+  bool shouldRepaint(covariant BoardNavigatorViewportPainter oldDelegate) =>
+      oldDelegate.viewportScale != viewportScale ||
+      oldDelegate.viewportOffset != viewportOffset ||
+      oldDelegate.worldBounds != worldBounds ||
+      oldDelegate.viewportSize != viewportSize ||
+      oldDelegate.visibleScreenBounds != visibleScreenBounds;
+}
+
+/// Combined painter retained for embedders that used the original public API.
+class BoardNavigatorPainter extends CustomPainter {
+  BoardNavigatorPainter({
+    required BoardViewport viewport,
+    required this.viewportSize,
+    Rect? visibleScreenBounds,
+    required this.objects,
+    required this.strokes,
+  }) : viewportScale = viewport.scale,
+       viewportOffset = viewport.offset,
+       worldBounds = viewport.worldBounds,
+       visibleScreenBounds =
+           visibleScreenBounds ?? (Offset.zero & viewportSize);
+
+  final double viewportScale;
+  final Offset viewportOffset;
+  final Rect worldBounds;
+  final Size viewportSize;
+  final Rect visibleScreenBounds;
   final List<BoardObject> objects;
   final List<InkStroke> strokes;
 
   @override
   void paint(Canvas canvas, Size size) {
-    final world = worldBounds;
-    final surface = Offset.zero & size;
-    canvas.drawRect(surface, Paint()..color = FlowboardColors.canvas);
-    canvas.save();
-    canvas.clipRRect(
-      RRect.fromRectAndRadius(surface, const Radius.circular(9)),
-    );
-
-    final cellPaint = Paint()
-      ..color = const Color(0xFF8D9994).withValues(alpha: .48)
-      ..strokeWidth = 1;
-    for (var index = 1; index < 3; index++) {
-      final x = size.width * index / 3;
-      final y = size.height * index / 3;
-      canvas.drawLine(Offset(x, 0), Offset(x, size.height), cellPaint);
-      canvas.drawLine(Offset(0, y), Offset(size.width, y), cellPaint);
-    }
-
-    final objectPaint = Paint()
-      ..color = const Color(0xFF52605D).withValues(alpha: .38)
-      ..style = PaintingStyle.fill;
-    for (final object in objects.take(2000)) {
-      final bounds = object.transform.bounds;
-      if (!bounds.left.isFinite ||
-          !bounds.top.isFinite ||
-          !bounds.width.isFinite ||
-          !bounds.height.isFinite) {
-        continue;
-      }
-      final rect = BoardNavigatorGeometry.mapRect(
-        Rect.fromLTWH(bounds.left, bounds.top, bounds.width, bounds.height),
-        size,
-        world,
-      ).intersect(surface);
-      if (!rect.isEmpty) canvas.drawRect(rect, objectPaint);
-    }
-
-    final inkPaint = Paint()
-      ..color = const Color(0xFF26312F).withValues(alpha: .72)
-      ..style = PaintingStyle.stroke
-      ..strokeCap = StrokeCap.round
-      ..strokeJoin = StrokeJoin.round
-      ..strokeWidth = 1.15;
-    for (final stroke in strokes.take(5000)) {
-      if (stroke.points.isEmpty) continue;
-      final step = math.max(1, (stroke.points.length / 80).ceil());
-      Path? path;
-      for (var index = 0; index < stroke.points.length; index += step) {
-        final point = stroke.points[index];
-        if (!point.x.isFinite || !point.y.isFinite) continue;
-        final mapped = BoardNavigatorGeometry.mapPoint(
-          Offset(point.x, point.y),
-          size,
-          world,
-        );
-        path ??= Path()..moveTo(mapped.dx, mapped.dy);
-        path.lineTo(mapped.dx, mapped.dy);
-      }
-      if (path != null) canvas.drawPath(path, inkPaint);
-    }
-
-    final visibleWorld = Rect.fromPoints(
-      (Offset.zero - viewportOffset) / viewportScale,
-      (Offset(viewportSize.width, viewportSize.height) - viewportOffset) /
-          viewportScale,
-    ).intersect(world);
-    if (!visibleWorld.isEmpty) {
-      final visible = BoardNavigatorGeometry.mapRect(visibleWorld, size, world);
-      canvas.drawRect(
-        visible,
-        Paint()..color = const Color(0xFFD73333).withValues(alpha: .08),
-      );
-      canvas.drawRect(
-        visible,
-        Paint()
-          ..color = const Color(0xFFE32636)
-          ..style = PaintingStyle.stroke
-          ..strokeWidth = 2.4,
-      );
-    }
-    canvas.restore();
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(surface.deflate(.75), const Radius.circular(9)),
-      Paint()
-        ..color = FlowboardColors.divider
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 1.5,
+    _paintNavigatorContent(canvas, size, worldBounds, objects, strokes);
+    _paintNavigatorViewport(
+      canvas,
+      size,
+      viewportScale: viewportScale,
+      viewportOffset: viewportOffset,
+      visibleScreenBounds: visibleScreenBounds,
+      worldBounds: worldBounds,
     );
   }
 
@@ -280,6 +300,121 @@ class BoardNavigatorPainter extends CustomPainter {
       oldDelegate.viewportOffset != viewportOffset ||
       oldDelegate.worldBounds != worldBounds ||
       oldDelegate.viewportSize != viewportSize ||
+      oldDelegate.visibleScreenBounds != visibleScreenBounds ||
       oldDelegate.objects != objects ||
       oldDelegate.strokes != strokes;
+}
+
+void _paintNavigatorContent(
+  Canvas canvas,
+  Size size,
+  Rect world,
+  List<BoardObject> objects,
+  List<InkStroke> strokes,
+) {
+  final surface = Offset.zero & size;
+  canvas.drawRect(surface, Paint()..color = FlowboardColors.canvas);
+  canvas.save();
+  canvas.clipRRect(RRect.fromRectAndRadius(surface, const Radius.circular(9)));
+
+  final cellPaint = Paint()
+    ..color = const Color(0xFF8D9994).withValues(alpha: .48)
+    ..strokeWidth = 1;
+  for (var index = 1; index < 3; index++) {
+    final x = size.width * index / 3;
+    final y = size.height * index / 3;
+    canvas.drawLine(Offset(x, 0), Offset(x, size.height), cellPaint);
+    canvas.drawLine(Offset(0, y), Offset(size.width, y), cellPaint);
+  }
+
+  final objectPaint = Paint()
+    ..color = const Color(0xFF52605D).withValues(alpha: .38)
+    ..style = PaintingStyle.fill;
+  for (final object in objects.take(2000)) {
+    final bounds = object.transform.bounds;
+    if (!bounds.left.isFinite ||
+        !bounds.top.isFinite ||
+        !bounds.width.isFinite ||
+        !bounds.height.isFinite) {
+      continue;
+    }
+    final rect = BoardNavigatorGeometry.mapRect(
+      Rect.fromLTWH(bounds.left, bounds.top, bounds.width, bounds.height),
+      size,
+      world,
+    ).intersect(surface);
+    if (!rect.isEmpty) canvas.drawRect(rect, objectPaint);
+  }
+
+  final inkPaint = Paint()
+    ..color = const Color(0xFF26312F).withValues(alpha: .72)
+    ..style = PaintingStyle.stroke
+    ..strokeCap = StrokeCap.round
+    ..strokeJoin = StrokeJoin.round
+    ..strokeWidth = 1.15;
+  for (final stroke in strokes.take(5000)) {
+    if (stroke.points.isEmpty) continue;
+    final step = math.max(1, (stroke.points.length / 80).ceil());
+    Path? path;
+    for (var index = 0; index < stroke.points.length; index += step) {
+      final point = stroke.points[index];
+      if (!point.x.isFinite || !point.y.isFinite) continue;
+      final mapped = BoardNavigatorGeometry.mapPoint(
+        Offset(point.x, point.y),
+        size,
+        world,
+      );
+      path ??= Path()..moveTo(mapped.dx, mapped.dy);
+      path.lineTo(mapped.dx, mapped.dy);
+    }
+    if (path != null) canvas.drawPath(path, inkPaint);
+  }
+
+  canvas.restore();
+  canvas.drawRRect(
+    RRect.fromRectAndRadius(surface.deflate(.75), const Radius.circular(9)),
+    Paint()
+      ..color = FlowboardColors.divider
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.5,
+  );
+}
+
+void _paintNavigatorViewport(
+  Canvas canvas,
+  Size size, {
+  required double viewportScale,
+  required Offset viewportOffset,
+  required Rect visibleScreenBounds,
+  required Rect worldBounds,
+}) {
+  if (!viewportScale.isFinite || viewportScale <= 0) return;
+  final surface = Offset.zero & size;
+  canvas.save();
+  canvas.clipRRect(RRect.fromRectAndRadius(surface, const Radius.circular(9)));
+  final visibleWorld = BoardNavigatorGeometry.visibleWorldRect(
+    viewportScale: viewportScale,
+    viewportOffset: viewportOffset,
+    visibleScreenBounds: visibleScreenBounds,
+    worldBounds: worldBounds,
+  );
+  if (!visibleWorld.isEmpty) {
+    final visible = BoardNavigatorGeometry.mapRect(
+      visibleWorld,
+      size,
+      worldBounds,
+    );
+    canvas.drawRect(
+      visible,
+      Paint()..color = const Color(0xFFD73333).withValues(alpha: .08),
+    );
+    canvas.drawRect(
+      visible,
+      Paint()
+        ..color = const Color(0xFFE32636)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2.4,
+    );
+  }
+  canvas.restore();
 }

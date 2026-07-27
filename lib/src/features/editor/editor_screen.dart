@@ -49,6 +49,97 @@ final class _OpenedPdfPreview {
   final PdfDocument document;
 }
 
+/// Values consumed by the editor chrome outside [BoardSurface].
+///
+/// The board already listens to its controller directly. Comparing this small
+/// snapshot prevents high-frequency eraser and transform previews from
+/// rebuilding the top bar, both radial menus, timers and the other participant
+/// surface.
+final class _EditorShellSnapshot {
+  const _EditorShellSnapshot({
+    required this.documentRevision,
+    required this.pageId,
+    required this.tool,
+    required this.shape,
+    required this.penColor,
+    required this.penWidth,
+    required this.penType,
+    required this.selectionHash,
+    required this.saving,
+    required this.lastError,
+    required this.canUndo,
+    required this.canRedo,
+    required this.canPaste,
+  });
+
+  factory _EditorShellSnapshot.from(EditorController controller) {
+    final pen = controller.penStyle;
+    return _EditorShellSnapshot(
+      documentRevision: controller.document.revision,
+      pageId: controller.page.id,
+      tool: controller.tool,
+      shape: controller.activeShape,
+      penColor: pen.colorArgb,
+      penWidth: pen.width,
+      penType: pen.type,
+      selectionHash: Object.hashAllUnordered(controller.selectedSceneItemIds),
+      saving: controller.saving,
+      lastError: controller.lastError,
+      canUndo: controller.canUndo,
+      canRedo: controller.canRedo,
+      canPaste: controller.canPaste,
+    );
+  }
+
+  final int documentRevision;
+  final String pageId;
+  final BoardTool tool;
+  final ShapeKind shape;
+  final int penColor;
+  final double penWidth;
+  final InkToolType penType;
+  final int selectionHash;
+  final bool saving;
+  final String? lastError;
+  final bool canUndo;
+  final bool canRedo;
+  final bool canPaste;
+
+  @override
+  bool operator ==(Object other) =>
+      other is _EditorShellSnapshot &&
+      other.documentRevision == documentRevision &&
+      other.pageId == pageId &&
+      other.tool == tool &&
+      other.shape == shape &&
+      other.penColor == penColor &&
+      other.penWidth == penWidth &&
+      other.penType == penType &&
+      other.selectionHash == selectionHash &&
+      other.saving == saving &&
+      other.lastError == lastError &&
+      other.canUndo == canUndo &&
+      other.canRedo == canRedo &&
+      other.canPaste == canPaste;
+
+  @override
+  int get hashCode => Object.hash(
+    documentRevision,
+    pageId,
+    tool,
+    shape,
+    penColor,
+    penWidth,
+    penType,
+    selectionHash,
+    saving,
+    lastError,
+    canUndo,
+    canRedo,
+    canPaste,
+  );
+}
+
 final class _WorkspaceRegionClipper extends CustomClipper<Rect> {
   const _WorkspaceRegionClipper(this.region);
 
@@ -94,6 +185,9 @@ class _EditorScreenState extends State<EditorScreen>
   final Map<String, int> _thumbnailIdentity = {};
   int _thumbnailGeneration = 0;
   int _lastThumbnailIdentity = -1;
+  WhiteboardDocument? _thumbnailObservedDocument;
+  _EditorShellSnapshot? _primaryShellSnapshot;
+  _EditorShellSnapshot? _secondaryShellSnapshot;
   Timer? _thumbnailDebounce;
   bool _thumbnailRefreshRunning = false;
   bool _thumbnailRefreshQueued = false;
@@ -821,18 +915,31 @@ class _EditorScreenState extends State<EditorScreen>
         penStyle: _editor.penStyle,
       );
     }
-    final thumbnailIdentity = Object.hashAll(
-      _editor.document.pages.map(identityHashCode),
-    );
-    if (thumbnailIdentity != _lastThumbnailIdentity) {
-      _lastThumbnailIdentity = thumbnailIdentity;
-      _scheduleThumbnailRefresh();
+    final currentDocument = _editor.document;
+    if (!identical(_thumbnailObservedDocument, currentDocument)) {
+      _thumbnailObservedDocument = currentDocument;
+      final assetFingerprints = _thumbnailAssetFingerprints(currentDocument);
+      final thumbnailIdentity = Object.hashAll(
+        currentDocument.pages.map(
+          (page) => _pageThumbnailFingerprint(page, assetFingerprints),
+        ),
+      );
+      if (thumbnailIdentity != _lastThumbnailIdentity) {
+        _lastThumbnailIdentity = thumbnailIdentity;
+        _scheduleThumbnailRefresh();
+      }
     }
+    final nextSnapshot = _EditorShellSnapshot.from(_editor);
+    if (nextSnapshot == _primaryShellSnapshot) return;
+    _primaryShellSnapshot = nextSnapshot;
     setState(() {});
   }
 
   void _onSecondaryEditorChanged() {
     if (!mounted) return;
+    final nextSnapshot = _EditorShellSnapshot.from(_secondaryEditor);
+    if (nextSnapshot == _secondaryShellSnapshot) return;
+    _secondaryShellSnapshot = nextSnapshot;
     setState(() {});
   }
 
@@ -858,12 +965,18 @@ class _EditorScreenState extends State<EditorScreen>
 
   void _scheduleThumbnailRefresh() {
     _thumbnailDebounce?.cancel();
-    _thumbnailDebounce = Timer(const Duration(milliseconds: 320), () {
+    _thumbnailDebounce = Timer(const Duration(milliseconds: 850), () {
       _startThumbnailRefresh();
     });
   }
 
   void _startThumbnailRefresh() {
+    if (_editor.inkSessions.isWriting ||
+        (_participantMode == EditorParticipantMode.twoPeople &&
+            _secondaryEditor.inkSessions.isWriting)) {
+      _scheduleThumbnailRefresh();
+      return;
+    }
     unawaited(
       _drainThumbnailRefresh().catchError((Object error, StackTrace stack) {
         FlutterError.reportError(
@@ -912,12 +1025,13 @@ class _EditorScreenState extends State<EditorScreen>
       document.currentPage,
       ...document.pages.where((page) => page.id != document.currentPage.id),
     ];
+    final assetFingerprints = _thumbnailAssetFingerprints(document);
     for (final page in orderedPages) {
       if (_pageSheetOpen) {
         _thumbnailRefreshQueued = true;
         return;
       }
-      final identity = identityHashCode(page);
+      final identity = _pageThumbnailFingerprint(page, assetFingerprints);
       if (_thumbnailIdentity[page.id] == identity) continue;
       ui.Image image;
       try {
@@ -954,6 +1068,39 @@ class _EditorScreenState extends State<EditorScreen>
   void _disposeThumbnailAfterFrame(ui.Image image) {
     SchedulerBinding.instance.addPostFrameCallback((_) => image.dispose());
   }
+
+  static Map<String, int> _thumbnailAssetFingerprints(
+    WhiteboardDocument document,
+  ) => <String, int>{
+    for (final asset in document.assets)
+      asset.id: Object.hash(
+        identityHashCode(asset),
+        asset.relativePath,
+        asset.byteLength,
+        asset.sha256,
+      ),
+  };
+
+  static int _pageThumbnailFingerprint(
+    BoardPage page,
+    Map<String, int> assetFingerprints,
+  ) => Object.hash(
+    page.id,
+    page.name,
+    identityHashCode(page.strokes),
+    identityHashCode(page.objects),
+    identityHashCode(page.annotationLayers),
+    identityHashCode(page.template),
+    Object.hashAll(
+      page.objects.map(
+        (object) => switch (object) {
+          ImageObject(:final assetId) || PdfObject(:final assetId) =>
+            assetFingerprints[assetId] ?? assetId.hashCode,
+          _ => 0,
+        },
+      ),
+    ),
+  );
 
   Future<void> _leave() async {
     if (_leaving) return;
@@ -1715,6 +1862,8 @@ class _EditorScreenState extends State<EditorScreen>
   Future<void> _sharePdf() async {
     if (_exporting) return;
     PreparedBoardExport? prepared;
+    File? file;
+    var retry = false;
     setState(() {
       _exporting = true;
       _exportProgress = null;
@@ -1726,7 +1875,7 @@ class _EditorScreenState extends State<EditorScreen>
       );
       if (!mounted) return;
       final directory = await getTemporaryDirectory();
-      final file = File(
+      file = File(
         p.join(
           directory.path,
           '${_safeFileName(_editor.document.title)}-share-'
@@ -1735,28 +1884,42 @@ class _EditorScreenState extends State<EditorScreen>
       );
       if (!mounted) return;
       setState(() => _exporting = false);
-      unawaited(
-        showDialog<void>(
-          context: context,
-          barrierDismissible: false,
-          builder: (dialogContext) => Dialog(
-            child: QrSharePanel(
-              controller: _shareController,
-              onClose: () => Navigator.pop(dialogContext),
-              onRetry: () {
-                Navigator.pop(dialogContext);
-                unawaited(_sharePdf());
-              },
-            ),
+      final dialogFuture = showDialog<bool>(
+        context: context,
+        barrierDismissible: false,
+        builder: (dialogContext) => Dialog(
+          child: QrSharePanel(
+            controller: _shareController,
+            onClose: () => Navigator.pop(dialogContext, false),
+            onRetry: () => Navigator.pop(dialogContext, true),
           ),
         ),
       );
-      await _shareController.exportAndShare(prepared.snapshot, file);
+      final exportFuture = _shareController.exportAndShare(
+        prepared.snapshot,
+        file,
+      );
+      retry = await dialogFuture ?? false;
+      // Closing the panel also cancels an export that is still running. This
+      // prevents an invisible server from retaining the temporary file.
+      await _shareController.stop();
+      await exportFuture;
     } catch (error) {
       if (mounted) _showError('Lokale Freigabe fehlgeschlagen: $error');
     } finally {
+      await _shareController.stop();
+      if (file != null) {
+        try {
+          if (await file.exists()) await file.delete();
+        } on Object {
+          // Temporary share cleanup is best-effort.
+        }
+      }
       prepared?.dispose();
       if (mounted) setState(() => _exporting = false);
+    }
+    if (retry && mounted) {
+      await _sharePdf();
     }
   }
 

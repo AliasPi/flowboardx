@@ -5,12 +5,13 @@ import '../../../domain/model/geometry.dart';
 import '../../../domain/model/ink.dart';
 import '../../../domain/model/scene_order.dart';
 import 'board_object_layer.dart';
-import 'ink_painter.dart';
+import 'persisted_ink_layer.dart';
 
 /// Paints free ink and board objects in one shared z-order. Consecutive ink
-/// entries are intentionally batched into one CustomPaint, so a page with many
-/// strokes does not create a widget/render-object per stroke.
-class BoardSceneLayer extends StatelessWidget {
+/// entries are split into bounded, stable batches. Completed batches retain
+/// their vector cache when a new stroke is appended, without creating one
+/// fullscreen render layer per stroke.
+class BoardSceneLayer extends StatefulWidget {
   const BoardSceneLayer({
     required this.objects,
     required this.strokes,
@@ -33,40 +34,106 @@ class BoardSceneLayer extends StatelessWidget {
   final Rect2? worldClip;
 
   @override
-  Widget build(BuildContext context) {
-    final runs = _buildRuns(
-      orderedBoardSceneItems(objects: objects, strokes: strokes),
+  State<BoardSceneLayer> createState() => _BoardSceneLayerState();
+}
+
+class _BoardSceneLayerState extends State<BoardSceneLayer> {
+  late List<_SceneRun> _runs;
+  late VisibleObjectInkLayerIndex _annotationIndex;
+
+  @override
+  void initState() {
+    super.initState();
+    _annotationIndex = VisibleObjectInkLayerIndex(widget.annotationLayers);
+    _rebuildRuns();
+  }
+
+  @override
+  void didUpdateWidget(covariant BoardSceneLayer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // Viewport and overlay changes retain the page-list identities. Avoid an
+    // O(N log N) scene sort for every pan, zoom and cursor frame.
+    if (!identical(oldWidget.objects, widget.objects) ||
+        !identical(oldWidget.strokes, widget.strokes)) {
+      _rebuildRuns();
+    }
+    if (!identical(oldWidget.annotationLayers, widget.annotationLayers)) {
+      _annotationIndex = VisibleObjectInkLayerIndex(widget.annotationLayers);
+    }
+  }
+
+  void _rebuildRuns() {
+    _runs = _buildRuns(
+      orderedBoardSceneItems(objects: widget.objects, strokes: widget.strokes),
     );
+  }
+
+  @override
+  Widget build(BuildContext context) {
     return Stack(
       fit: StackFit.expand,
       clipBehavior: Clip.hardEdge,
       children: [
-        for (var index = 0; index < runs.length; index++)
-          switch (runs[index]) {
+        for (var index = 0; index < _runs.length; index++)
+          switch (_runs[index]) {
             final _ObjectRun run => BoardObjectLayer(
-              key: ValueKey('scene-objects-$index-${run.signature}'),
+              key: ValueKey('scene-objects-$index-${run.objects.first.id}'),
               objects: run.objects,
-              annotationLayers: annotationLayers,
-              scale: scale,
-              offset: offset,
-              assets: assets,
-              selectedIds: selectedIds,
-              worldClip: worldClip,
+              annotationLayers: widget.annotationLayers,
+              annotationIndex: _annotationIndex,
+              scale: widget.scale,
+              offset: widget.offset,
+              assets: widget.assets,
+              selectedIds: widget.selectedIds,
+              worldClip: widget.worldClip,
+              objectsAreSceneOrdered: true,
             ),
-            final _StrokeRun run => RepaintBoundary(
-              key: ValueKey('scene-ink-$index-${run.signature}'),
-              child: CustomPaint(
-                painter: InkPainter(
-                  strokes: run.strokes,
-                  worldToScreenScale: scale,
-                  worldToScreenOffset: offset,
-                  worldClip: worldClip,
-                  selectionIds: selectedIds,
-                ),
-              ),
-            ),
+            final _StrokeRun run => _buildStrokeRun(run, index),
           },
       ],
+    );
+  }
+
+  Widget _buildStrokeRun(_StrokeRun run, int index) {
+    final scale = widget.scale;
+    if (!scale.isFinite ||
+        scale <= 0 ||
+        !widget.offset.dx.isFinite ||
+        !widget.offset.dy.isFinite ||
+        (widget.worldClip != null &&
+            !run.worldBounds.intersects(widget.worldClip!))) {
+      return const SizedBox.shrink();
+    }
+    // Stroke bounds already include half the physical nib width. The fixed
+    // screen-space margin accommodates the selection halo and antialiasing.
+    const screenMargin = 8.0;
+    final left = widget.offset.dx + run.worldBounds.left * scale - screenMargin;
+    final top = widget.offset.dy + run.worldBounds.top * scale - screenMargin;
+    final width = run.worldBounds.width * scale + screenMargin * 2;
+    final height = run.worldBounds.height * scale + screenMargin * 2;
+    return Positioned(
+      key: ValueKey('scene-ink-$index-${run.strokes.first.id}'),
+      left: left,
+      top: top,
+      width: width.clamp(1.0, double.maxFinite).toDouble(),
+      height: height.clamp(1.0, double.maxFinite).toDouble(),
+      child: PersistedInkLayer(
+        strokes: run.strokes,
+        worldToScreenScale: scale,
+        worldToScreenOffset: widget.offset - Offset(left, top),
+        // The complete run is already culled before this widget is built.
+        // Passing the moving viewport clip down would repaint every cached
+        // picture during a pure pan even though this run-local transform is
+        // stable.
+        worldClip: null,
+        // Keep each painter independent from the global selection set.
+        // Select-all previously compared that full set in every run, turning
+        // one frame into O(runs × selected items).
+        selectionIds: <String>{
+          for (final stroke in run.strokes)
+            if (widget.selectedIds.contains(stroke.id)) stroke.id,
+        },
+      ),
     );
   }
 }
@@ -85,8 +152,8 @@ List<_SceneRun> _buildRuns(List<BoardSceneItem> scene) {
       continue;
     }
     final previous = result.lastOrNull;
-    if (previous is _StrokeRun) {
-      previous.strokes.add(item.stroke!);
+    if (previous is _StrokeRun && previous.canAppend(item.stroke!)) {
+      previous.add(item.stroke!);
     } else {
       result.add(_StrokeRun(<InkStroke>[item.stroke!]));
     }
@@ -94,28 +161,56 @@ List<_SceneRun> _buildRuns(List<BoardSceneItem> scene) {
   return result;
 }
 
-sealed class _SceneRun {
-  String get signature;
-}
+sealed class _SceneRun {}
 
 final class _ObjectRun extends _SceneRun {
   _ObjectRun(this.objects);
 
   final List<BoardObject> objects;
-
-  @override
-  String get signature =>
-      '${objects.length}:${objects.first.id}:${objects.last.id}:'
-      '${objects.first.zIndex}:${objects.last.zIndex}';
 }
 
 final class _StrokeRun extends _SceneRun {
-  _StrokeRun(this.strokes);
+  _StrokeRun(this.strokes)
+    : _pointCount = strokes.fold<int>(
+        0,
+        (total, stroke) => total + stroke.points.length,
+      ),
+      worldBounds = strokes.skip(1).fold<Rect2>(strokes.first.bounds, (
+        bounds,
+        stroke,
+      ) {
+        return bounds.union(stroke.bounds);
+      });
 
   final List<InkStroke> strokes;
+  int _pointCount;
+  Rect2 worldBounds;
 
-  @override
-  String get signature =>
-      '${strokes.length}:${strokes.first.id}:${strokes.last.id}:'
-      '${strokes.first.zIndex}:${strokes.last.zIndex}';
+  bool canAppend(InkStroke stroke) {
+    if (strokes.length >= _maxStrokeBatchLength ||
+        _pointCount + stroke.points.length > _maxStrokeBatchPoints) {
+      return false;
+    }
+    final combined = worldBounds.union(stroke.bounds);
+    if (!combined.left.isFinite ||
+        !combined.top.isFinite ||
+        !combined.width.isFinite ||
+        !combined.height.isFinite) {
+      return false;
+    }
+    return combined.width <= _maxStrokeBatchWorldExtent &&
+        combined.height <= _maxStrokeBatchWorldExtent &&
+        combined.width * combined.height <= _maxStrokeBatchWorldArea;
+  }
+
+  void add(InkStroke stroke) {
+    strokes.add(stroke);
+    _pointCount += stroke.points.length;
+    worldBounds = worldBounds.union(stroke.bounds);
+  }
 }
+
+const int _maxStrokeBatchLength = 48;
+const int _maxStrokeBatchPoints = 2048;
+const double _maxStrokeBatchWorldExtent = 2048;
+const double _maxStrokeBatchWorldArea = 2048 * 2048;

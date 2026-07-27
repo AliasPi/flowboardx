@@ -109,6 +109,89 @@ void main() {
     expect(serialized, hasLength(10));
   });
 
+  test('redistributes unused point budget to a dense cursive stroke', () {
+    final densePoints = List<InkPoint>.generate(
+      HandwritingRecognitionRequest.maximumChannelPointsPerStroke,
+      (index) => InkPoint(
+        x: index.toDouble(),
+        y: (index % 37).toDouble(),
+        timestampMicros: index,
+      ),
+      growable: false,
+    );
+    final request = HandwritingRecognitionRequest(
+      strokes: <InkStroke>[
+        for (var index = 0; index < 99; index++)
+          InkStroke(
+            id: 'dot-$index',
+            points: <InkPoint>[InkPoint(x: index.toDouble(), y: 0)],
+          ),
+        InkStroke(id: 'cursive', points: densePoints),
+      ],
+    );
+
+    final serialized = (request.toMap()['strokes']! as List).cast<Map>();
+    final cursive = serialized.singleWhere(
+      (stroke) => stroke['id'] == 'cursive',
+    );
+
+    expect(cursive['points'], hasLength(densePoints.length));
+  });
+
+  test('normalized sampling preserves a tight turn beside long packets', () {
+    final source = <InkPoint>[
+      for (var index = 0; index < 6500; index++) InkPoint(x: index * 4.0, y: 0),
+      const InkPoint(x: 26000, y: 2),
+      const InkPoint(x: 26001, y: 28),
+      const InkPoint(x: 26002, y: 2),
+      for (var index = 6501; index < 13000; index++)
+        InkPoint(x: index * 4.0, y: 0),
+    ];
+    final request = HandwritingRecognitionRequest(
+      strokes: <InkStroke>[InkStroke(id: 'tight-turn', points: source)],
+    );
+
+    final stroke = (request.toMap()['strokes']! as List).single as Map;
+    final points = (stroke['points']! as List).cast<Map>();
+
+    expect(
+      points.any((point) => point['y'] == 28),
+      isTrue,
+      reason: 'short high-curvature features must not lose to long segments',
+    );
+  });
+
+  test(
+    'rejects oversized stroke selections before the native boundary',
+    () async {
+      var invoked = false;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+            invoked = true;
+            return null;
+          });
+      final request = HandwritingRecognitionRequest(
+        strokes: <InkStroke>[
+          for (
+            var index = 0;
+            index < HandwritingRecognitionRequest.maximumChannelStrokeCount + 1;
+            index++
+          )
+            InkStroke(
+              id: 'stroke-$index',
+              points: <InkPoint>[InkPoint(x: index.toDouble(), y: 1)],
+            ),
+        ],
+      );
+
+      final result = await service.recognize(request);
+
+      expect(result.isRecognized, isFalse);
+      expect(result.message, contains('zu viele'));
+      expect(invoked, isFalse);
+    },
+  );
+
   test(
     'recognizes directly through the platform boundary and parses confidence',
     () async {
@@ -194,6 +277,10 @@ void main() {
               'engine': 'bundledLatinOcr',
               'modelDelivery': 'bundled-apk',
               'attempts': 3,
+              'lineCountHint': 2,
+              'wordCountHint': 5,
+              'durationMillis': 417,
+              'timedOut': true,
             },
           );
 
@@ -212,6 +299,10 @@ void main() {
       expect(result.engine, 'bundledLatinOcr');
       expect(result.modelDelivery, 'bundled-apk');
       expect(result.attemptCount, 3);
+      expect(result.lineCountHint, 2);
+      expect(result.wordCountHint, 5);
+      expect(result.durationMillis, 417);
+      expect(result.timedOut, isTrue);
     },
   );
 
@@ -234,6 +325,31 @@ void main() {
 
     expect(result.isRecognized, isFalse);
     expect(result.message, 'Nicht erkannt.');
+  });
+
+  test('rejects a recognized protocol response without text', () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          channel,
+          (call) async => <String, Object>{'status': 'recognized'},
+        );
+
+    expect(
+      () => service.recognize(
+        HandwritingRecognitionRequest(
+          strokes: [
+            InkStroke(id: 's', points: const [InkPoint(x: 0, y: 0)]),
+          ],
+        ),
+      ),
+      throwsA(
+        isA<HandwritingRecognitionFailure>().having(
+          (failure) => failure.kind,
+          'kind',
+          HandwritingRecognitionFailureKind.invalidResponse,
+        ),
+      ),
+    );
   });
 
   test('empty ink is not reported as a FormatException', () async {

@@ -98,6 +98,31 @@ abstract final class EraserContactGeometry {
     ];
   }
 
+  /// Radius of the smallest contact-centred circle containing every stamp.
+  ///
+  /// The UI cursor uses this exact value, so it always communicates the
+  /// furthest point the current physical contact can erase.
+  static double enclosingScreenRadius({
+    required Offset center,
+    required Iterable<EraserBrushStamp> footprint,
+    double fallback = 18,
+  }) {
+    var maximum = 0.0;
+    for (final stamp in footprint) {
+      if (!stamp.center.dx.isFinite ||
+          !stamp.center.dy.isFinite ||
+          !stamp.radius.isFinite ||
+          stamp.radius <= 0) {
+        continue;
+      }
+      maximum = math.max(
+        maximum,
+        (stamp.center - center).distance + stamp.radius,
+      );
+    }
+    return _safeRadius(maximum, fallback: fallback);
+  }
+
   static double _positive(double value) =>
       value.isFinite && value > 0 ? value : 0;
 

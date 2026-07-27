@@ -64,6 +64,7 @@ class SelectionEngine {
       }
       final stroke = item.stroke!;
       if (memberGroup.containsKey(stroke.id)) continue;
+      if (!stroke.bounds.inflate(tolerance).contains(point)) continue;
       if (_distanceToStroke(point, stroke) <= tolerance + stroke.width / 2) {
         result.add(
           SelectionCandidate(
@@ -142,19 +143,76 @@ class SelectionEngine {
 
   Set<String> itemsInLasso(BoardPage page, List<Vec2> polygon) {
     if (polygon.length < 3) return const <String>{};
+    final boundedPolygon = simplifyLasso(polygon);
+    final polygonBounds = Rect2.fromPoints(boundedPolygon);
     final selected = <String>{};
     for (final object in page.objects) {
       if (!object.locked &&
-          _insidePolygon(object.transform.bounds.center, polygon)) {
+          object.transform.bounds.intersects(polygonBounds) &&
+          _insidePolygon(object.transform.bounds.center, boundedPolygon)) {
         selected.add(object.id);
       }
     }
     for (final stroke in page.strokes) {
-      if (_insidePolygon(stroke.bounds.center, polygon)) {
+      if (stroke.bounds.intersects(polygonBounds) &&
+          _insidePolygon(stroke.bounds.center, boundedPolygon)) {
         selected.add(stroke.id);
       }
     }
     return _respectContentGroups(page, selected);
+  }
+
+  /// Keeps lasso hit testing bounded while retaining the strongest turn in
+  /// every input bucket. Smartboards can emit thousands of samples for one
+  /// outline; testing every scene item against all of them scales poorly.
+  static List<Vec2> simplifyLasso(
+    List<Vec2> source, {
+    int maximumVertices = 256,
+  }) {
+    if (source.length <= maximumVertices || maximumVertices < 3) return source;
+    final result = <Vec2>[source.first];
+    final interiorCount = source.length - 2;
+    final bucketCount = maximumVertices - 2;
+    for (var bucket = 0; bucket < bucketCount; bucket++) {
+      final start =
+          1 +
+          (bucket * interiorCount ~/ bucketCount)
+              .clamp(0, interiorCount - 1)
+              .toInt();
+      final endExclusive =
+          1 +
+          ((bucket + 1) * interiorCount ~/ bucketCount)
+              .clamp(1, interiorCount)
+              .toInt();
+      final chordStart = source[start - 1];
+      final chordEnd = source[math.min(source.length - 1, endExclusive)];
+      final chordX = chordEnd.x - chordStart.x;
+      final chordY = chordEnd.y - chordStart.y;
+      final chordLengthSquared = chordX * chordX + chordY * chordY;
+      var selectedIndex = start;
+      var greatestDeviation = -1.0;
+      for (var index = start; index < endExclusive; index++) {
+        final point = source[index];
+        final deviation = chordLengthSquared <= 1e-12
+            ? math.pow(point.x - chordStart.x, 2) +
+                  math.pow(point.y - chordStart.y, 2)
+            : math.pow(
+                    (point.x - chordStart.x) * chordY -
+                        (point.y - chordStart.y) * chordX,
+                    2,
+                  ) /
+                  chordLengthSquared;
+        if (deviation > greatestDeviation) {
+          greatestDeviation = deviation.toDouble();
+          selectedIndex = index;
+        }
+      }
+      if (!identical(source[selectedIndex], result.last)) {
+        result.add(source[selectedIndex]);
+      }
+    }
+    if (!identical(result.last, source.last)) result.add(source.last);
+    return result;
   }
 
   /// Selects persistent content groups atomically and leaves ungrouped items

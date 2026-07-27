@@ -341,6 +341,20 @@ final class BoardPage {
        contentGroups = List.unmodifiable(contentGroups),
        selection = selection ?? SelectionState.empty;
 
+  BoardPage._({
+    required this.id,
+    required this.name,
+    required this.viewport,
+    required this.strokes,
+    required this.objects,
+    required this.annotationLayers,
+    required this.groups,
+    required this.contentGroups,
+    required this.selection,
+    required this.template,
+    required this.thumbnailAssetId,
+  });
+
   factory BoardPage.empty({required String id, String name = 'Seite 1'}) =>
       BoardPage(id: id, name: name);
 
@@ -388,15 +402,23 @@ final class BoardPage {
     bool clearTemplate = false,
     String? thumbnailAssetId,
     bool clearThumbnail = false,
-  }) => BoardPage(
+  }) => BoardPage._(
     id: id ?? this.id,
     name: name ?? this.name,
     viewport: viewport ?? this.viewport,
-    strokes: strokes ?? this.strokes,
-    objects: objects ?? this.objects,
-    annotationLayers: annotationLayers ?? this.annotationLayers,
-    groups: groups ?? this.groups,
-    contentGroups: contentGroups ?? this.contentGroups,
+    strokes: strokes == null
+        ? this.strokes
+        : List<InkStroke>.unmodifiable(strokes),
+    objects: objects == null
+        ? this.objects
+        : List<BoardObject>.unmodifiable(objects),
+    annotationLayers: annotationLayers == null
+        ? this.annotationLayers
+        : List<ObjectInkLayer>.unmodifiable(annotationLayers),
+    groups: groups == null ? this.groups : List<InkGroup>.unmodifiable(groups),
+    contentGroups: contentGroups == null
+        ? this.contentGroups
+        : List<ContentGroup>.unmodifiable(contentGroups),
     selection: selection ?? this.selection,
     template: clearTemplate ? null : template ?? this.template,
     thumbnailAssetId: clearThumbnail
@@ -452,28 +474,57 @@ final class BoardPage {
   /// Repairs cross references without changing valid content.
   BoardPage sanitized() {
     final seen = <String>{};
-    final validStrokes = strokes
-        .where((stroke) => stroke.id.isNotEmpty && seen.add(stroke.id))
-        .toList();
-    final validObjects = objects
-        .where((object) => object.id.isNotEmpty && seen.add(object.id))
-        .toList();
+    var changed = false;
+    final validStrokes = <InkStroke>[];
+    for (final stroke in strokes) {
+      if (stroke.id.isEmpty || !seen.add(stroke.id)) {
+        changed = true;
+      } else {
+        validStrokes.add(stroke);
+      }
+    }
+    final validObjects = <BoardObject>[];
+    for (final object in objects) {
+      if (object.id.isEmpty || !seen.add(object.id)) {
+        changed = true;
+      } else {
+        validObjects.add(object);
+      }
+    }
     final strokeIds = validStrokes.map((stroke) => stroke.id).toSet();
     final objectIds = validObjects.map((object) => object.id).toSet();
     final validAnnotations = <ObjectInkLayer>[];
     for (final layer in annotationLayers) {
-      if (!objectIds.contains(layer.objectId) || !seen.add(layer.id)) continue;
-      final layerStrokes = layer.strokes
-          .where((stroke) => stroke.id.isNotEmpty && seen.add(stroke.id))
-          .toList();
-      validAnnotations.add(layer.copyWith(strokes: layerStrokes));
+      if (!objectIds.contains(layer.objectId) || !seen.add(layer.id)) {
+        changed = true;
+        continue;
+      }
+      final layerStrokes = <InkStroke>[];
+      var layerChanged = false;
+      for (final stroke in layer.strokes) {
+        if (stroke.id.isEmpty || !seen.add(stroke.id)) {
+          changed = true;
+          layerChanged = true;
+        } else {
+          layerStrokes.add(stroke);
+        }
+      }
+      validAnnotations.add(
+        layerChanged ? layer.copyWith(strokes: layerStrokes) : layer,
+      );
     }
     final validGroups = <InkGroup>[];
     for (final group in groups) {
       final members = group.strokeIds.where(strokeIds.contains).toList();
-      if (members.isNotEmpty && seen.add(group.id)) {
-        validGroups.add(group.copyWith(strokeIds: members));
+      if (members.isEmpty || !seen.add(group.id)) {
+        changed = true;
+        continue;
       }
+      final groupChanged = members.length != group.strokeIds.length;
+      if (groupChanged) changed = true;
+      validGroups.add(
+        groupChanged ? group.copyWith(strokeIds: members) : group,
+      );
     }
     final strokeById = {for (final stroke in validStrokes) stroke.id: stroke};
     final objectById = {for (final object in validObjects) object.id: object};
@@ -481,7 +532,10 @@ final class BoardPage {
     final validContentGroups = <ContentGroup>[];
     for (final group in contentGroups) {
       final members = group.memberIds.where(validItemIds.contains).toList();
-      if (members.length < 2 || !seen.add(group.id)) continue;
+      if (members.length < 2 || !seen.add(group.id)) {
+        changed = true;
+        continue;
+      }
       Rect2? bounds;
       for (final memberId in members) {
         final memberBounds =
@@ -491,8 +545,15 @@ final class BoardPage {
           bounds = bounds == null ? memberBounds : bounds.union(memberBounds);
         }
       }
+      final nextBounds = bounds ?? group.bounds;
+      final groupChanged =
+          members.length != group.memberIds.length ||
+          nextBounds != group.bounds;
+      if (groupChanged) changed = true;
       validContentGroups.add(
-        group.copyWith(memberIds: members, bounds: bounds ?? group.bounds),
+        groupChanged
+            ? group.copyWith(memberIds: members, bounds: nextBounds)
+            : group,
       );
     }
     final selectable = {
@@ -500,15 +561,22 @@ final class BoardPage {
       ...validGroups.map((group) => group.id),
       ...validContentGroups.map((group) => group.id),
     };
+    final selectedIds = selection.selectedItemIds
+        .where(selectable.contains)
+        .toList(growable: false);
+    final selectionChanged =
+        selectedIds.length != selection.selectedItemIds.length;
+    if (selectionChanged) changed = true;
+    if (!changed) return this;
     return copyWith(
       strokes: validStrokes,
       objects: validObjects,
       annotationLayers: validAnnotations,
       groups: validGroups,
       contentGroups: validContentGroups,
-      selection: selection.copyWith(
-        selectedItemIds: selection.selectedItemIds.where(selectable.contains),
-      ),
+      selection: selectionChanged
+          ? selection.copyWith(selectedItemIds: selectedIds)
+          : selection,
     );
   }
 }
@@ -561,6 +629,21 @@ final class WhiteboardDocument {
       );
     }
   }
+
+  WhiteboardDocument._trusted({
+    required this.id,
+    required this.title,
+    required this.createdAt,
+    required this.updatedAt,
+    required this.pages,
+    required this.currentPageIndex,
+    required this.presets,
+    required this.activePresetId,
+    required this.assets,
+    required this.metadata,
+    required this.thumbnailAssetId,
+    required this.revision,
+  });
 
   factory WhiteboardDocument.create({
     required String id,
@@ -644,22 +727,60 @@ final class WhiteboardDocument {
     String? thumbnailAssetId,
     bool clearThumbnail = false,
     int? revision,
-  }) => WhiteboardDocument(
-    id: id,
-    title: title ?? this.title,
-    createdAt: createdAt,
-    updatedAt: updatedAt ?? this.updatedAt,
-    pages: pages ?? this.pages,
-    currentPageIndex: currentPageIndex ?? this.currentPageIndex,
-    presets: presets ?? this.presets,
-    activePresetId: activePresetId ?? this.activePresetId,
-    assets: assets ?? this.assets,
-    metadata: metadata ?? this.metadata,
-    thumbnailAssetId: clearThumbnail
-        ? null
-        : thumbnailAssetId ?? this.thumbnailAssetId,
-    revision: revision ?? this.revision,
-  );
+  }) {
+    final nextPages = pages == null || identical(pages, this.pages)
+        ? this.pages
+        : List<BoardPage>.unmodifiable(pages);
+    final nextPageIndex = currentPageIndex ?? this.currentPageIndex;
+    if (nextPages.isEmpty || nextPages.length > maxPageCount) {
+      throw ArgumentError.value(
+        nextPages.length,
+        'pages.length',
+        'muss zwischen 1 und $maxPageCount liegen',
+      );
+    }
+    if (nextPageIndex < 0 || nextPageIndex >= nextPages.length) {
+      throw RangeError.range(
+        nextPageIndex,
+        0,
+        nextPages.length - 1,
+        'currentPageIndex',
+      );
+    }
+    if (!identical(nextPages, this.pages)) {
+      final pageIds = nextPages.map((page) => page.id).toSet();
+      if (pageIds.length != nextPages.length ||
+          pageIds.any((pageId) => pageId.isEmpty)) {
+        throw ArgumentError.value(
+          pageIds,
+          'pages',
+          'Seiten-IDs müssen eindeutig und nicht leer sein',
+        );
+      }
+    }
+    final nextPresets = presets == null || identical(presets, this.presets)
+        ? this.presets
+        : List<PenPreset>.unmodifiable(presets);
+    final nextAssets = assets == null || identical(assets, this.assets)
+        ? this.assets
+        : List<DocumentAsset>.unmodifiable(assets);
+    return WhiteboardDocument._trusted(
+      id: id,
+      title: title ?? this.title,
+      createdAt: createdAt,
+      updatedAt: (updatedAt ?? this.updatedAt).toUtc(),
+      pages: nextPages,
+      currentPageIndex: nextPageIndex,
+      presets: nextPresets,
+      activePresetId: activePresetId ?? this.activePresetId,
+      assets: nextAssets,
+      metadata: metadata ?? this.metadata,
+      thumbnailAssetId: clearThumbnail
+          ? null
+          : thumbnailAssetId ?? this.thumbnailAssetId,
+      revision: revision ?? this.revision,
+    );
+  }
 
   Map<String, Object?> toJson({required int schemaVersion}) => {
     'schemaVersion': schemaVersion,

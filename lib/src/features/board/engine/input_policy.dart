@@ -45,8 +45,10 @@ class PointerPolicy {
     PointerEvent event, {
     required PointerRole currentRole,
     required int activeNavigationTouches,
+    required bool stylusCurrentlyActive,
   }) {
     if (event.kind != PointerDeviceKind.touch ||
+        stylusCurrentlyActive ||
         (currentRole != PointerRole.navigate &&
             currentRole != PointerRole.select &&
             currentRole != PointerRole.ignored)) {
@@ -81,6 +83,15 @@ class PointerPolicy {
     required int activeNavigationTouches,
     bool fingerDrawingEnabled = false,
   }) {
+    if (event.kind == PointerDeviceKind.invertedStylus) {
+      return PointerRole.erase;
+    }
+    // Palm rejection outranks broad-touch erasing while this participant's
+    // pen is down. Otherwise a reported palm radius would erase before the
+    // stylus guard below gets a chance to ignore it.
+    if (event.kind == PointerDeviceKind.touch && stylusCurrentlyActive) {
+      return PointerRole.ignored;
+    }
     if (isEraserContact(event)) return PointerRole.erase;
     if (event.kind == PointerDeviceKind.stylus) {
       if (tool == BoardTool.eraser) return PointerRole.erase;
@@ -88,9 +99,6 @@ class PointerPolicy {
     }
 
     if (event.kind == PointerDeviceKind.touch) {
-      // Small contacts arriving while a pen is down are almost always fingers
-      // resting on the panel. A deliberate broad edge still remains an eraser.
-      if (stylusCurrentlyActive) return PointerRole.ignored;
       if (_isSelectionTool(tool) || selectionActive) return PointerRole.select;
       if (fingerDrawingEnabled &&
           activeNavigationTouches == 0 &&

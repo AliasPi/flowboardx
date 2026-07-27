@@ -17,15 +17,17 @@ abstract interface class BoardAssetResolver {
   String? localPath(String assetId);
 }
 
-class BoardObjectLayer extends StatelessWidget {
+class BoardObjectLayer extends StatefulWidget {
   const BoardObjectLayer({
     required this.objects,
     required this.annotationLayers,
     required this.scale,
     required this.offset,
     required this.assets,
+    this.annotationIndex,
     this.selectedIds = const <String>{},
     this.worldClip,
+    this.objectsAreSceneOrdered = false,
     super.key,
   });
 
@@ -34,31 +36,69 @@ class BoardObjectLayer extends StatelessWidget {
   final double scale;
   final Offset offset;
   final BoardAssetResolver assets;
+  final VisibleObjectInkLayerIndex? annotationIndex;
   final Set<String> selectedIds;
   final Rect2? worldClip;
 
+  /// Skips the local z-order sort when [objects] already comes from
+  /// [orderedBoardSceneItems].
+  ///
+  /// Board scene runs preserve their source order, so sorting them a second
+  /// time on every viewport frame only creates avoidable lists and comparisons.
+  final bool objectsAreSceneOrdered;
+
+  @override
+  State<BoardObjectLayer> createState() => _BoardObjectLayerState();
+}
+
+class _BoardObjectLayerState extends State<BoardObjectLayer> {
+  VisibleObjectInkLayerIndex? _ownedAnnotationIndex;
+
+  @override
+  void initState() {
+    super.initState();
+    _updateOwnedAnnotationIndex();
+  }
+
+  @override
+  void didUpdateWidget(covariant BoardObjectLayer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!identical(oldWidget.annotationLayers, widget.annotationLayers) ||
+        !identical(oldWidget.annotationIndex, widget.annotationIndex)) {
+      _updateOwnedAnnotationIndex();
+    }
+  }
+
+  void _updateOwnedAnnotationIndex() {
+    _ownedAnnotationIndex = widget.annotationIndex == null
+        ? VisibleObjectInkLayerIndex(widget.annotationLayers)
+        : null;
+  }
+
   @override
   Widget build(BuildContext context) {
-    final visibleLayers = annotationLayers
-        .where((layer) => layer.visible)
-        .toList(growable: false);
-    final sorted = orderedBoardSceneItems(
-      objects: objects.where(
-        (object) =>
-            worldClip == null || object.transform.bounds.intersects(worldClip!),
-      ),
-      strokes: const [],
-    ).map((item) => item.object!).toList(growable: false);
+    final annotationIndex = widget.annotationIndex ?? _ownedAnnotationIndex!;
+    final visibleObjects = widget.objects.where(
+      (object) =>
+          widget.worldClip == null ||
+          object.transform.bounds.intersects(widget.worldClip!),
+    );
+    final sorted = widget.objectsAreSceneOrdered
+        ? visibleObjects.toList(growable: false)
+        : orderedBoardSceneItems(
+            objects: visibleObjects,
+            strokes: const [],
+          ).map((item) => item.object!).toList(growable: false);
     return Stack(
       clipBehavior: Clip.hardEdge,
       children: [
         for (final object in sorted)
           Positioned(
             key: ValueKey('board-object-${object.id}'),
-            left: offset.dx + object.transform.x * scale,
-            top: offset.dy + object.transform.y * scale,
-            width: object.transform.width * scale,
-            height: object.transform.height * scale,
+            left: widget.offset.dx + object.transform.x * widget.scale,
+            top: widget.offset.dy + object.transform.y * widget.scale,
+            width: object.transform.width * widget.scale,
+            height: object.transform.height * widget.scale,
             child: Transform.rotate(
               angle: object.transform.rotationRadians,
               alignment: Alignment.center,
@@ -74,10 +114,10 @@ class BoardObjectLayer extends StatelessWidget {
                         children: [
                           _ObjectBody(
                             object: object,
-                            assets: assets,
-                            displayScale: scale,
+                            assets: widget.assets,
+                            displayScale: widget.scale,
                           ),
-                          if (activeObjectInkLayer(object, visibleLayers)
+                          if (annotationIndex.layerFor(object)
                               case final layer?)
                             CustomPaint(
                               painter: _NormalizedAnnotationPainter(layer),
@@ -92,6 +132,41 @@ class BoardObjectLayer extends StatelessWidget {
           ),
       ],
     );
+  }
+}
+
+/// Immutable O(1) lookup for the visible annotation attached to an object.
+///
+/// Input order is significant: duplicate legacy or page-specific layers retain
+/// the first match, exactly like [activeObjectInkLayer]. A PDF first attempts
+/// its active source page and then falls back to its first unscoped legacy
+/// layer. Other object types use only that unscoped layer.
+class VisibleObjectInkLayerIndex {
+  VisibleObjectInkLayerIndex(Iterable<ObjectInkLayer> layers) {
+    for (final layer in layers) {
+      if (!layer.visible) continue;
+      final pageIndex = layer.pdfPageIndex;
+      if (pageIndex == null) {
+        _legacyByObject.putIfAbsent(layer.objectId, () => layer);
+        continue;
+      }
+      (_pageLayersByObject[layer.objectId] ??= <int, ObjectInkLayer>{})
+          .putIfAbsent(pageIndex, () => layer);
+    }
+  }
+
+  final Map<String, ObjectInkLayer> _legacyByObject =
+      <String, ObjectInkLayer>{};
+  final Map<String, Map<int, ObjectInkLayer>> _pageLayersByObject =
+      <String, Map<int, ObjectInkLayer>>{};
+
+  ObjectInkLayer? layerFor(BoardObject object) {
+    if (object is PdfObject) {
+      final exact =
+          _pageLayersByObject[object.id]?[object.activeSourcePageIndex];
+      if (exact != null) return exact;
+    }
+    return _legacyByObject[object.id];
   }
 }
 
