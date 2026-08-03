@@ -795,9 +795,15 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
   void _activateTertiary(int index) {
     if (_controller.activeBranch == RadialMenuBranch.pen) {
       if (index >= 0 && index < RadialPenType.values.length) {
-        _updatePen(
-          _controller.penSettings.copyWith(type: RadialPenType.values[index]),
-        );
+        final type = RadialPenType.values[index];
+        _updatePen(_controller.penSettings.copyWith(type: type));
+        if (type == RadialPenType.eraser) {
+          // Erasing is a complete tool, not another configurable pen family.
+          // Keep the primary ring available, but dismiss the colour/type fan
+          // immediately so selecting the eraser never appears to open another
+          // Stift/Marker/Gestrichelt/Gerade/Radierer choice.
+          _controller.setBranch(null);
+        }
       }
       return;
     }

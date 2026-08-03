@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../app/app_theme.dart';
-import '../../domain/model/ink.dart';
+import '../radial_menu/radial_menu_models.dart';
 import '../radial_menu/radial_menu_widget.dart';
 
 /// Compact access to the current pen colour without opening the radial menu.
@@ -69,9 +69,10 @@ class EditorPenColorQuickButton extends StatelessWidget {
   }
 }
 
-/// Fast switching between the handwriting modes most often used in class.
-/// Marker remains available in the radial menu; if it is active, its icon is
-/// still represented here until one of these three quick modes is selected.
+/// Fast switching between every drawing tool exposed by the pen fan.
+///
+/// [RadialPenType] is used deliberately instead of [InkToolType]: an eraser is
+/// an input tool and must not be persisted as an ink stroke style.
 class EditorPenTypeQuickButton extends StatelessWidget {
   const EditorPenTypeQuickButton({
     required this.type,
@@ -80,19 +81,21 @@ class EditorPenTypeQuickButton extends StatelessWidget {
     super.key,
   });
 
-  static const List<InkToolType> quickTypes = <InkToolType>[
-    InkToolType.normal,
-    InkToolType.dashed,
-    InkToolType.straightLine,
+  static const List<RadialPenType> quickTypes = <RadialPenType>[
+    RadialPenType.normal,
+    RadialPenType.marker,
+    RadialPenType.dashed,
+    RadialPenType.straight,
+    RadialPenType.eraser,
   ];
 
-  final InkToolType type;
-  final ValueChanged<InkToolType> onTypeSelected;
+  final RadialPenType type;
+  final ValueChanged<RadialPenType> onTypeSelected;
   final String? controlId;
 
   @override
   Widget build(BuildContext context) {
-    return PopupMenuButton<InkToolType>(
+    return PopupMenuButton<RadialPenType>(
       key: ValueKey(
         controlId == null
             ? 'editor-pen-type-quick-button'
@@ -101,9 +104,9 @@ class EditorPenTypeQuickButton extends StatelessWidget {
       tooltip: 'Stiftart',
       initialValue: quickTypes.contains(type) ? type : null,
       onSelected: onTypeSelected,
-      itemBuilder: (context) => <PopupMenuEntry<InkToolType>>[
+      itemBuilder: (context) => <PopupMenuEntry<RadialPenType>>[
         for (final candidate in quickTypes)
-          PopupMenuItem<InkToolType>(
+          PopupMenuItem<RadialPenType>(
             value: candidate,
             child: ListTile(
               dense: true,
@@ -123,26 +126,25 @@ class EditorPenTypeQuickButton extends StatelessWidget {
             ),
           ),
       ],
-      icon: Icon(
-        editorPenTypeIcon(type),
-        color: quickTypes.contains(type) ? FlowboardColors.mint : null,
-      ),
+      icon: Icon(editorPenTypeIcon(type), color: FlowboardColors.mint),
     );
   }
 }
 
-IconData editorPenTypeIcon(InkToolType type) => switch (type) {
-  InkToolType.normal => Icons.edit_rounded,
-  InkToolType.marker => Icons.border_color_rounded,
-  InkToolType.dashed => Icons.more_horiz_rounded,
-  InkToolType.straightLine => Icons.show_chart_rounded,
+IconData editorPenTypeIcon(RadialPenType type) => switch (type) {
+  RadialPenType.normal => Icons.edit_rounded,
+  RadialPenType.marker => Icons.border_color_rounded,
+  RadialPenType.dashed => Icons.more_horiz_rounded,
+  RadialPenType.straight => Icons.show_chart_rounded,
+  RadialPenType.eraser => Icons.cleaning_services_rounded,
 };
 
-String editorPenTypeLabel(InkToolType type) => switch (type) {
-  InkToolType.normal => 'Normal',
-  InkToolType.marker => 'Marker',
-  InkToolType.dashed => 'Gestrichelt',
-  InkToolType.straightLine => 'Gerade Linie',
+String editorPenTypeLabel(RadialPenType type) => switch (type) {
+  RadialPenType.normal => 'Normal',
+  RadialPenType.marker => 'Marker',
+  RadialPenType.dashed => 'Gestrichelt',
+  RadialPenType.straight => 'Gerade Linie',
+  RadialPenType.eraser => 'Radiergummi',
 };
 
 class _CurrentColorGlyph extends StatelessWidget {

@@ -336,7 +336,7 @@ ausgeführt, ist stattdessen in den SMART-Ink-Fensterwerkzeugen
   jeweiligen Bedienhälfte und beim Schließen kehrt das Zentrum an seine
   vorherige Randposition zurück. „Menüposition zurücksetzen“ in der Kopfleiste
   zentriert es im Sichtfeld
-- Stiftfarbe und die häufigen Stiftarten Normal, Gestrichelt und Gerade Linie
+- Stiftfarbe sowie Normal, Marker, Gestrichelt, Gerade Linie und Radiergummi
   lassen sich direkt in der Kopfleiste wechseln; auf schmalen Displays liegen
   dieselben Schnellaktionen im Überlaufmenü
 - bereits aktive Hauptfunktion erneut wählen: deren Außenringe einklappen

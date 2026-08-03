@@ -141,7 +141,7 @@ class RadialMenuPainter extends CustomPainter {
   };
 
   int get tertiaryCount {
-    // Pen types are one visual control. Its four internal choices are mapped
+    // Pen types are one visual control. Its five internal choices are mapped
     // in [hitTargetAt] and exposed separately to accessibility services.
     if (branch == RadialMenuBranch.pen) return 1;
     if (branch != RadialMenuBranch.insert) return 0;

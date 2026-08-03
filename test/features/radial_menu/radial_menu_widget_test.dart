@@ -207,7 +207,7 @@ void main() {
   });
 
   testWidgets(
-    'eraser uses automatic size and removes the ink thickness slider',
+    'eraser activates directly and dismisses the configurable pen fan',
     (tester) async {
       final controller = RadialMenuController(isOpen: true);
       addTearDown(controller.dispose);
@@ -248,15 +248,35 @@ void main() {
           tester.widget<CustomPaint>(surface).painter! as RadialMenuPainter;
       expect(controller.penSettings.type, RadialPenType.eraser);
       expect(controller.penSettings.thickness, 8);
+      expect(controller.isOpen, isTrue);
+      expect(controller.activeBranch, isNull);
+      expect(painter.branch, isNull);
+      expect(painter.tertiaryCount, 0);
       expect(painter.hasThicknessSlider, isFalse);
-      expect(
-        painter
-            .semanticsBuilder(size)
-            .map((entry) => entry.properties.label)
-            .whereType<String>(),
-        contains('Radiergummi, automatische Größe'),
-      );
+      final labels = painter
+          .semanticsBuilder(size)
+          .map((entry) => entry.properties.label)
+          .whereType<String>();
+      expect(labels, isNot(contains('Radiergummi, automatische Größe')));
+      expect(labels, isNot(contains('Normal')));
+      expect(labels, isNot(contains('Marker')));
       expect(changes.last.type, RadialPenType.eraser);
+
+      // Reopening the pen branch intentionally restores its safe defaults;
+      // selecting the eraser again must remain a one-step, collapsing action.
+      await tester.tapAt(pen);
+      await tester.pumpAndSettle();
+      expect(controller.activeBranch, RadialMenuBranch.pen);
+      expect(controller.penSettings, const RadialPenSettings());
+      await tester.tapAt(eraser);
+      await tester.pumpAndSettle();
+      expect(controller.activeBranch, isNull);
+      expect(controller.penSettings.type, RadialPenType.eraser);
+      expect(changes.map((settings) => settings.type), <RadialPenType>[
+        RadialPenType.eraser,
+        RadialPenType.normal,
+        RadialPenType.eraser,
+      ]);
     },
   );
 

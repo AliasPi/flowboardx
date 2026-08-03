@@ -383,8 +383,7 @@ class _EditorScreenState extends State<EditorScreen>
                         _applyQuickPen(editor, color: color),
                     onCustomPenColorRequested: (editor) =>
                         unawaited(_chooseQuickPenColor(editor)),
-                    onPenTypeChanged: (editor, type) =>
-                        _applyQuickPen(editor, type: type),
+                    onPenTypeChanged: _applyQuickPenType,
                     onAddPage: (editor) => _addPageAndShowWheel(
                       editor: editor,
                       source: identical(editor, _secondaryEditor)
@@ -832,6 +831,20 @@ class _EditorScreenState extends State<EditorScreen>
         type: _radialType(nextType),
       ),
     );
+  }
+
+  void _applyQuickPenType(EditorController editor, RadialPenType type) {
+    final inkType = _inkType(type);
+    if (inkType != null) {
+      _applyQuickPen(editor, type: inkType);
+      return;
+    }
+
+    final secondary = identical(editor, _secondaryEditor);
+    final participant = secondary ? _secondaryParticipant : _primaryParticipant;
+    final radial = secondary ? _secondaryRadial : _radial;
+    _setParticipantTool(participant, BoardTool.eraser);
+    radial.setPenSettings(radial.penSettings.copyWith(type: type));
   }
 
   Future<void> _chooseQuickPenColor(EditorController editor) async {
@@ -2342,7 +2355,8 @@ class _ParticipantPenQuickControls extends StatelessWidget {
   final EditorController controller;
   final void Function(EditorController editor, Color color) onColorChanged;
   final ValueChanged<EditorController> onCustomColorRequested;
-  final void Function(EditorController editor, InkToolType type) onTypeChanged;
+  final void Function(EditorController editor, RadialPenType type)
+  onTypeChanged;
 
   @override
   Widget build(BuildContext context) {
@@ -2373,7 +2387,14 @@ class _ParticipantPenQuickControls extends StatelessWidget {
           ),
           EditorPenTypeQuickButton(
             controlId: controlId,
-            type: controller.penStyle.type,
+            type: controller.tool == BoardTool.eraser
+                ? RadialPenType.eraser
+                : switch (controller.penStyle.type) {
+                    InkToolType.normal => RadialPenType.normal,
+                    InkToolType.marker => RadialPenType.marker,
+                    InkToolType.dashed => RadialPenType.dashed,
+                    InkToolType.straightLine => RadialPenType.straight,
+                  },
             onTypeSelected: (type) => onTypeChanged(controller, type),
           ),
         ],
@@ -2426,7 +2447,7 @@ class _EditorTopBar extends StatelessWidget {
   final VoidCallback onShowLargeTimer;
   final void Function(EditorController editor, Color color) onPenColorChanged;
   final ValueChanged<EditorController> onCustomPenColorRequested;
-  final void Function(EditorController editor, InkToolType type)
+  final void Function(EditorController editor, RadialPenType type)
   onPenTypeChanged;
   final ValueChanged<EditorController> onAddPage;
   final Future<void> Function(EditorController, String) onDeletePage;
@@ -2619,30 +2640,44 @@ class _EditorTopBar extends StatelessWidget {
                           case _EditorTopBarAction.penColor:
                             onCustomPenColorRequested(controller);
                           case _EditorTopBarAction.penNormal:
-                            onPenTypeChanged(controller, InkToolType.normal);
+                            onPenTypeChanged(controller, RadialPenType.normal);
+                          case _EditorTopBarAction.penMarker:
+                            onPenTypeChanged(controller, RadialPenType.marker);
                           case _EditorTopBarAction.penDashed:
-                            onPenTypeChanged(controller, InkToolType.dashed);
+                            onPenTypeChanged(controller, RadialPenType.dashed);
                           case _EditorTopBarAction.penStraight:
                             onPenTypeChanged(
                               controller,
-                              InkToolType.straightLine,
+                              RadialPenType.straight,
                             );
+                          case _EditorTopBarAction.penEraser:
+                            onPenTypeChanged(controller, RadialPenType.eraser);
                           case _EditorTopBarAction.secondaryPenColor:
                             onCustomPenColorRequested(secondaryController);
                           case _EditorTopBarAction.secondaryPenNormal:
                             onPenTypeChanged(
                               secondaryController,
-                              InkToolType.normal,
+                              RadialPenType.normal,
+                            );
+                          case _EditorTopBarAction.secondaryPenMarker:
+                            onPenTypeChanged(
+                              secondaryController,
+                              RadialPenType.marker,
                             );
                           case _EditorTopBarAction.secondaryPenDashed:
                             onPenTypeChanged(
                               secondaryController,
-                              InkToolType.dashed,
+                              RadialPenType.dashed,
                             );
                           case _EditorTopBarAction.secondaryPenStraight:
                             onPenTypeChanged(
                               secondaryController,
-                              InkToolType.straightLine,
+                              RadialPenType.straight,
+                            );
+                          case _EditorTopBarAction.secondaryPenEraser:
+                            onPenTypeChanged(
+                              secondaryController,
+                              RadialPenType.eraser,
                             );
                           case _EditorTopBarAction.previousPrimaryPage:
                             controller.previousPage();
@@ -2691,6 +2726,13 @@ class _EditorTopBar extends StatelessWidget {
                             ),
                           ),
                           const PopupMenuItem(
+                            value: _EditorTopBarAction.penMarker,
+                            child: ListTile(
+                              leading: Icon(Icons.border_color_rounded),
+                              title: Text('Stift: Marker'),
+                            ),
+                          ),
+                          const PopupMenuItem(
                             value: _EditorTopBarAction.penDashed,
                             child: ListTile(
                               leading: Icon(Icons.more_horiz_rounded),
@@ -2702,6 +2744,13 @@ class _EditorTopBar extends StatelessWidget {
                             child: ListTile(
                               leading: Icon(Icons.show_chart_rounded),
                               title: Text('Stift: Gerade Linie'),
+                            ),
+                          ),
+                          const PopupMenuItem(
+                            value: _EditorTopBarAction.penEraser,
+                            child: ListTile(
+                              leading: Icon(Icons.cleaning_services_rounded),
+                              title: Text('Stift: Radiergummi'),
                             ),
                           ),
                           if (split) ...[
@@ -2725,6 +2774,13 @@ class _EditorTopBar extends StatelessWidget {
                               ),
                             ),
                             const PopupMenuItem(
+                              value: _EditorTopBarAction.secondaryPenMarker,
+                              child: ListTile(
+                                leading: Icon(Icons.border_color_rounded),
+                                title: Text('Stift: Marker'),
+                              ),
+                            ),
+                            const PopupMenuItem(
                               value: _EditorTopBarAction.secondaryPenDashed,
                               child: ListTile(
                                 leading: Icon(Icons.more_horiz_rounded),
@@ -2736,6 +2792,13 @@ class _EditorTopBar extends StatelessWidget {
                               child: ListTile(
                                 leading: Icon(Icons.show_chart_rounded),
                                 title: Text('Stift: Gerade Linie'),
+                              ),
+                            ),
+                            const PopupMenuItem(
+                              value: _EditorTopBarAction.secondaryPenEraser,
+                              child: ListTile(
+                                leading: Icon(Icons.cleaning_services_rounded),
+                                title: Text('Stift: Radiergummi'),
                               ),
                             ),
                           ],
@@ -3004,12 +3067,16 @@ class _EditorTopBar extends StatelessWidget {
 enum _EditorTopBarAction {
   penColor,
   penNormal,
+  penMarker,
   penDashed,
   penStraight,
+  penEraser,
   secondaryPenColor,
   secondaryPenNormal,
+  secondaryPenMarker,
   secondaryPenDashed,
   secondaryPenStraight,
+  secondaryPenEraser,
   pages,
   saveTemplate,
   resetMenu,

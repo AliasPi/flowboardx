@@ -3,10 +3,10 @@ import 'dart:io';
 
 import 'package:flowboard_x/src/data/document_repository.dart';
 import 'package:flowboard_x/src/domain/model/document.dart';
-import 'package:flowboard_x/src/domain/model/ink.dart';
 import 'package:flowboard_x/src/features/board/presentation/board_surface.dart';
 import 'package:flowboard_x/src/features/editor/editor_pen_quick_controls.dart';
 import 'package:flowboard_x/src/features/editor/editor_screen.dart';
+import 'package:flowboard_x/src/features/radial_menu/radial_menu_models.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -133,7 +133,7 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(secondaryTypeFinder);
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Gestrichelt'));
+    await tester.tap(find.text('Radiergummi'));
     await tester.pumpAndSettle();
 
     final primaryColorControl = find.ancestor(
@@ -162,17 +162,71 @@ void main() {
     );
     expect(
       tester.widget<EditorPenTypeQuickButton>(primaryTypeControl).type,
-      InkToolType.normal,
+      RadialPenType.normal,
     );
     expect(
       tester.widget<EditorPenTypeQuickButton>(secondaryTypeControl).type,
-      InkToolType.dashed,
+      RadialPenType.eraser,
     );
     expect(tester.takeException(), isNull);
 
     await tester.tap(find.byTooltip('Übersicht'));
     await tester.pumpAndSettle();
     expect(find.text('Dokumentübersicht'), findsOneWidget);
+  });
+
+  testWidgets('compact top bar overflow applies marker and eraser choices', (
+    tester,
+  ) async {
+    tester.view.devicePixelRatio = 1;
+    tester.view.physicalSize = const Size(600, 900);
+    final directory = (await tester.runAsync(
+      () => Directory.systemTemp.createTemp('flowboard-editor-compact-pen-'),
+    ))!;
+    final document = WhiteboardDocument.create(
+      id: 'editor-compact-pen-controls',
+      now: DateTime.utc(2026, 8, 3, 12),
+    );
+    final repository = _MemoryRepository(directory, document);
+    addTearDown(() async {
+      tester.view.resetDevicePixelRatio();
+      tester.view.resetPhysicalSize();
+      await tester.runAsync(() async {
+        if (await directory.exists()) {
+          await directory.delete(recursive: true);
+        }
+      });
+    });
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: EditorScreen(
+          document: document,
+          repository: repository,
+          assetDirectory: directory,
+        ),
+      ),
+    );
+    await tester.pump();
+
+    await tester.tap(find.byTooltip('Weitere Aktionen'));
+    await tester.pumpAndSettle();
+    expect(find.text('Stift: Marker'), findsOneWidget);
+    expect(find.text('Stift: Radiergummi'), findsOneWidget);
+    await tester.tap(find.text('Stift: Radiergummi'));
+    await tester.pumpAndSettle();
+
+    // Make the direct control visible and verify that the compact command
+    // changed the participant's actual tool, not only the menu chrome.
+    tester.view.physicalSize = const Size(800, 900);
+    await tester.pumpAndSettle();
+    final typeControl = find.byType(EditorPenTypeQuickButton);
+    expect(typeControl, findsOneWidget);
+    expect(
+      tester.widget<EditorPenTypeQuickButton>(typeControl).type,
+      RadialPenType.eraser,
+    );
+    expect(tester.takeException(), isNull);
   });
 }
 
