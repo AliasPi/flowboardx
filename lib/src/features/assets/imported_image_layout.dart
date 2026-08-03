@@ -42,6 +42,15 @@ final class ImportedImageLayout {
   static const int maximumAxisPixels = 16384;
   static const int maximumPixelCount = 32 * 1024 * 1024;
 
+  /// Upper decode tier for one visible board image.
+  ///
+  /// A 4096 x 4096 RGBA cache entry occupies about 64 MiB before GPU copies.
+  /// Zooming through several tiers, or showing two photos, can then evict ink
+  /// pictures and trigger GC/raster churn on classroom hardware. 3072 still
+  /// covers a 4K board with high visual fidelity while bounding a square frame
+  /// to about 36 MiB. The encoded source remains untouched for export.
+  static const int maximumBoardDecodeAxis = 3072;
+
   /// Fits [intrinsicSize] into the standard insertion footprint while keeping
   /// its exact aspect ratio. Invalid or unsupported images retain the legacy
   /// footprint so import rollback and older platform codecs remain defensive.
@@ -200,10 +209,17 @@ int _finitePixels(double value) => value.isFinite ? value.round() : 512;
 
 int _decodeTier(int requested) {
   if (requested <= 0) return 128;
-  for (final tier in const [128, 256, 512, 1024, 2048, 4096]) {
+  for (final tier in const [
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    ImportedImageLayout.maximumBoardDecodeAxis,
+  ]) {
     if (requested <= tier) return tier;
   }
-  return 4096;
+  return ImportedImageLayout.maximumBoardDecodeAxis;
 }
 
 const int _maximumHeaderScan = 2 * 1024 * 1024;

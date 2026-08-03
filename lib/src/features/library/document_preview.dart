@@ -8,7 +8,6 @@ import '../../domain/model/geometry.dart';
 import '../../domain/model/ink.dart';
 import '../../domain/model/scene_order.dart';
 import '../board/presentation/dashed_ink_path.dart';
-import '../board/presentation/ink_painter.dart';
 import '../editor/text_object_layout.dart';
 
 /// Lightweight, asset-independent page preview. Raster assets intentionally use
@@ -119,11 +118,11 @@ class DocumentPagePreviewPainter extends CustomPainter {
         for (var index = 0; index < count; index++) {
           _paintStroke(
             canvas,
-            InkPainter.objectLocalStrokeToCanvas(
-              layer.strokes[index],
-              objectSize,
-            ),
+            layer.strokes[index],
             scale,
+            xScale: objectSize.width,
+            yScale: objectSize.height,
+            widthScale: math.min(objectSize.width, objectSize.height),
           );
         }
         canvas.restore();
@@ -507,11 +506,18 @@ class DocumentPagePreviewPainter extends CustomPainter {
     painter.dispose();
   }
 
-  void _paintStroke(Canvas canvas, InkStroke stroke, double scale) {
+  void _paintStroke(
+    Canvas canvas,
+    InkStroke stroke,
+    double scale, {
+    double xScale = 1,
+    double yScale = 1,
+    double widthScale = 1,
+  }) {
     final points = stroke.points;
     if (points.isEmpty) return;
     final validPoints = points.where(
-      (point) => point.x.isFinite && point.y.isFinite,
+      (point) => (point.x * xScale).isFinite && (point.y * yScale).isFinite,
     );
     if (validPoints.isEmpty) return;
     final sampled = _sample(validPoints.toList(growable: false));
@@ -522,11 +528,11 @@ class DocumentPagePreviewPainter extends CustomPainter {
       ..strokeCap = marker ? StrokeCap.square : StrokeCap.round
       ..strokeJoin = StrokeJoin.round
       ..style = PaintingStyle.stroke
-      ..strokeWidth = safePreviewStrokeWidth(stroke.width, scale);
+      ..strokeWidth = safePreviewStrokeWidth(stroke.width * widthScale, scale);
 
     if (sampled.length == 1) {
       canvas.drawCircle(
-        Offset(sampled.first.x, sampled.first.y),
+        Offset(sampled.first.x * xScale, sampled.first.y * yScale),
         paint.strokeWidth / 2,
         Paint()..color = paint.color,
       );
@@ -534,19 +540,26 @@ class DocumentPagePreviewPainter extends CustomPainter {
     }
     if (stroke.type == InkToolType.straightLine) {
       canvas.drawLine(
-        Offset(sampled.first.x, sampled.first.y),
-        Offset(sampled.last.x, sampled.last.y),
+        Offset(sampled.first.x * xScale, sampled.first.y * yScale),
+        Offset(sampled.last.x * xScale, sampled.last.y * yScale),
         paint,
       );
       return;
     }
     if (stroke.type == InkToolType.dashed) {
-      _paintDashedStroke(canvas, sampled, paint);
+      _paintDashedStroke(
+        canvas,
+        sampled,
+        paint,
+        xScale: xScale,
+        yScale: yScale,
+      );
       return;
     }
-    final path = Path()..moveTo(sampled.first.x, sampled.first.y);
+    final path = Path()
+      ..moveTo(sampled.first.x * xScale, sampled.first.y * yScale);
     for (var index = 1; index < sampled.length; index++) {
-      path.lineTo(sampled[index].x, sampled[index].y);
+      path.lineTo(sampled[index].x * xScale, sampled[index].y * yScale);
     }
     canvas.drawPath(path, paint);
   }
@@ -562,16 +575,30 @@ class DocumentPagePreviewPainter extends CustomPainter {
     return sampled;
   }
 
-  void _paintDashedStroke(Canvas canvas, List<InkPoint> points, Paint paint) {
+  void _paintDashedStroke(
+    Canvas canvas,
+    List<InkPoint> points,
+    Paint paint, {
+    double xScale = 1,
+    double yScale = 1,
+  }) {
     final dash = math.max(8.0, paint.strokeWidth * 2);
     final gap = math.max(5.0, paint.strokeWidth * 1.2);
-    final result = DashedInkPathBuilder.build(
-      points: points.map((point) => Offset(point.x, point.y)),
+    final result = DashedInkPathBuilder.buildMapped<InkPoint>(
+      points: points,
+      xOf: _inkPointX,
+      yOf: _inkPointY,
       dashLength: dash,
       gapLength: gap,
+      xScale: xScale,
+      yScale: yScale,
     );
     if (result.commandCount > 0) canvas.drawPath(result.path, paint);
   }
+
+  static double _inkPointX(InkPoint point) => point.x;
+
+  static double _inkPointY(InkPoint point) => point.y;
 
   /// Keeps both corrupt persisted widths and the inverse-scale minimum away
   /// from values that can destabilize the native rasterizer.

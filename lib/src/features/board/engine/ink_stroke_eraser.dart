@@ -39,6 +39,8 @@ final class InkStrokeEraser {
     required double radius,
     required ErasedStrokeIdFactory idFactory,
     InkPointProjection? project,
+    double? eraseMinimumX,
+    double? eraseMaximumX,
   }) {
     if (stroke.points.isEmpty ||
         !_isFinite(eraserStart) ||
@@ -65,12 +67,17 @@ final class InkStrokeEraser {
 
     if (stroke.points.length == 1) {
       final erased =
+          _xInsideErasePartition(
+            projected.single.x,
+            eraseMinimumX,
+            eraseMaximumX,
+          ) &&
           _pointToSegmentDistanceSquared(
-            projected.single,
-            eraserStart,
-            eraserEnd,
-          ) <=
-          radius * radius;
+                projected.single,
+                eraserStart,
+                eraserEnd,
+              ) <=
+              radius * radius;
       return InkStrokeEraseResult(
         changed: erased,
         fragments: erased ? const <InkStroke>[] : <InkStroke>[stroke],
@@ -94,6 +101,8 @@ final class InkStrokeEraser {
         eraserStart,
         eraserEnd,
         radius,
+        eraseMinimumX: eraseMinimumX,
+        eraseMaximumX: eraseMaximumX,
       );
       if (keptIntervals.length != 1 ||
           keptIntervals.single.start > _parameterEpsilon ||
@@ -164,14 +173,31 @@ final class InkStrokeEraser {
     Vec2 strokeEnd,
     Vec2 eraserStart,
     Vec2 eraserEnd,
-    double radius,
-  ) {
+    double radius, {
+    double? eraseMinimumX,
+    double? eraseMaximumX,
+  }) {
     final breakpoints = <double>[0, 1];
     final eraserDx = eraserEnd.x - eraserStart.x;
     final eraserDy = eraserEnd.y - eraserStart.y;
     final eraserLengthSquared = eraserDx * eraserDx + eraserDy * eraserDy;
     final strokeDx = strokeEnd.x - strokeStart.x;
     final strokeDy = strokeEnd.y - strokeStart.y;
+
+    if (strokeDx.abs() > _parameterEpsilon) {
+      if (eraseMinimumX != null && eraseMinimumX.isFinite) {
+        _addUnitBreakpoint(
+          breakpoints,
+          (eraseMinimumX - strokeStart.x) / strokeDx,
+        );
+      }
+      if (eraseMaximumX != null && eraseMaximumX.isFinite) {
+        _addUnitBreakpoint(
+          breakpoints,
+          (eraseMaximumX - strokeStart.x) / strokeDx,
+        );
+      }
+    }
 
     if (eraserLengthSquared > _positionEpsilonSquared) {
       final projectionStart =
@@ -230,8 +256,14 @@ final class InkStrokeEraser {
         strokeStart.x + strokeDx * middle,
         strokeStart.y + strokeDy * middle,
       );
-      if (_pointToSegmentDistanceSquared(point, eraserStart, eraserEnd) >
-          radius * radius) {
+      final insidePartition = _xInsideErasePartition(
+        point.x,
+        eraseMinimumX,
+        eraseMaximumX,
+      );
+      if (!insidePartition ||
+          _pointToSegmentDistanceSquared(point, eraserStart, eraserEnd) >
+              radius * radius) {
         if (outside.isNotEmpty &&
             (outside.last.end - start).abs() <= _parameterEpsilon) {
           outside[outside.length - 1] = _ParameterInterval(
@@ -398,6 +430,14 @@ final class InkStrokeEraser {
   }
 
   static bool _isFinite(Vec2 point) => point.x.isFinite && point.y.isFinite;
+
+  static bool _xInsideErasePartition(
+    double x,
+    double? minimum,
+    double? maximum,
+  ) =>
+      (minimum == null || !minimum.isFinite || x >= minimum) &&
+      (maximum == null || !maximum.isFinite || x <= maximum);
 
   static void _addUnitBreakpoint(List<double> values, double value) {
     if (value.isFinite &&

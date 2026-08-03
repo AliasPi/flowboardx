@@ -56,6 +56,51 @@ void main() {
     );
     expect(resolver.byteReads, 1);
   });
+
+  testWidgets('viewport culling does not probe the same image asset again', (
+    tester,
+  ) async {
+    final resolver = _MemoryResolver(
+      _pngHeader(width: ImportedImageLayout.maximumAxisPixels + 1, height: 100),
+    );
+    final image = ImageObject(
+      id: 'culled-image',
+      transform: const ObjectTransform(x: 20, y: 20, width: 120, height: 80),
+      assetId: 'asset',
+    );
+
+    Future<void> pump(Rect2 clip) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: SizedBox(
+            width: 400,
+            height: 300,
+            child: BoardObjectLayer(
+              objects: <BoardObject>[image],
+              annotationLayers: const <ObjectInkLayer>[],
+              scale: 1,
+              offset: Offset.zero,
+              assets: resolver,
+              worldClip: clip,
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+    }
+
+    await pump(const Rect2(left: 0, top: 0, width: 400, height: 300));
+    expect(resolver.byteReads, 1);
+
+    await pump(const Rect2(left: 1000, top: 1000, width: 400, height: 300));
+    expect(
+      find.byKey(const ValueKey<String>('board-object-culled-image')),
+      findsNothing,
+    );
+
+    await pump(const Rect2(left: 0, top: 0, width: 400, height: 300));
+    expect(resolver.byteReads, 1);
+  });
 }
 
 final class _MemoryResolver implements BoardAssetResolver {

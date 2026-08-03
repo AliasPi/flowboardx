@@ -1,10 +1,26 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 
 import '../model/board_object.dart';
 import '../model/document.dart';
 import '../model/ink.dart';
 import 'document_command.dart';
+
+/// Structural performance counters for deterministic scale regression tests.
+final class CommandHistoryDiagnostics {
+  int singlePageTransitions = 0;
+  int deepPageMerges = 0;
+  int genericPageMerges = 0;
+  int referencedAssetPageScans = 0;
+
+  void reset() {
+    singlePageTransitions = 0;
+    deepPageMerges = 0;
+    genericPageMerges = 0;
+    referencedAssetPageScans = 0;
+  }
+}
 
 final class CommandHistory {
   static const String defaultOwnerId = 'default';
@@ -13,7 +29,9 @@ final class CommandHistory {
     WhiteboardDocument initial, {
     this.maxDepth = 200,
     DateTime Function()? clock,
+    CommandHistoryDiagnostics? diagnostics,
   }) : _clock = clock ?? DateTime.now,
+       diagnostics = diagnostics ?? CommandHistoryDiagnostics(),
        _document = initial {
     if (maxDepth < 1) {
       throw ArgumentError.value(maxDepth, 'maxDepth', 'muss positiv sein');
@@ -22,9 +40,10 @@ final class CommandHistory {
 
   final int maxDepth;
   final DateTime Function() _clock;
-  final List<_HistoryEntry> _entries = [];
-  final Map<String, List<_HistoryEntry>> _undoStacks = {};
-  final Map<String, List<_HistoryEntry>> _redoStacks = {};
+  final CommandHistoryDiagnostics diagnostics;
+  final ListQueue<_HistoryEntry> _entries = ListQueue<_HistoryEntry>();
+  final Map<String, ListQueue<_HistoryEntry>> _undoStacks = {};
+  final Map<String, ListQueue<_HistoryEntry>> _redoStacks = {};
   final StreamController<WhiteboardDocument> _changes =
       StreamController.broadcast(sync: true);
   WhiteboardDocument _document;
@@ -57,7 +76,10 @@ final class CommandHistory {
     _stack(_undoStacks, normalizedOwner).add(entry);
     final abandonedRedo = _stack(_redoStacks, normalizedOwner);
     if (abandonedRedo.isNotEmpty) {
-      _entries.removeWhere(abandonedRedo.contains);
+      // Avoid O(depth²) ListQueue.contains calls when a new edit abandons a
+      // long redo branch.
+      final abandonedEntries = abandonedRedo.toSet();
+      _entries.removeWhere(abandonedEntries.contains);
       abandonedRedo.clear();
     }
     _trimToMaximumDepth();
@@ -83,6 +105,7 @@ final class CommandHistory {
       current: _document,
       from: entry.after,
       to: entry.before,
+      diagnostics: diagnostics,
     );
     final nextDocument = _withMonotonicRevision(restored, after: _document);
     undoStack.removeLast();
@@ -100,6 +123,7 @@ final class CommandHistory {
       current: _document,
       from: entry.before,
       to: entry.after,
+      diagnostics: diagnostics,
     );
     final nextDocument = _withMonotonicRevision(restored, after: _document);
     redoStack.removeLast();
@@ -155,10 +179,13 @@ final class CommandHistory {
     );
   }
 
-  List<_HistoryEntry> _stack(
-    Map<String, List<_HistoryEntry>> stacks,
+  ListQueue<_HistoryEntry> _stack(
+    Map<String, ListQueue<_HistoryEntry>> stacks,
     String ownerId,
-  ) => stacks.putIfAbsent(_normalizeOwnerId(ownerId), () => <_HistoryEntry>[]);
+  ) => stacks.putIfAbsent(
+    _normalizeOwnerId(ownerId),
+    ListQueue<_HistoryEntry>.new,
+  );
 
   String _normalizeOwnerId(String value) {
     final normalized = value.trim();
@@ -170,10 +197,24 @@ final class CommandHistory {
 
   void _trimToMaximumDepth() {
     while (_entries.length > maxDepth) {
-      final removed = _entries.removeAt(0);
-      _undoStacks[removed.ownerId]?.remove(removed);
-      _redoStacks[removed.ownerId]?.remove(removed);
+      final removed = _entries.removeFirst();
+      _removeOldestReference(_undoStacks[removed.ownerId], removed);
+      _removeOldestReference(_redoStacks[removed.ownerId], removed);
     }
+  }
+
+  void _removeOldestReference(
+    ListQueue<_HistoryEntry>? stack,
+    _HistoryEntry entry,
+  ) {
+    if (stack == null || stack.isEmpty) return;
+    if (identical(stack.first, entry)) {
+      stack.removeFirst();
+      return;
+    }
+    // A participant-scoped undo can move an old global entry into the redo
+    // queue. That uncommon branch still needs identity-correct removal.
+    stack.remove(entry);
   }
 
   void _ensureActive() {
@@ -196,15 +237,14 @@ WhiteboardDocument _applyTransition({
   required WhiteboardDocument current,
   required WhiteboardDocument from,
   required WhiteboardDocument to,
+  required CommandHistoryDiagnostics diagnostics,
 }) {
   final currentPageId = current.currentPage.id;
-  final pages = _mergeItems<BoardPage>(
-    current: current.pages,
-    from: from.pages,
-    to: to.pages,
-    idOf: (page) => page.id,
-    same: _samePage,
-    mergeModified: _mergePage,
+  final pages = _mergeDocumentPages(
+    current: current,
+    from: from,
+    to: to,
+    diagnostics: diagnostics,
   );
   if (pages.isEmpty) {
     // A valid command may never remove the final page. Treat malformed history
@@ -236,12 +276,15 @@ WhiteboardDocument _applyTransition({
             ? to.thumbnailAssetId
             : current.thumbnailAssetId
       : current.thumbnailAssetId;
-  final assets = _retainReferencedAssets(
-    merged: mergedAssets,
-    current: current.assets,
-    pages: pages,
-    documentThumbnailAssetId: nextThumbnail,
-  );
+  final assets = identical(from.assets, to.assets)
+      ? current.assets
+      : _retainReferencedAssets(
+          merged: mergedAssets,
+          current: current.assets,
+          pages: pages,
+          documentThumbnailAssetId: nextThumbnail,
+          diagnostics: diagnostics,
+        );
   return current.copyWith(
     title: from.title != to.title && current.title == from.title
         ? to.title
@@ -261,7 +304,77 @@ WhiteboardDocument _applyTransition({
   );
 }
 
-BoardPage _mergePage(BoardPage current, BoardPage from, BoardPage to) {
+List<BoardPage> _mergeDocumentPages({
+  required WhiteboardDocument current,
+  required WhiteboardDocument from,
+  required WhiteboardDocument to,
+  required CommandHistoryDiagnostics diagnostics,
+}) {
+  if (identical(from.pages, to.pages)) return current.pages;
+
+  // Every completed stroke and most object edits replace exactly one page.
+  // The persistent page list carries that proof, so selective undo does not
+  // need to map and compare all 100 pages.
+  final forwardReplacement = to.pages is SingleReplacementModelList<BoardPage>
+      ? (to.pages as SingleReplacementModelList<BoardPage>)
+            .singleReplacementIndexFrom(from.pages)
+      : null;
+  final replacementIndex =
+      forwardReplacement ??
+      (from.pages is SingleReplacementModelList<BoardPage>
+          ? (from.pages as SingleReplacementModelList<BoardPage>)
+                .singleReplacementIndexFrom(to.pages)
+          : null);
+  if (replacementIndex != null) {
+    final sourcePage = from.pages[replacementIndex];
+    final targetPage = to.pages[replacementIndex];
+    if (sourcePage.id == targetPage.id) {
+      final currentIndex = current.pageIndexById(sourcePage.id);
+      if (currentIndex != null) {
+        diagnostics.singlePageTransitions++;
+        final currentPage = current.pages[currentIndex];
+        final mergedPage = identical(currentPage, sourcePage)
+            ? _restorePageContent(targetPage, currentPage.viewport)
+            : _mergePage(
+                currentPage,
+                sourcePage,
+                targetPage,
+                diagnostics: diagnostics,
+              );
+        final result = current.pages.toList(growable: false);
+        result[currentIndex] = mergedPage;
+        return List<BoardPage>.unmodifiable(result);
+      }
+    }
+  }
+
+  diagnostics.genericPageMerges++;
+  return _mergeItems<BoardPage>(
+    current: current.pages,
+    from: from.pages,
+    to: to.pages,
+    idOf: (page) => page.id,
+    same: _samePage,
+    mergeModified: (currentPage, sourcePage, targetPage) => _mergePage(
+      currentPage,
+      sourcePage,
+      targetPage,
+      diagnostics: diagnostics,
+    ),
+    allowDirectTransition: false,
+  );
+}
+
+BoardPage _restorePageContent(BoardPage target, ViewportState viewport) =>
+    target.viewport == viewport ? target : target.copyWith(viewport: viewport);
+
+BoardPage _mergePage(
+  BoardPage current,
+  BoardPage from,
+  BoardPage to, {
+  required CommandHistoryDiagnostics diagnostics,
+}) {
+  diagnostics.deepPageMerges++;
   final thumbnailChanged = from.thumbnailAssetId != to.thumbnailAssetId;
   final templateChanged = !_sameNullableJson(
     from.template?.toJson(),
@@ -284,7 +397,9 @@ BoardPage _mergePage(BoardPage current, BoardPage from, BoardPage to) {
           same: (left, right) =>
               _sameEncoded(left, right, (value) => value.toJson()),
           mergeModified: _mergeStroke,
-          canRemove: (stroke, _) => !protectedItemIds.contains(stroke.id),
+          canRemove: protectedItemIds.isEmpty
+              ? null
+              : (stroke, _) => !protectedItemIds.contains(stroke.id),
         ),
         objects: _mergeItems<BoardObject>(
           current: current.objects,
@@ -294,7 +409,9 @@ BoardPage _mergePage(BoardPage current, BoardPage from, BoardPage to) {
           same: (left, right) =>
               _sameEncoded(left, right, (value) => value.toJson()),
           mergeModified: _mergeBoardObject,
-          canRemove: (object, _) => !protectedItemIds.contains(object.id),
+          canRemove: protectedItemIds.isEmpty
+              ? null
+              : (object, _) => !protectedItemIds.contains(object.id),
         ),
         annotationLayers: _mergeItems<ObjectInkLayer>(
           current: current.annotationLayers,
@@ -423,25 +540,33 @@ DocumentMetadata _mergeMetadata(
 }
 
 Set<String> _foreignPersistentReferences(BoardPage current, BoardPage from) {
+  if (identical(current.annotationLayers, from.annotationLayers) &&
+      identical(current.contentGroups, from.contentGroups)) {
+    return const <String>{};
+  }
   final protected = <String>{};
-  final sourceLayers = <String, ObjectInkLayer>{
-    for (final layer in from.annotationLayers) layer.id: layer,
-  };
-  for (final layer in current.annotationLayers) {
-    final source = sourceLayers[layer.id];
-    if (source == null ||
-        !_sameEncoded(source, layer, (value) => value.toJson())) {
-      protected.add(layer.objectId);
+  if (!identical(current.annotationLayers, from.annotationLayers)) {
+    final sourceLayers = <String, ObjectInkLayer>{
+      for (final layer in from.annotationLayers) layer.id: layer,
+    };
+    for (final layer in current.annotationLayers) {
+      final source = sourceLayers[layer.id];
+      if (source == null ||
+          !_sameEncoded(source, layer, (value) => value.toJson())) {
+        protected.add(layer.objectId);
+      }
     }
   }
-  final sourceGroups = <String, ContentGroup>{
-    for (final group in from.contentGroups) group.id: group,
-  };
-  for (final group in current.contentGroups) {
-    final source = sourceGroups[group.id];
-    if (source == null ||
-        !_sameEncoded(source, group, (value) => value.toJson())) {
-      protected.addAll(group.memberIds);
+  if (!identical(current.contentGroups, from.contentGroups)) {
+    final sourceGroups = <String, ContentGroup>{
+      for (final group in from.contentGroups) group.id: group,
+    };
+    for (final group in current.contentGroups) {
+      final source = sourceGroups[group.id];
+      if (source == null ||
+          !_sameEncoded(source, group, (value) => value.toJson())) {
+        protected.addAll(group.memberIds);
+      }
     }
   }
   return protected;
@@ -452,7 +577,9 @@ List<DocumentAsset> _retainReferencedAssets({
   required List<DocumentAsset> current,
   required List<BoardPage> pages,
   required String? documentThumbnailAssetId,
+  required CommandHistoryDiagnostics diagnostics,
 }) {
+  diagnostics.referencedAssetPageScans += pages.length;
   final referenced = <String>{
     ?documentThumbnailAssetId,
     for (final page in pages) ?page.thumbnailAssetId,
@@ -653,7 +780,12 @@ List<T> _mergeItems<T>({
   required bool Function(T left, T right) same,
   _ItemMerger<T>? mergeModified,
   _ItemRemovalGuard<T>? canRemove,
+  bool allowDirectTransition = true,
 }) {
+  if (identical(from, to)) return current;
+  if (allowDirectTransition && canRemove == null && identical(current, from)) {
+    return to;
+  }
   final fromById = <String, T>{for (final item in from) idOf(item): item};
   final toById = <String, T>{for (final item in to) idOf(item): item};
   final currentById = <String, T>{for (final item in current) idOf(item): item};

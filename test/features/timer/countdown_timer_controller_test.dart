@@ -3,7 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   group('CountdownTimerController', () {
-    test('uses a monotonic deadline and delivers the alarm exactly once', () {
+    test('uses a monotonic deadline and starts the alarm on expiry', () {
       final time = _ManualTime();
       var alarmCount = 0;
       final controller = CountdownTimerController(
@@ -25,6 +25,119 @@ void main() {
       time.runDueCallbacks();
       controller.refresh();
       expect(alarmCount, 1);
+    });
+
+    test('repeats the alarm until the user explicitly acknowledges it', () {
+      final time = _ManualTime();
+      var alarmCount = 0;
+      final controller = CountdownTimerController(
+        initialDuration: const Duration(seconds: 2),
+        now: time.now,
+        scheduler: time.schedule,
+        alarmRepeatInterval: const Duration(milliseconds: 750),
+        onAlarm: () => alarmCount++,
+      );
+      addTearDown(controller.dispose);
+
+      controller.start();
+      time.elapse(const Duration(seconds: 2));
+
+      expect(controller.status, CountdownTimerStatus.finished);
+      expect(controller.isAlarmActive, isTrue);
+      expect(controller.state.alarmActive, isTrue);
+      expect(alarmCount, 1, reason: 'Expiry sounds immediately.');
+
+      time.elapse(const Duration(milliseconds: 2250));
+      expect(alarmCount, 4, reason: 'Three repeat pulses follow.');
+
+      expect(controller.acknowledgeAlarm(), isTrue);
+      expect(controller.isAlarmActive, isFalse);
+      expect(controller.state.alarmActive, isFalse);
+      final acknowledgedAt = alarmCount;
+      time.elapse(const Duration(seconds: 10), runCanceledCallbacks: true);
+      expect(alarmCount, acknowledgedAt);
+      expect(controller.acknowledgeAlarm(), isFalse);
+    });
+
+    test('publishes one atomic live state for every countdown view', () {
+      final time = _ManualTime();
+      final controller = CountdownTimerController(
+        initialDuration: const Duration(seconds: 4),
+        now: time.now,
+        scheduler: time.schedule,
+      );
+      addTearDown(controller.dispose);
+      final states = <CountdownTimerState>[];
+      controller.liveState.addListener(() => states.add(controller.state));
+
+      controller.start();
+      time.elapse(const Duration(seconds: 2));
+
+      expect(states, hasLength(3));
+      expect(states.first.status, CountdownTimerStatus.running);
+      expect(states.last.remaining, const Duration(seconds: 2));
+      expect(states.last, controller.state);
+    });
+
+    test('derives final-minute and alarm presentation stages', () {
+      const idle = CountdownTimerState(
+        configuredDuration: Duration(minutes: 2),
+        remaining: Duration(minutes: 2),
+        status: CountdownTimerStatus.idle,
+        alarmActive: false,
+      );
+      const beforeFinalMinute = CountdownTimerState(
+        configuredDuration: Duration(minutes: 2),
+        remaining: Duration(seconds: 61),
+        status: CountdownTimerStatus.running,
+        alarmActive: false,
+      );
+      const finalMinute = CountdownTimerState(
+        configuredDuration: Duration(minutes: 2),
+        remaining: Duration(minutes: 1),
+        status: CountdownTimerStatus.running,
+        alarmActive: false,
+      );
+      const alarm = CountdownTimerState(
+        configuredDuration: Duration(minutes: 2),
+        remaining: Duration.zero,
+        status: CountdownTimerStatus.finished,
+        alarmActive: true,
+      );
+
+      expect(idle.presentationStage, CountdownTimerPresentationStage.none);
+      expect(
+        beforeFinalMinute.presentationStage,
+        CountdownTimerPresentationStage.none,
+      );
+      expect(
+        finalMinute.presentationStage,
+        CountdownTimerPresentationStage.finalMinute,
+      );
+      expect(alarm.presentationStage, CountdownTimerPresentationStage.alarm);
+    });
+
+    test('default display wake-ups are bounded to one per second', () {
+      final time = _ManualTime();
+      final controller = CountdownTimerController(
+        initialDuration: const Duration(seconds: 10),
+        now: time.now,
+        scheduler: time.schedule,
+      );
+      addTearDown(controller.dispose);
+      var notifications = 0;
+      controller.addListener(() => notifications++);
+
+      controller.start();
+      time.elapse(const Duration(seconds: 3));
+
+      expect(notifications, 4, reason: 'Start plus three displayed seconds.');
+      expect(
+        time.scheduledWakeUpCount,
+        4,
+        reason: 'A text-only countdown does not need five wake-ups per second.',
+      );
+      expect(controller.remaining, const Duration(seconds: 7));
     });
 
     test('refresh finishes an elapsed timer after an app resume', () {
@@ -108,6 +221,46 @@ void main() {
       expect(controller.remaining, const Duration(minutes: 3));
     });
 
+    test('reset, setDuration and restart all stop an active alarm', () {
+      final time = _ManualTime();
+      var alarmCount = 0;
+      final controller = CountdownTimerController(
+        initialDuration: const Duration(seconds: 1),
+        now: time.now,
+        scheduler: time.schedule,
+        onAlarm: () => alarmCount++,
+      );
+      addTearDown(controller.dispose);
+
+      controller.start();
+      time.elapse(const Duration(seconds: 1));
+      expect(controller.isAlarmActive, isTrue);
+      controller.reset();
+      expect(controller.isAlarmActive, isFalse);
+      final afterReset = alarmCount;
+      time.elapse(const Duration(seconds: 2), runCanceledCallbacks: true);
+      expect(alarmCount, afterReset);
+
+      controller.start();
+      time.elapse(const Duration(seconds: 1));
+      expect(controller.isAlarmActive, isTrue);
+      controller.setDuration(const Duration(seconds: 2));
+      expect(controller.isAlarmActive, isFalse);
+      final afterSetDuration = alarmCount;
+      time.elapse(const Duration(seconds: 2), runCanceledCallbacks: true);
+      expect(alarmCount, afterSetDuration);
+
+      controller.start();
+      time.elapse(const Duration(seconds: 2));
+      expect(controller.isAlarmActive, isTrue);
+      final beforeRestart = alarmCount;
+      expect(controller.start(), isTrue);
+      expect(controller.isAlarmActive, isFalse);
+      expect(controller.isRunning, isTrue);
+      time.elapse(const Duration(seconds: 1), runCanceledCallbacks: true);
+      expect(alarmCount, beforeRestart);
+    });
+
     test('dispose makes already queued callbacks harmless', () {
       final time = _ManualTime();
       var alarmCount = 0;
@@ -123,6 +276,26 @@ void main() {
       time.elapse(const Duration(seconds: 5), runCanceledCallbacks: true);
 
       expect(alarmCount, 0);
+    });
+
+    test('dispose stops an already active repeating alarm', () {
+      final time = _ManualTime();
+      var alarmCount = 0;
+      final controller = CountdownTimerController(
+        initialDuration: const Duration(seconds: 1),
+        now: time.now,
+        scheduler: time.schedule,
+        onAlarm: () => alarmCount++,
+      );
+
+      controller.start();
+      time.elapse(const Duration(seconds: 1));
+      expect(alarmCount, 1);
+      expect(controller.isAlarmActive, isTrue);
+
+      controller.dispose();
+      time.elapse(const Duration(seconds: 5), runCanceledCallbacks: true);
+      expect(alarmCount, 1);
     });
 
     test('zero cannot start and excessive durations are clamped', () {
@@ -158,6 +331,7 @@ final class _ManualTime {
   final List<_ManualWakeUp> _wakeUps = <_ManualWakeUp>[];
 
   Duration now() => _elapsed;
+  int get scheduledWakeUpCount => _wakeUps.length;
 
   CountdownWakeUp schedule(Duration delay, void Function() callback) {
     final wakeUp = _ManualWakeUp(_elapsed + delay, callback);

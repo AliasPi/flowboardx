@@ -184,6 +184,47 @@ class BoardViewport extends ChangeNotifier {
     if (_offset != previous) notifyListeners();
   }
 
+  /// Aligns the participant-facing edge of a split viewport exactly with its
+  /// stable world-space divider.
+  ///
+  /// Unlike [constrain], this is an explicit alignment operation rather than
+  /// a one-sided guard. It is intended for entering a partitioned workspace:
+  /// the left participant sees [BoardViewportHorizontalConstraint.worldBoundaryX]
+  /// at the right edge of their region and the right participant sees it at
+  /// the left edge. Subsequent pan and zoom operations remain free inside the
+  /// assigned half and continue to use the regular one-sided constraint.
+  void alignToHorizontalPartition({
+    required Size viewportSize,
+    required BoardViewportHorizontalConstraint horizontalConstraint,
+    Rect? visibleScreenBounds,
+  }) {
+    if (viewportSize.isEmpty ||
+        !viewportSize.width.isFinite ||
+        !viewportSize.height.isFinite ||
+        !horizontalConstraint.isValid ||
+        !_scale.isFinite ||
+        _scale <= 0) {
+      return;
+    }
+    final visibleBounds = _safeVisibleBounds(viewportSize, visibleScreenBounds);
+    final targetScreenX =
+        horizontalConstraint.side == BoardViewportPartitionSide.left
+        ? visibleBounds.right
+        : visibleBounds.left;
+    final alignedX =
+        targetScreenX - horizontalConstraint.worldBoundaryX * _scale;
+    if (!alignedX.isFinite) return;
+
+    final previous = _offset;
+    _offset = Offset(alignedX, _offset.dy);
+    _clamp(
+      viewportSize,
+      visibleScreenBounds: visibleBounds,
+      horizontalConstraint: horizontalConstraint,
+    );
+    if (_offset != previous) notifyListeners();
+  }
+
   Rect _safeVisibleBounds(Size viewportSize, Rect? requested) {
     final surfaceBounds = Offset.zero & viewportSize;
     if (viewportSize.isEmpty || requested == null) return surfaceBounds;

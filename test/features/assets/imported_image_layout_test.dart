@@ -62,6 +62,17 @@ void main() {
       expect(provider.policy, ResizeImagePolicy.fit);
     });
 
+    test('bounds one 4K image cache entry without changing its source', () {
+      final provider = ImportedImageLayout.aspectPreservingProvider(
+        MemoryImage(Uint8List.fromList(const [1, 2, 3])),
+        physicalSize: const ui.Size(5000, 5000),
+      );
+
+      expect(provider.width, ImportedImageLayout.maximumBoardDecodeAxis);
+      expect(provider.height, ImportedImageLayout.maximumBoardDecodeAxis);
+      expect(provider.policy, ResizeImagePolicy.fit);
+    });
+
     test(
       'decoded 3:2 and odd-ratio images retain their source ratio',
       () async {

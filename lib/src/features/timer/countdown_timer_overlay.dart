@@ -47,6 +47,183 @@ abstract final class CountdownOverlayGeometry {
       );
 }
 
+/// Owns the large timer as a root [OverlayEntry].
+///
+/// Rendering above the Navigator is essential for the alarm: a PDF dialog,
+/// bottom sheet or editor progress veil must never cover its mandatory
+/// acknowledgement. The entry itself remains hit-test transparent outside the
+/// timer rectangle, so the board stays usable whenever no modal barrier is
+/// present underneath it.
+final class CountdownTimerOverlayPresenter {
+  OverlayEntry? _entry;
+  Rect? _lastRect;
+
+  bool get isVisible => _entry != null;
+
+  /// Inserts, or raises, the timer above every currently visible route.
+  ///
+  /// Returns `false` only when the caller's context has not reached an Overlay
+  /// yet; state owners can retry in their next post-frame callback.
+  bool show(
+    BuildContext context, {
+    required CountdownTimerController controller,
+  }) {
+    final overlay = Overlay.maybeOf(context, rootOverlay: true);
+    if (overlay == null) return false;
+    _removeEntry();
+    late final OverlayEntry entry;
+    entry = OverlayEntry(
+      builder: (overlayContext) => Positioned.fill(
+        child: LayoutBuilder(
+          builder: (context, constraints) => Stack(
+            clipBehavior: Clip.none,
+            children: [
+              CountdownTimerOverlay(
+                controller: controller,
+                bounds: Rect.fromLTWH(
+                  12,
+                  84,
+                  math.max(0, constraints.maxWidth - 24),
+                  math.max(0, constraints.maxHeight - 96),
+                ),
+                initialRect: _lastRect,
+                onRectChanged: (value) => _lastRect = value,
+                onClose: () => hide(controller: controller),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    _entry = entry;
+    overlay.insert(entry);
+    return true;
+  }
+
+  /// Hides the panel unless an active alarm still requires confirmation.
+  void hide({
+    required CountdownTimerController controller,
+    bool force = false,
+  }) {
+    if (!force && controller.isAlarmActive) return;
+    _removeEntry();
+  }
+
+  void _removeEntry() {
+    final entry = _entry;
+    _entry = null;
+    if (entry == null) return;
+    entry.remove();
+    entry.dispose();
+  }
+
+  void dispose() => _removeEntry();
+}
+
+/// Emits one request when a countdown enters its final minute and another when
+/// it reaches the alarm state.
+///
+/// The edge-triggered behavior lets a teacher close the panel during the final
+/// minute without it reopening on every one-second tick. Reaching `00:00` is a
+/// distinct stage and therefore always requests the panel again for the
+/// mandatory alarm acknowledgement.
+class CountdownTimerAutoPresentation extends StatefulWidget {
+  const CountdownTimerAutoPresentation({
+    required this.controller,
+    required this.onShowLarge,
+    super.key,
+  });
+
+  final CountdownTimerController controller;
+  final VoidCallback onShowLarge;
+
+  @override
+  State<CountdownTimerAutoPresentation> createState() =>
+      _CountdownTimerAutoPresentationState();
+}
+
+class _CountdownTimerAutoPresentationState
+    extends State<CountdownTimerAutoPresentation> {
+  late CountdownTimerStatus _lastStatus = widget.controller.state.status;
+  bool _finalMinuteRequested = false;
+  bool _alarmRequested = false;
+  int _postFrameRequestGeneration = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.controller.addListener(_handleCountdownChange);
+    _requestForAlreadyActiveState();
+  }
+
+  @override
+  void didUpdateWidget(covariant CountdownTimerAutoPresentation oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller == widget.controller) return;
+    oldWidget.controller.removeListener(_handleCountdownChange);
+    _postFrameRequestGeneration++;
+    _lastStatus = widget.controller.state.status;
+    _finalMinuteRequested = false;
+    _alarmRequested = false;
+    widget.controller.addListener(_handleCountdownChange);
+    _requestForAlreadyActiveState();
+  }
+
+  void _handleCountdownChange() {
+    final state = widget.controller.state;
+    if (state.status == CountdownTimerStatus.idle ||
+        (_lastStatus == CountdownTimerStatus.finished && state.isRunning)) {
+      _finalMinuteRequested = false;
+      _alarmRequested = false;
+    }
+    _lastStatus = state.status;
+    final stage = state.presentationStage;
+    if (stage == CountdownTimerPresentationStage.none) return;
+    if (stage == CountdownTimerPresentationStage.finalMinute) {
+      if (_finalMinuteRequested) return;
+      _finalMinuteRequested = true;
+    } else {
+      if (_alarmRequested) return;
+      _alarmRequested = true;
+    }
+    // A synchronous milestone supersedes any initial post-frame request.
+    _postFrameRequestGeneration++;
+    widget.onShowLarge();
+  }
+
+  void _requestForAlreadyActiveState() {
+    final stage = widget.controller.state.presentationStage;
+    if (stage == CountdownTimerPresentationStage.none) return;
+    if (stage == CountdownTimerPresentationStage.finalMinute) {
+      _finalMinuteRequested = true;
+    } else {
+      _alarmRequested = true;
+    }
+    final controller = widget.controller;
+    final generation = ++_postFrameRequestGeneration;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted ||
+          generation != _postFrameRequestGeneration ||
+          !identical(widget.controller, controller) ||
+          controller.state.presentationStage ==
+              CountdownTimerPresentationStage.none) {
+        return;
+      }
+      widget.onShowLarge();
+    });
+  }
+
+  @override
+  void dispose() {
+    _postFrameRequestGeneration++;
+    widget.controller.removeListener(_handleCountdownChange);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => const SizedBox.shrink();
+}
+
 /// Large, draggable countdown display for use as a direct child of a [Stack].
 ///
 /// Only the current panel rectangle participates in hit testing. Writing and
@@ -115,10 +292,12 @@ class _CountdownTimerOverlayState extends State<CountdownTimerOverlay> {
           child: Stack(
             children: [
               Positioned.fill(
-                child: AnimatedBuilder(
-                  animation: widget.controller,
-                  builder: (context, _) =>
-                      _CountdownDisplay(controller: widget.controller),
+                child: ValueListenableBuilder<CountdownTimerState>(
+                  valueListenable: widget.controller.liveState,
+                  builder: (context, state, _) => _CountdownDisplay(
+                    controller: widget.controller,
+                    state: state,
+                  ),
                 ),
               ),
               Positioned(
@@ -151,11 +330,16 @@ class _CountdownTimerOverlayState extends State<CountdownTimerOverlay> {
                         ),
                       ),
                       const Spacer(),
-                      IconButton(
-                        key: const ValueKey('countdown-overlay-close'),
-                        tooltip: 'Große Timeranzeige schließen',
-                        onPressed: widget.onClose,
-                        icon: const Icon(Icons.close_rounded),
+                      ValueListenableBuilder<CountdownTimerState>(
+                        valueListenable: widget.controller.liveState,
+                        builder: (context, state, _) => IconButton(
+                          key: const ValueKey('countdown-overlay-close'),
+                          tooltip: state.alarmActive
+                              ? 'Alarm zuerst bestätigen'
+                              : 'Große Timeranzeige schließen',
+                          onPressed: state.alarmActive ? null : widget.onClose,
+                          icon: const Icon(Icons.close_rounded),
+                        ),
                       ),
                       const SizedBox(width: 2),
                     ],
@@ -199,16 +383,16 @@ class _CountdownTimerOverlayState extends State<CountdownTimerOverlay> {
 }
 
 class _CountdownDisplay extends StatelessWidget {
-  const _CountdownDisplay({required this.controller});
+  const _CountdownDisplay({required this.controller, required this.state});
 
   final CountdownTimerController controller;
+  final CountdownTimerState state;
 
   @override
   Widget build(BuildContext context) {
     final urgent =
-        controller.isRunning &&
-        controller.remaining <= const Duration(seconds: 30);
-    final finished = controller.isFinished;
+        state.isRunning && state.remaining <= const Duration(seconds: 30);
+    final finished = state.isFinished;
     final color = finished || urgent
         ? FlowboardColors.warning
         : FlowboardColors.textPrimary;
@@ -226,9 +410,9 @@ class _CountdownDisplay extends StatelessWidget {
                     child: Semantics(
                       liveRegion: true,
                       label:
-                          'Verbleibende Zeit ${formatCountdown(controller.remaining)}',
+                          'Verbleibende Zeit ${formatCountdown(state.remaining)}',
                       child: Text(
-                        formatCountdown(controller.remaining),
+                        formatCountdown(state.remaining),
                         key: const ValueKey('countdown-large-value'),
                         maxLines: 1,
                         style: TextStyle(
@@ -248,25 +432,42 @@ class _CountdownDisplay extends StatelessWidget {
               Row(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  IconButton.filledTonal(
-                    key: const ValueKey('countdown-overlay-start-pause'),
-                    tooltip: controller.isRunning ? 'Pausieren' : 'Starten',
-                    onPressed: controller.isRunning
-                        ? controller.pause
-                        : controller.start,
-                    icon: Icon(
-                      controller.isRunning
-                          ? Icons.pause_rounded
-                          : Icons.play_arrow_rounded,
+                  if (state.alarmActive) ...[
+                    FilledButton.icon(
+                      key: const ValueKey(
+                        'countdown-overlay-acknowledge-alarm',
+                      ),
+                      style: FilledButton.styleFrom(
+                        backgroundColor: FlowboardColors.warning,
+                        foregroundColor: FlowboardColors.background,
+                      ),
+                      onPressed: controller.acknowledgeAlarm,
+                      icon: const Icon(Icons.notifications_off_rounded),
+                      label: const Text('Alarm stoppen'),
                     ),
-                  ),
-                  const SizedBox(width: 10),
-                  IconButton(
-                    key: const ValueKey('countdown-overlay-reset'),
-                    tooltip: 'Zurücksetzen',
-                    onPressed: controller.reset,
-                    icon: const Icon(Icons.replay_rounded),
-                  ),
+                    const SizedBox(width: 10),
+                  ] else ...[
+                    IconButton.filledTonal(
+                      key: const ValueKey('countdown-overlay-start-pause'),
+                      tooltip: state.isRunning ? 'Pausieren' : 'Starten',
+                      onPressed: state.isRunning
+                          ? controller.pause
+                          : controller.start,
+                      icon: Icon(
+                        state.isRunning
+                            ? Icons.pause_rounded
+                            : Icons.play_arrow_rounded,
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                  ],
+                  if (!state.alarmActive)
+                    IconButton(
+                      key: const ValueKey('countdown-overlay-reset'),
+                      tooltip: 'Zurücksetzen',
+                      onPressed: controller.reset,
+                      icon: const Icon(Icons.replay_rounded),
+                    ),
                 ],
               ),
             ],

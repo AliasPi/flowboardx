@@ -10,7 +10,9 @@ import 'package:pdfrx/pdfrx.dart';
 import '../../domain/model/board_object.dart';
 import '../../domain/model/document.dart';
 import '../../domain/model/geometry.dart';
+import '../../domain/model/ink.dart';
 import '../../domain/model/scene_order.dart';
+import '../assets/imported_image_layout.dart';
 import '../board/presentation/board_object_layer.dart';
 import '../board/presentation/ink_painter.dart';
 import '../editor/text_object_layout.dart';
@@ -46,12 +48,17 @@ final class PdfThumbnailRaster {
   final Uint8List _bgraBytes;
 }
 
+final class PageThumbnailRenderCancelled implements Exception {
+  const PageThumbnailRenderCancelled();
+}
+
 class PageThumbnailRenderer {
   PageThumbnailRenderer({
     this.width = 192,
     this.height = 108,
     int pdfCacheCapacity = 24,
     int pdfRenderSize = 384,
+    int imageCacheCapacity = 32,
     PdfThumbnailRasterizer pdfRasterizer = _rasterizePdfThumbnail,
   }) : assert(width > 0),
        assert(height > 0),
@@ -59,45 +66,69 @@ class PageThumbnailRenderer {
          capacity: pdfCacheCapacity,
          renderSize: pdfRenderSize,
          rasterizer: pdfRasterizer,
-       );
+       ),
+       _imageThumbnails = _ImageThumbnailCache(capacity: imageCacheCapacity);
 
   final int width;
   final int height;
   final _PdfThumbnailCache _pdfThumbnails;
+  final _ImageThumbnailCache _imageThumbnails;
+  static const int maximumThumbnailStrokePoints = 512;
+  static const int maximumThumbnailTotalStrokePoints = 32768;
 
   /// Releases cached PDF pixels. In-flight renders remain safe and become
   /// collectible as soon as their current thumbnail render has completed.
-  void dispose() => _pdfThumbnails.clear();
+  void dispose() {
+    _pdfThumbnails.clear();
+    _imageThumbnails.clear();
+  }
 
-  Future<ui.Image> render(BoardPage page, BoardAssetResolver assets) async {
+  Future<ui.Image> render(
+    BoardPage page,
+    BoardAssetResolver assets, {
+    bool Function()? shouldCancel,
+  }) async {
     final decoded = <String, ui.Image>{};
     ui.PictureRecorder? recorder;
     ui.Picture? picture;
     var recording = false;
     try {
+      _throwIfCancelled(shouldCancel);
       for (final object in page.objects) {
+        _throwIfCancelled(shouldCancel);
         switch (object) {
           case final ImageObject image:
-            ui.Codec? codec;
             try {
-              final bytes = await assets.readBytes(image.assetId);
-              if (bytes == null) continue;
-              codec = await ui.instantiateImageCodec(bytes, targetWidth: 400);
-              final frame = await codec.getNextFrame();
-              decoded[image.id] = frame.image;
+              final decodedImage = await _imageThumbnails.load(
+                assets,
+                image.assetId,
+              );
+              if (shouldCancel?.call() ?? false) {
+                decodedImage?.dispose();
+                throw const PageThumbnailRenderCancelled();
+              }
+              if (decodedImage == null) continue;
+              decoded[image.id] = decodedImage;
+            } on PageThumbnailRenderCancelled {
+              rethrow;
             } on Object {
               // A corrupt optional asset does not invalidate the thumbnail.
-            } finally {
-              codec?.dispose();
             }
           case final PdfObject pdf:
             try {
               final path = assets.localPath(pdf.assetId);
               if (path == null || path.isEmpty) continue;
-              decoded[pdf.id] = await _pdfThumbnails.load(
+              final image = await _pdfThumbnails.load(
                 path,
                 pdf.activeSourcePageIndex,
               );
+              if (shouldCancel?.call() ?? false) {
+                image.dispose();
+                throw const PageThumbnailRenderCancelled();
+              }
+              decoded[pdf.id] = image;
+            } on PageThumbnailRenderCancelled {
+              rethrow;
             } on Object {
               // The canvas below draws an explicit unavailable-PDF fallback.
             }
@@ -106,6 +137,7 @@ class PageThumbnailRenderer {
         }
       }
 
+      _throwIfCancelled(shouldCancel);
       recorder = ui.PictureRecorder();
       recording = true;
       final canvas = Canvas(recorder);
@@ -128,22 +160,40 @@ class PageThumbnailRenderer {
         canvas.drawLine(Offset(world.left, y), Offset(world.right, y), grid);
       }
 
-      final annotations = page.annotationLayers
-          .where((layer) => layer.visible)
-          .toList(growable: false);
+      final annotationIndex = VisibleObjectInkLayerIndex(page.annotationLayers);
+      var activeAnnotationStrokeCount = 0;
+      for (final object in page.objects) {
+        activeAnnotationStrokeCount +=
+            annotationIndex.layerFor(object)?.strokes.length ?? 0;
+      }
+      final inkBudget = _ThumbnailInkBudget(
+        strokeCount: page.strokes.length + activeAnnotationStrokeCount,
+        totalPointBudget: maximumThumbnailTotalStrokePoints,
+        maximumPointsPerStroke: maximumThumbnailStrokePoints,
+      );
+      _throwIfCancelled(shouldCancel);
       final scene = orderedBoardSceneItems(
         objects: page.objects,
         strokes: page.strokes,
       );
+      _throwIfCancelled(shouldCancel);
       for (final item in scene) {
+        _throwIfCancelled(shouldCancel);
         final stroke = item.stroke;
         if (stroke != null) {
-          InkPainter.drawStroke(canvas, stroke);
+          InkPainter.drawStroke(
+            canvas,
+            _thumbnailStroke(
+              stroke,
+              shouldCancel,
+              maximumPoints: inkBudget.take(stroke.points.length),
+            ),
+          );
           continue;
         }
         final object = item.object!;
         _drawObject(canvas, object, decoded[object.id], scale);
-        final layer = activeObjectInkLayer(object, annotations);
+        final layer = annotationIndex.layerFor(object);
         if (layer != null) {
           canvas.save();
           _applyObjectOrientation(canvas, object.transform);
@@ -153,14 +203,29 @@ class PageThumbnailRenderer {
             object.transform.height,
           );
           for (final annotation in layer.strokes) {
-            InkPainter.drawObjectLocalStroke(canvas, annotation, objectSize);
+            _throwIfCancelled(shouldCancel);
+            InkPainter.drawObjectLocalStroke(
+              canvas,
+              _thumbnailStroke(
+                annotation,
+                shouldCancel,
+                maximumPoints: inkBudget.take(annotation.points.length),
+              ),
+              objectSize,
+            );
           }
           canvas.restore();
         }
       }
       picture = recorder.endRecording();
       recording = false;
-      return await picture.toImage(width, height);
+      _throwIfCancelled(shouldCancel);
+      final image = await picture.toImage(width, height);
+      if (shouldCancel?.call() ?? false) {
+        image.dispose();
+        throw const PageThumbnailRenderCancelled();
+      }
+      return image;
     } finally {
       if (recording && recorder != null) {
         try {
@@ -174,6 +239,111 @@ class PageThumbnailRenderer {
         entry.dispose();
       }
     }
+  }
+
+  static void _throwIfCancelled(bool Function()? shouldCancel) {
+    if (shouldCancel?.call() ?? false) {
+      throw const PageThumbnailRenderCancelled();
+    }
+  }
+
+  static InkStroke _thumbnailStroke(
+    InkStroke stroke,
+    bool Function()? shouldCancel, {
+    int maximumPoints = maximumThumbnailStrokePoints,
+  }) {
+    final points = stroke.points;
+    if (points.isEmpty) return stroke;
+    if (maximumPoints <= 0) {
+      return stroke.copyWith(points: const <InkPoint>[]);
+    }
+    if (points.length <= maximumPoints) return stroke;
+    if (maximumPoints == 1) {
+      return stroke.copyWith(points: <InkPoint>[points.first]);
+    }
+    final sampled = stroke.type == InkToolType.straightLine
+        ? <InkPoint>[points.first, points.last]
+        : sampleStrokePoints(
+            points,
+            maximumPoints: maximumPoints,
+            shouldCancel: shouldCancel,
+          );
+    return stroke.copyWith(points: sampled);
+  }
+
+  /// Computes the same bounded streaming allocation used by [render].
+  ///
+  /// Exposed for stress tests: page complexity may increase without allowing
+  /// the 192x108 preview to consume an unbounded number of path commands.
+  @visibleForTesting
+  static List<int> allocateStrokePointBudgets(
+    Iterable<int> pointCounts, {
+    int totalPointBudget = maximumThumbnailTotalStrokePoints,
+    int maximumPointsPerStroke = maximumThumbnailStrokePoints,
+  }) {
+    final counts = pointCounts.toList(growable: false);
+    final budget = _ThumbnailInkBudget(
+      strokeCount: counts.length,
+      totalPointBudget: totalPointBudget,
+      maximumPointsPerStroke: maximumPointsPerStroke,
+    );
+    return <int>[for (final count in counts) budget.take(math.max(0, count))];
+  }
+
+  /// Reduces persisted input to a thumbnail-sized command budget while
+  /// retaining both endpoints and the strongest turn in each temporal bucket.
+  ///
+  /// A 192 px preview cannot display tens of thousands of distinct samples.
+  /// Bounding every stroke also prevents one recovered/very long circle from
+  /// monopolizing the UI isolate after the ink quiet period.
+  @visibleForTesting
+  static List<InkPoint> sampleStrokePoints(
+    List<InkPoint> source, {
+    int maximumPoints = maximumThumbnailStrokePoints,
+    bool Function()? shouldCancel,
+  }) {
+    if (maximumPoints < 2) {
+      throw ArgumentError.value(
+        maximumPoints,
+        'maximumPoints',
+        'must be at least two',
+      );
+    }
+    if (source.length <= maximumPoints) return source;
+    if (maximumPoints == 2) return <InkPoint>[source.first, source.last];
+
+    final result = <InkPoint>[source.first];
+    final interiorCount = source.length - 2;
+    final bucketCount = maximumPoints - 2;
+    for (var bucket = 0; bucket < bucketCount; bucket++) {
+      _throwIfCancelled(shouldCancel);
+      final start = 1 + bucket * interiorCount ~/ bucketCount;
+      final endExclusive = 1 + (bucket + 1) * interiorCount ~/ bucketCount;
+      final chordStart = source[start - 1];
+      final chordEnd = source[math.min(source.length - 1, endExclusive)];
+      final chordX = chordEnd.x - chordStart.x;
+      final chordY = chordEnd.y - chordStart.y;
+      final chordLengthSquared = chordX * chordX + chordY * chordY;
+      var selectedIndex = start;
+      var greatestDeviation = -1.0;
+      for (var index = start; index < endExclusive; index++) {
+        if ((index & 255) == 0) _throwIfCancelled(shouldCancel);
+        final point = source[index];
+        final relativeX = point.x - chordStart.x;
+        final relativeY = point.y - chordStart.y;
+        final cross = relativeX * chordY - relativeY * chordX;
+        final deviation = chordLengthSquared <= 1e-12
+            ? relativeX * relativeX + relativeY * relativeY
+            : cross * cross / chordLengthSquared;
+        if (deviation > greatestDeviation) {
+          greatestDeviation = deviation;
+          selectedIndex = index;
+        }
+      }
+      result.add(source[selectedIndex]);
+    }
+    result.add(source.last);
+    return result;
   }
 
   void _drawObject(
@@ -323,7 +493,160 @@ class PageThumbnailRenderer {
   }
 }
 
+/// Fair, streaming point allocation for a complete page thumbnail.
+///
+/// Every remaining stroke gets an equal share of the remaining page budget.
+/// Short strokes return their unused share to later strokes. This keeps dots
+/// and short handwriting intact while bounding pathological pages containing
+/// thousands of long circular gestures.
+final class _ThumbnailInkBudget {
+  _ThumbnailInkBudget({
+    required int strokeCount,
+    required int totalPointBudget,
+    required this.maximumPointsPerStroke,
+  }) : _remainingStrokes = math.max(0, strokeCount),
+       _remainingPoints = math.max(0, totalPointBudget),
+       assert(maximumPointsPerStroke > 0);
+
+  final int maximumPointsPerStroke;
+  int _remainingStrokes;
+  int _remainingPoints;
+
+  int take(int pointCount) {
+    if (_remainingStrokes <= 0 || pointCount <= 0) {
+      if (_remainingStrokes > 0) _remainingStrokes--;
+      return 0;
+    }
+    final fairShare = _remainingPoints <= 0
+        ? 0
+        : (_remainingPoints / _remainingStrokes).ceil();
+    final allocated = math.min(
+      pointCount,
+      math.min(maximumPointsPerStroke, fairShare),
+    );
+    _remainingStrokes--;
+    _remainingPoints = math.max(0, _remainingPoints - allocated);
+    return allocated;
+  }
+}
+
 typedef _PdfThumbnailKey = ({String path, int sourcePageIndex});
+
+typedef _ImageThumbnailKey = ({BoardAssetResolver assets, String assetId});
+
+/// Retains one bounded decode per immutable document asset.
+///
+/// Adding ink invalidates the page preview but not the image bytes. Re-reading
+/// and decoding every embedded photo after each quiet period previously moved
+/// that unrelated work back onto the raster pipeline. The cache owns the
+/// original image and hands each render a cheap clone that it may dispose.
+final class _ImageThumbnailCache {
+  _ImageThumbnailCache({required this.capacity}) : assert(capacity >= 0);
+
+  final int capacity;
+  final LinkedHashMap<_ImageThumbnailKey, _ImageThumbnailCacheEntry> _entries =
+      LinkedHashMap<_ImageThumbnailKey, _ImageThumbnailCacheEntry>();
+
+  Future<ui.Image?> load(BoardAssetResolver assets, String assetId) async {
+    final key = (assets: assets, assetId: assetId);
+    if (capacity == 0) {
+      return _decodeImageThumbnail(assets, assetId);
+    }
+
+    var entry = _entries.remove(key);
+    entry ??= _ImageThumbnailCacheEntry(_decodeImageThumbnail(assets, assetId));
+    _entries[key] = entry;
+    while (_entries.length > capacity) {
+      _entries.remove(_entries.keys.first)?.evict();
+    }
+
+    entry.acquire();
+    try {
+      final image = await entry.image;
+      return image?.clone();
+    } on Object {
+      if (identical(_entries[key], entry)) {
+        _entries.remove(key);
+        entry.evict();
+      }
+      rethrow;
+    } finally {
+      entry.release();
+    }
+  }
+
+  void clear() {
+    final entries = _entries.values.toSet();
+    _entries.clear();
+    for (final entry in entries) {
+      entry.evict();
+    }
+  }
+}
+
+/// Owns one cached image while allowing concurrent callers to clone it.
+///
+/// LRU eviction may happen while the decode is in flight. Deferring disposal
+/// until every borrower has cloned the result prevents both use-after-dispose
+/// failures and the previous "first N assets stay forever" cache behaviour.
+final class _ImageThumbnailCacheEntry {
+  _ImageThumbnailCacheEntry(this.image);
+
+  final Future<ui.Image?> image;
+  int _borrowers = 0;
+  bool _evicted = false;
+  bool _disposalScheduled = false;
+
+  void acquire() => _borrowers++;
+
+  void release() {
+    assert(_borrowers > 0);
+    _borrowers--;
+    _scheduleDisposalIfReady();
+  }
+
+  void evict() {
+    _evicted = true;
+    _scheduleDisposalIfReady();
+  }
+
+  void _scheduleDisposalIfReady() {
+    if (!_evicted || _borrowers != 0 || _disposalScheduled) return;
+    _disposalScheduled = true;
+    unawaited(
+      image.then<void>(
+        (value) => value?.dispose(),
+        onError: (Object _, StackTrace _) {},
+      ),
+    );
+  }
+}
+
+Future<ui.Image?> _decodeImageThumbnail(
+  BoardAssetResolver assets,
+  String assetId,
+) async {
+  final bytes = await assets.readBytes(assetId);
+  if (bytes == null || bytes.isEmpty) return null;
+  final intrinsic = await ImportedImageLayout.dimensionsFromBytes(bytes);
+  final longest = math.max(intrinsic.width, intrinsic.height);
+  final factor = longest > 400 ? 400 / longest : 1.0;
+  final targetWidth = math.max(1, (intrinsic.width * factor).round());
+  final targetHeight = math.max(1, (intrinsic.height * factor).round());
+  ui.Codec? codec;
+  try {
+    codec = await ui.instantiateImageCodec(
+      bytes,
+      targetWidth: targetWidth,
+      targetHeight: targetHeight,
+      allowUpscaling: false,
+    );
+    final frame = await codec.getNextFrame();
+    return frame.image;
+  } finally {
+    codec?.dispose();
+  }
+}
 
 final class _PdfThumbnailCache {
   _PdfThumbnailCache({

@@ -138,7 +138,7 @@ Future<void> _verifyAndroidOfflineModels(
       '> Offline-Handschriftmodell geprüft: ${report.artifactName}, '
       '${report.modelFileCount} Dateien, '
       '${report.uncompressedModelBytes} Byte ML Kit; '
-      '${report.handwritingAssetCount} PP-OCRv5-Assets, '
+      '${report.handwritingAssetCount} PP-OCRv6-Assets, '
       '${report.handwritingAssetBytes} Byte; '
       '${report.onnxRuntimeLibraryCount} ONNX-Runtime-Bibliotheken; '
       '${report.onnxRuntimeJavaTypeCount} JNI-Java-Typen',

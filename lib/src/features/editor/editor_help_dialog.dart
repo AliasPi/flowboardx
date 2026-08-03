@@ -67,8 +67,10 @@ class FlowboardHelpDialog extends StatelessWidget {
                         'Finger-Schreiben ist standardmäßig aus: Ein Finger verschiebt dann das Board. Der Finger-Schalter in der Kopfleiste aktiviert das Schreiben mit einem Finger.',
                         'Zwei Finger übernehmen weiterhin Pan und Zoom, auch wenn Finger-Schreiben aktiv ist.',
                         'Beim Zoomen erscheint rechts unten ein verschiebbarer Navigator. Im roten Rahmen ziehen oder tippen navigiert; ohne Interaktion blendet er sich aus.',
-                        'Handkante oder breiter Kontakt radiert nur die überstrichenen Linienabschnitte, während Stifte weiter schreiben können.',
-                        'Der Radiergummi im Stiftfächer radiert mit dem Stift; derselbe Dickenregler bestimmt seine Breite.',
+                        'Mit der Unterseite der geballten Faust oder einer breit aufgelegten Hand über die Tinte wischen: Die App erkennt die Radierabsicht automatisch, ohne Werkzeugwechsel.',
+                        'Der sichtbare Kreis folgt der erkannten Auflagefläche. Mehr Fläche erzeugt einen größeren Radierer; Kreis und tatsächlich gelöschter Bereich sind identisch.',
+                        'Auch der Radiergummi im Stiftfächer bestimmt seine Größe automatisch aus dem Stift-/Hardwarekontakt. Der Dickenregler erscheint nur für zeichnende Stifte.',
+                        'Ein oder zwei normale Finger bleiben Auswahl, Verschieben sowie Pan/Zoom und lösen keine Radierung aus.',
                       ],
                     ),
                     _HelpCard(
@@ -77,6 +79,8 @@ class FlowboardHelpDialog extends StatelessWidget {
                       lines: [
                         'Zentrum antippen: Menü öffnen oder schließen. Zentrum ziehen: Menü verschieben.',
                         'Seitenrad drehen oder mit fünf Fingern um das Menü kreisen, um Seiten zu wechseln.',
+                        'Eine Seitenvorschau im Seitenrad gedrückt halten, um diese Seite nach Bestätigung zu löschen.',
+                        'In der Kopfleiste wechseln die Pfeile neben der Seitenzahl vor und zurück; daneben liegen Neue Seite und Seite löschen.',
                         '„Menüposition zurücksetzen“ setzt es in die Mitte des sichtbaren Bereichs.',
                         'Der Pfeil am rechten Ende klappt die Kopfleiste platzsparend ein und wieder aus.',
                       ],
@@ -86,7 +90,8 @@ class FlowboardHelpDialog extends StatelessWidget {
                       title: 'Auswählen und gruppieren',
                       lines: [
                         'Rechteck, Lasso oder „Alles auswählen“ verwenden.',
-                        'Am Rahmen verschieben, am Griff proportional skalieren oder mit zwei Fingern direkt auf der Auswahl per Pinch vergrößern und verkleinern.',
+                        'Zum Verschieben genügt ein Drag an einer beliebigen Stelle innerhalb des sichtbaren Auswahlrahmens; ein Fingertipp auf freie Fläche hebt die Auswahl auf.',
+                        'Am Griff proportional skalieren oder mit zwei Fingern direkt auf der Auswahl per Pinch vergrößern und verkleinern.',
                         'Der Griff links unten dreht frei. Gedr\u00fcckt halten \u00f6ffnet 30\u00b0, 45\u00b0, 60\u00b0, 90\u00b0, Spiegeln und den manuellen Winkel.',
                         'Gruppen bleiben zusammen, bis „Gruppierung aufheben“ gewählt wird.',
                       ],
@@ -106,7 +111,7 @@ class FlowboardHelpDialog extends StatelessWidget {
                       title: 'Timer',
                       lines: [
                         'Über das Timer-Symbol eine Dauer einstellen, starten, pausieren oder zurücksetzen.',
-                        'Bei null ertönt einmal ein Signal.',
+                        'Ab einer Minute Restzeit erscheint die große Anzeige automatisch. Bei null ertönt der Alarm wiederholt, bis er dort mit „Alarm stoppen“ bestätigt wird.',
                         'Die große Anzeige lässt sich verschieben und skalieren. Außerhalb ihres Rechtecks kann ohne Unterbrechung weitergeschrieben werden.',
                       ],
                     ),

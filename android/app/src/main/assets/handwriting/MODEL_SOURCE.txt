@@ -2,25 +2,25 @@ Flowboard X bundled handwriting model
 ====================================
 
 Model:
-  PaddlePaddle latin_PP-OCRv5_mobile_rec_onnx
+  PaddlePaddle PP-OCRv6_small_rec_onnx
 
 Upstream revision:
-  89d3a50e2c27e2e7cceeab0e944c25c807d5db4f
+  b8f84f0b80c529de40b4fbb3544b84fa7233a513
 
 Model source:
-  https://huggingface.co/PaddlePaddle/latin_PP-OCRv5_mobile_rec_onnx/resolve/89d3a50e2c27e2e7cceeab0e944c25c807d5db4f/inference.onnx
+  https://huggingface.co/PaddlePaddle/PP-OCRv6_small_rec_onnx/resolve/b8f84f0b80c529de40b4fbb3544b84fa7233a513/inference.onnx
 
 Inference configuration source:
-  https://huggingface.co/PaddlePaddle/latin_PP-OCRv5_mobile_rec_onnx/resolve/89d3a50e2c27e2e7cceeab0e944c25c807d5db4f/inference.yml
+  https://huggingface.co/PaddlePaddle/PP-OCRv6_small_rec_onnx/resolve/b8f84f0b80c529de40b4fbb3544b84fa7233a513/inference.yml
 
 Model SHA-256:
-  7888113072263cb471b93f66dd5e2ad70548dc526fa1ace760d0d973dd121498
+  5435fd747c9e0efe15a96d0b378d5bd157e9492ed8fd80edf08f30d02fa24634
 
 Inference configuration SHA-256:
-  0bbe984570f597af3638e50bdf2e8276f3ab26a61966096538b3b0d1849f5c84
+  ab078671bb49f06228eadccd34f1bb501e157f7a047095ffb943ba81512c77d1
 
 Model size:
-  8,042,023 bytes
+  21,159,378 bytes
 
 License:
   Apache License 2.0. The complete upstream license is included as

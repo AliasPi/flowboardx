@@ -30,6 +30,7 @@ void main() {
     required DocumentLibraryOpenCallback onOpen,
     DocumentIdFactory? idFactory,
     FolderIdFactory? folderIdFactory,
+    DocumentLibraryClock? clock,
     LibraryArchiveService? archiveService,
   }) {
     return MaterialApp(
@@ -38,6 +39,7 @@ void main() {
         onOpen: onOpen,
         documentIdFactory: idFactory,
         folderIdFactory: folderIdFactory,
+        clock: clock,
         archiveService: archiveService,
       ),
     );
@@ -68,6 +70,7 @@ void main() {
     await tester.pumpWidget(
       app(
         idFactory: () => 'new-id',
+        clock: () => DateTime(2026, 7, 30, 15, 57),
         onOpen: (document, directory) {
           opened = document;
           openedAssets = directory;
@@ -80,6 +83,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(repository.saved.single.id, 'new-id');
+    expect(repository.saved.single.title, '20260730-15_57');
     expect(opened?.id, 'new-id');
     expect(openedAssets?.path, assets.path);
   });

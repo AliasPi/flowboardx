@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:flowboard_x/src/data/document_repository.dart';
+import 'package:flowboard_x/src/domain/commands/document_commands.dart';
 import 'package:flowboard_x/src/domain/model/document.dart';
 import 'package:flowboard_x/src/domain/model/ink.dart';
 import 'package:flowboard_x/src/features/board/engine/board_viewport.dart';
@@ -327,11 +328,11 @@ void main() {
     final fixture = await _pumpSplitBoard(tester);
     addTearDown(fixture.dispose);
     final pen = await tester.startGesture(
-      const Offset(700, 240),
+      const Offset(700, 180),
       pointer: 601,
       kind: PointerDeviceKind.stylus,
     );
-    await pen.moveTo(const Offset(700, 360));
+    await pen.moveTo(const Offset(700, 420));
     await pen.up();
     await tester.pump();
     expect(fixture.editor.page.strokes, hasLength(1));
@@ -340,11 +341,8 @@ void main() {
       const PointerDownEvent(
         pointer: 602,
         device: 602,
-        kind: PointerDeviceKind.touch,
+        kind: PointerDeviceKind.invertedStylus,
         position: Offset(700, 300),
-        radiusMajor: 30,
-        radiusMinor: 18,
-        size: .34,
       ),
     );
     await tester.pump();
@@ -363,11 +361,8 @@ void main() {
       const PointerUpEvent(
         pointer: 602,
         device: 602,
-        kind: PointerDeviceKind.touch,
+        kind: PointerDeviceKind.invertedStylus,
         position: Offset(700, 300),
-        radiusMajor: 30,
-        radiusMinor: 18,
-        size: .34,
       ),
     );
     await tester.pump();
@@ -403,6 +398,76 @@ void main() {
       await fixture.editor.flush();
     },
   );
+
+  testWidgets('right undo never exposes the stale left camera for one frame', (
+    tester,
+  ) async {
+    final fixture = await _pumpSplitBoard(tester);
+    addTearDown(fixture.dispose);
+    await _pumpSplitWorkspace(
+      tester,
+      editor: fixture.editor,
+      rightEditor: fixture.rightEditor,
+      left: fixture.left,
+      right: fixture.right,
+      leftSuppression: fixture.leftSuppression,
+      constrainHorizontalViewports: true,
+    );
+    const surfaceSize = Size(1000, 700);
+    const leftVisible = Rect.fromLTWH(0, 0, 500, 700);
+    const rightVisible = Rect.fromLTWH(500, 0, 500, 700);
+    fixture.editor.viewport.alignToHorizontalPartition(
+      viewportSize: surfaceSize,
+      visibleScreenBounds: leftVisible,
+      horizontalConstraint: const BoardViewportHorizontalConstraint(
+        side: BoardViewportPartitionSide.left,
+        worldBoundaryX: 960,
+      ),
+    );
+    fixture.rightEditor.viewport.alignToHorizontalPartition(
+      viewportSize: surfaceSize,
+      visibleScreenBounds: rightVisible,
+      horizontalConstraint: const BoardViewportHorizontalConstraint(
+        side: BoardViewportPartitionSide.right,
+        worldBoundaryX: 960,
+      ),
+    );
+    await tester.pump();
+    final expectedRightOffset = fixture.rightEditor.viewport.offset;
+
+    fixture.rightEditor.execute(
+      AddStrokeCommand(
+        fixture.rightEditor.page.id,
+        InkStroke(
+          id: 'right-undo-frame',
+          points: const <InkPoint>[
+            InkPoint(x: 1120, y: 260),
+            InkPoint(x: 1220, y: 320),
+          ],
+          authorId: 'right',
+        ),
+      ),
+    );
+    await tester.pump();
+    fixture.rightEditor.undo();
+    await tester.pump();
+
+    final layers = tester
+        .widgetList<BoardSceneLayer>(find.byType(BoardSceneLayer))
+        .toList(growable: false);
+    expect(layers, hasLength(2));
+    expect(fixture.rightEditor.viewport.offset, expectedRightOffset);
+    expect(layers[1].offset, expectedRightOffset);
+
+    // A later constraint frame must remain identical rather than correcting
+    // a camera that briefly rendered the neighbouring half.
+    await tester.pump();
+    final settledLayers = tester
+        .widgetList<BoardSceneLayer>(find.byType(BoardSceneLayer))
+        .toList(growable: false);
+    expect(settledLayers[1].offset, expectedRightOffset);
+    await fixture.editor.flush();
+  });
 }
 
 Future<_SplitFixture> _pumpSplitBoard(WidgetTester tester) async {

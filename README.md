@@ -8,7 +8,7 @@ Canvas-, Persistenz- und Exportmodule bleiben für Desktop-Plattformen nutzbar.
 
 | Plattform | Status | Plattformspezifische Integration |
 | --- | --- | --- |
-| Android 7.0+ (API 24+) | Primärziel | Eingebettetes PP-OCRv5/ONNX mit Offline-Fallback, Systemwidget, SAF-PDF-Speicherung und Quick Share/Systemfreigabe |
+| Android 7.0+ (API 24+) | Primärziel | Eingebettetes PP-OCRv6-small/ONNX mit Offline-Fallback, Systemwidget, SAF-PDF-Speicherung und Quick Share/Systemfreigabe |
 | Windows 10/11 | Unterstütztes Entwicklungs- und Desktopziel | Windows Ink mit lokalem OCR-Fallback sowie Google Bilder über WebView2 |
 | Web | Buildziel, noch keine produktive Freigabe | PDFium-WASM bleibt erforderlich; Dateisystem-, LAN-Server- und Handschriftfunktionen sind nativ ausgelegt |
 | iOS, macOS, Linux | Vorbereitete Flutter-Runner | Gemeinsame Domain-, Rendering- und UI-Schichten sind vorhanden; native Feature-Parität und Release-Qualifizierung stehen aus |
@@ -27,8 +27,9 @@ ist.
 - robuste Trennung von Stylus, Finger-Navigation, optionalem Finger-Schreiben,
   Palm-Rejection sowie partiellem Stift-/Faust-Radierer. Android übergibt die
   tatsächliche, zur Flutter-View ausgerichtete Kontaktellipse aus Mittelpunkt,
-  Haupt-/Nebenachse und Orientierung; Stift-Radiercursor und Löschpfad
-  entsprechen bei jedem Zoom der eingestellten 1–32-px-Dicke
+  Haupt-/Nebenachse und Orientierung. Werkzeug- und Faust-Radierer werden
+  automatisch in Bildschirmkoordinaten dimensioniert; sichtbarer Cursor und
+  tatsächlicher Löschpfad stimmen bei jedem Zoom überein
 - umschaltbarer Ein-/Zwei-Personen-Modus: Im geteilten Betrieb besitzt jede
   Hälfte ein eigenes Radialmenü, einen eigenen Stiftzustand sowie einen
   eigenen Eingabebereich, Viewport und aktiven Seitenzustand. Beide Hälften
@@ -83,7 +84,7 @@ ist.
   HTTP-Download per WLAN/Ethernet und QR-Code; auf Android zusätzlich Teilen
   über Quick Share beziehungsweise das System-Share-Sheet
 - lokale Handschrifterkennung ohne Laufzeit-Download: unter Android primär mit
-  dem im APK gebündelten, handschriftfähigen PP-OCRv5-Latin-Modell über ONNX
+  dem im APK gebündelten, handschriftfähigen PP-OCRv6-small-Modell über ONNX
   Runtime und mit gebündeltem ML-Kit-Latin-Modell als defensivem Fallback;
   unter Windows primär mit Windows Ink und bei nicht installiertem
   Handschrift-Feature mit lokaler Windows OCR
@@ -96,8 +97,9 @@ ist.
   Glyphbreite. Bereits gespeicherte Textfelder werden beim ersten Öffnen
   einmalig, verlustfrei und ohne Undo-Eintrag auf die neuen Maße migriert
 - driftfreier Countdown-Timer in der Kopfleiste mit Start, Pause, Zurücksetzen
-  und akustischem Signal; die große Timeranzeige ist frei verschiebbar und
-  skalierbar, während die übrige Schreibfläche vollständig bedienbar bleibt
+  und einem bis zur Bestätigung wiederholten akustischen Alarm; Kopfleiste und
+  große, frei verschiebbare sowie skalierbare Anzeige verwenden denselben
+  atomaren Live-Zustand, während die übrige Schreibfläche bedienbar bleibt
 - Android-Systemwidget mit „Neues Whiteboard“, größenabhängiger Liste und
   Öffnen zuletzt verwendeter Dokumente
 - responsive Dokumentbibliothek mit echten Inhaltsvorschauen, Recovery-Status,
@@ -292,14 +294,19 @@ ausgeführt, ist stattdessen in den SMART-Ink-Fensterwerkzeugen
 ## Bedienung auf dem Smartboard
 
 - Stylus: schreiben; invertierter Stylus oder „Radiergummi“ im Stiftfächer:
-  mit der eingestellten Dicke partiell radieren
-- breite Hand-/Faustkante: nur die überstrichenen Linienabschnitte werden
-  unabhängig vom aktiven Werkzeug und vom Menüstatus entfernt. Androids native
+  partiell radieren. Die Radiergröße folgt automatisch der gemeldeten
+  Stift-/Hardwarekontaktfläche und ist unabhängig von der Stiftdicke
+- mit der Unterseite der geballten Faust oder einer breit aufgelegten Hand über
+  die Tinte wischen: Nur die überstrichenen Linienabschnitte werden unabhängig
+  vom aktiven Werkzeug und vom Menüstatus entfernt. Der sichtbare Kreis folgt
+  der erkannten Auflagefläche und entspricht exakt dem Löschbereich. Androids native
   Palm-Klassifizierung (`TOOL_TYPE_PALM`, `FLAG_CANCELED` und der ältere
   `ACTION_CANCEL`-Pfad) wird zusätzlich zum Flutter-Kontaktprofil ausgewertet.
   Teilt ein Touchpanel die Faust in mehrere kleine Kontakte auf, erkennt die
   App drei oder mehr kompakte, gemeinsam bewegte Kontakte als eine
-  Radiergeste; der gesamte Wisch bleibt ein einzelner Undo-Schritt
+  Radiergeste und bildet daraus einen gemeinsamen Kontakt-Hüllkreis; der
+  gesamte Wisch bleibt ein einzelner Undo-Schritt. Normale Ein-/Zwei-Finger-
+  Gesten bleiben Auswahl, Verschieben beziehungsweise Pan/Zoom
 - Finger-Schalter in der Kopfleiste aus (Standard): ein Finger auf leerem Board
   verschiebt die Fläche; eingeschaltet schreibt ein einzelner Finger. Ein
   zweiter Finger übernimmt weiterhin zuverlässig Pan und Zoom
@@ -308,9 +315,10 @@ ausgeführt, ist stattdessen in den SMART-Ink-Fensterwerkzeugen
 - Auswahlmodus: tippen wechselt nachvollziehbar zwischen Stroke, Buchstabe,
   Wort, Zeile und Skizze; ziehen erzeugt Rechteck oder Lasso, „Alles auswählen“
   erfasst den vollständigen Seiteninhalt
-- Auswahl verschieben oder skalieren: Inhalt und objektgebundene Annotationen
-  folgen der Geste live. Zwei Finger innerhalb des Auswahlrahmens skalieren
-  proportional per Pinch; der Undo-Schritt wird erst beim Loslassen erzeugt
+- Auswahl verschieben oder skalieren: Der gesamte sichtbare Auswahlrahmen ist
+  als Drag-Fläche nutzbar, Inhalt und objektgebundene Annotationen folgen live.
+  Ein Fingertipp auf freie Fläche hebt die Auswahl auf. Zwei Finger innerhalb
+  des Rahmens skalieren proportional; Undo entsteht erst beim Loslassen
 - Auswahl drehen: Der Griff links unten rotiert frei; langes Drücken bietet
   30°, 45°, 60°, 90°, Spiegeln und eine manuelle Gradeingabe
 - Auswahl anordnen: eine Ebene oder vollständig nach vorn beziehungsweise
@@ -328,10 +336,14 @@ ausgeführt, ist stattdessen in den SMART-Ink-Fensterwerkzeugen
   jeweiligen Bedienhälfte und beim Schließen kehrt das Zentrum an seine
   vorherige Randposition zurück. „Menüposition zurücksetzen“ in der Kopfleiste
   zentriert es im Sichtfeld
+- Stiftfarbe und die häufigen Stiftarten Normal, Gestrichelt und Gerade Linie
+  lassen sich direkt in der Kopfleiste wechseln; auf schmalen Displays liegen
+  dieselben Schnellaktionen im Überlaufmenü
 - bereits aktive Hauptfunktion erneut wählen: deren Außenringe einklappen
 - Stift: Farben bilden Ring 2; der große Dickenbogen und die kompakt gebündelten
   Typen Normal, Marker, Gestrichelt, Gerade Linie und Radiergummi bilden Ring 3.
-  Der Dickenbogen steuert auch den Werkzeug-Radierer; dessen eigenes
+  Der Dickenbogen wird nur für zeichnende Stifte angezeigt. Beim Radiergummi
+  wird die Größe automatisch aus dem Live-Kontakt bestimmt; dessen eigenes
   Blockradierer-Glyph zeigt mit einer unterbrochenen Tintenlinie eindeutig die
   Löschfunktion
 - Vorlagen: Ring 2 enthält die vier eingebauten Vorlagen und „Eigene Vorlagen“;
@@ -340,9 +352,13 @@ ausgeführt, ist stattdessen in den SMART-Ink-Fensterwerkzeugen
   Vorlage
 - vorherige/nächste/neue Seite: führt die Aktion aus und öffnet das zyklische
   Miniatur-Drehrad; Kreisbewegung oder eine Fünf-Finger-Kreisgeste wechselt
-  weiter, einschließlich des Übergangs letzte ↔ erste Seite
+  weiter, einschließlich des Übergangs letzte ↔ erste Seite. Langes Drücken
+  einer Vorschau bietet das bestätigte, per Undo rücknehmbare Löschen an
 - Seitensymbol in der Kopfleiste: breites Seitenfach mit echten Miniaturen;
   horizontal wischen oder scrollen, um weitere Seiten direkt anzuwählen
+- neben der Seitenzahl in der Kopfleiste: Pfeile für vorherige/nächste Seite
+  sowie Schaltflächen für eine neue beziehungsweise die bestätigte Löschung
+  der aktuellen Seite; die letzte verbleibende Seite ist geschützt
 - Pfeil am rechten Ende der Kopfleiste: Leiste auf Zurück, Logo und
   Ausklapppfeil reduzieren beziehungsweise wieder vollständig anzeigen
 - Personen-Schalter in der Kopfleiste: zwischen voller Arbeitsfläche und zwei
@@ -350,8 +366,10 @@ ausgeführt, ist stattdessen in den SMART-Ink-Fensterwerkzeugen
   Seiten wirken nur auf die auslösende Hälfte; Inhalte bleiben beim Umschalten
   unverändert erhalten
 - Timer-Symbol in der Kopfleiste: Dauer einstellen, starten, pausieren oder
-  zurücksetzen; die große Anzeige kann ohne Schreibunterbrechung verschoben und
-  in der Größe angepasst werden
+  zurücksetzen; ab einer Minute Restzeit erscheint die große Anzeige
+  automatisch. Sie kann ohne Schreibunterbrechung verschoben und skaliert
+  werden. Bei 00:00 bleibt sie geöffnet und der Alarm wird wiederholt, bis er
+  dort ausdrücklich bestätigt wird
 - Info-Symbol in der Kopfleiste: kompakte Hilfe zu Stift, Navigation,
   Radialmenü, Auswahl, Text, Ebenen, Speicherung und Teilen
 - Textobjekt auswählen und „Text mit Stift korrigieren“ wählen: direkt über ein
@@ -446,22 +464,24 @@ Die App enthält eine unabhängige `HandwritingRecognitionService`-Grenze und ei
 echte Auswahlaktion „Handschrift in Text umwandeln“. Android implementiert den
 Channel `de.flowboardx/handwriting_recognition`. Android rastert die ausgewählte
 Vektortinte außerhalb des UI-Threads und führt als primäre Engine das offizielle
-`latin_PP-OCRv5_mobile_rec` aus. Dieses Modell ist auf lateinische Sprachen und
-komplexe Handschrift ausgelegt. Die Inferenz läuft lokal über ONNX Runtime:
-Modell (8.042.023 Bytes), Originalkonfiguration und Lizenztexte sind vollständig
-im APK enthalten. Es findet weder beim ersten Start noch später ein
+`PP-OCRv6_small_rec` aus. Dieses Modell unterstützt 50 Sprachen und wurde
+ausdrücklich auch auf Handschrift trainiert. Die Inferenz läuft lokal über ONNX
+Runtime: Modell (21.159.378 Bytes), Originalkonfiguration und Lizenztexte sind
+vollständig im APK enthalten. Es findet weder beim ersten Start noch später ein
 Modell-Download statt. Falls ONNX Runtime auf einem ungewöhnlichen Gerät nicht
-initialisiert werden kann, bleibt das ebenfalls gebündelte
-`com.google.mlkit:text-recognition:16.0.1` als defensiver Offline-Fallback
-verfügbar; die Play-Services-Variante wird nicht verwendet.
+initialisiert werden kann oder ein Kandidat nicht sicher genug ist, bleibt das
+ebenfalls gebündelte `com.google.mlkit:text-recognition:16.0.1` als defensiver,
+unabhängiger Offline-Fallback verfügbar; die Play-Services-Variante wird nicht
+verwendet.
 
 Beim ersten Erkennungsauftrag wird das unveränderliche ONNX-Asset atomar in den
 privaten App-Speicher gestreamt und von dort geladen. Dadurch liegen nicht
 gleichzeitig eine vollständige Java-Bytekopie und das native Modell im Speicher.
 Session, Session-Optionen und wiederverwendeter Tensorpuffer besitzen einen
-gemeinsamen, serialisierten Lebenszyklus. Eine erfolgreich ausgeführte
-PP-OCR-Inferenz lädt nicht zusätzlich die ML-Kit-Laufzeit; der Fallback wird erst
-bei einer technisch nicht verfügbaren primären Engine initialisiert.
+gemeinsamen, serialisierten Lebenszyklus. Die ML-Kit-Laufzeit wird nur dann
+lazy initialisiert, wenn PP-OCR technisch nicht verfügbar ist oder sein
+Ergebnis keine ausreichend sichere Einzel- beziehungsweise geometrische
+Evidenz besitzt.
 
 ONNX Runtime löst einen Teil seiner Java-Typen aus nativem JNI-Code über feste
 Binärnamen auf. Der Android-Release übernimmt deshalb die
@@ -478,9 +498,9 @@ einen bereits laufenden nativen ORT-Aufruf beenden, statt nur den Dart-Future
 abzubrechen.
 
 Modellquelle:
-[`PaddlePaddle/latin_PP-OCRv5_mobile_rec_onnx`](https://huggingface.co/PaddlePaddle/latin_PP-OCRv5_mobile_rec_onnx),
+[`PaddlePaddle/PP-OCRv6_small_rec_onnx`](https://huggingface.co/PaddlePaddle/PP-OCRv6_small_rec_onnx),
 SHA-256
-`7888113072263cb471b93f66dd5e2ad70548dc526fa1ace760d0d973dd121498`.
+`5435fd747c9e0efe15a96d0b378d5bd157e9492ed8fd80edf08f30d02fa24634`.
 
 Der Release-Build prüft Modell, Konfiguration und Lizenzen vor dem Verpacken
 bytegenau per SHA-256. Der nachgelagerte APK-Verifier kontrolliert zusätzlich
@@ -490,13 +510,20 @@ Zielgerät unvollständige APK auszuliefern.
 
 Androids geräteunabhängige Vorverarbeitung entfernt dichte
 Sampling-Duplikate, begrenzt Pfadkommandos und segmentiert die Vektortinte
-geometrisch in Zeilen. Für PP-OCRv5 wird jede Zeile seitenverhältnistreu auf
+geometrisch in Zeilen. Für PP-OCRv6 wird jede Zeile seitenverhältnistreu auf
 48 Pixel Höhe skaliert, in BGR/CHW angeordnet und exakt wie in der offiziellen
 Modellkonfiguration normalisiert. Ein eigener, getesteter CTC-Decoder bildet
-die 838 Ausgabeklassen einschließlich Leerzeichen und deutscher Sonderzeichen
+die 18.710 Ausgabeklassen einschließlich Leerzeichen und deutscher Sonderzeichen
 zurück. Mehrzeilige Ergebnisse werden erst übernommen, wenn jede Zeile erkannt
 wurde; bei unsicherem Ergebnis greift die bestehende Profil-, Wort- und
 Zeilenheuristik des Offline-Fallbacks.
+
+Da PP-OCRv6 ein gemeinsames mehrsprachiges Vokabular verwendet, berechnet die
+Android-Engine beim Sessionstart einmalig eine Latin-Klassenmaske. Der
+CTC-Decoder berücksichtigt danach nur Blank, Leerzeichen, lateinische
+Buchstaben einschließlich Umlauten und `ß`, Ziffern sowie übliche Satzzeichen.
+Visuell ähnliche griechische, kyrillische, CJK- oder Emoji-Klassen können daher
+deutschen Text nicht verdrängen; zugleich sinkt der Argmax-Aufwand deutlich.
 
 Strichreihenfolge und Zeitstempel unterstützen weiterhin die
 räumlich-zeitliche Worttrennung. Der Platform-Channel überträgt Koordinaten als

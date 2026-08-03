@@ -99,6 +99,8 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
       TouchContactClassifier();
   static const double _fiveFingerDetent = math.pi / 10;
   static const double _fiveFingerDetentHysteresis = .70;
+  static const int _minimumPageGestureFingers = 4;
+  static const int _maximumPageGestureFingers = 5;
 
   late RadialMenuController _controller;
   late bool _ownsController;
@@ -129,6 +131,7 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
   // available for ordinary one- and two-finger interaction.
   final Map<int, Offset> _menuPointers = <int, Offset>{};
   final Map<int, double> _fiveFingerAngularTravel = <int, double>{};
+  final Set<int> _pageGesturePointers = <int>{};
   final Set<int> _suppressedMenuPointers = <int>{};
   bool _fiveFingerPageGesture = false;
   int _fiveFingerStartPagePosition = 0;
@@ -136,6 +139,10 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
   bool _suppressMenuActivation = false;
   RadialHitTarget _hovered = RadialHitTarget.none;
   RadialHitTarget _pressed = RadialHitTarget.none;
+  List<RadialPagePreview>? _visiblePageSource;
+  int _visiblePageCurrentIndex = -1;
+  int _visiblePageWindowSize = -1;
+  List<RadialPagePreview> _visiblePageSnapshot = const <RadialPagePreview>[];
 
   @override
   void initState() {
@@ -230,6 +237,7 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
     _suppressMenuActivation = false;
     _menuPointers.clear();
     _fiveFingerAngularTravel.clear();
+    _pageGesturePointers.clear();
     _suppressedMenuPointers.clear();
     _controller.removeListener(_onControllerChanged);
     if (_ownsController) _controller.dispose();
@@ -491,6 +499,24 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
               setState(() => _pressed = RadialHitTarget.none);
             }
           },
+          onLongPressStart: (details) {
+            if (_suppressMenuActivation ||
+                _controller.activeBranch != RadialMenuBranch.pages ||
+                widget.pagePreviews.length <= 1) {
+              return;
+            }
+            final target = painter.hitTargetAt(
+              details.localPosition,
+              Size.square(_diameter),
+            );
+            if (target.layer != RadialMenuLayer.secondary) return;
+            final pages = _visiblePagePreviews();
+            if (target.index < 0 || target.index >= pages.length) return;
+            if (_pressed.isInteractive) {
+              setState(() => _pressed = RadialHitTarget.none);
+            }
+            widget.callbacks.onPageDeleteRequested?.call(pages[target.index]);
+          },
           onPanDown: (details) {
             _panStartTarget = painter.hitTargetAt(
               details.localPosition,
@@ -588,6 +614,7 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
       _panTravel = 0;
       return;
     }
+    final completedMode = _dragMode;
     final fallbackTarget =
         commitTapFallback &&
             _panStarted &&
@@ -604,6 +631,12 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
     if (_pressed.isInteractive) {
       setState(() => _pressed = RadialHitTarget.none);
     }
+    if (completedMode == _DragMode.center && _centerPosition != null) {
+      // Persist the final position once. Calling this callback for every
+      // pointer packet used to cancel and recreate the editor's debounce timer
+      // at stylus frequency while the radial menu was being dragged.
+      widget.callbacks.onPositionChanged?.call(_centerPosition!);
+    }
     if (fallbackTarget.isInteractive) {
       unawaited(_activateTarget(fallbackTarget));
     }
@@ -616,7 +649,6 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
       _centerPosition = next;
       _displayCenterPosition = next;
     });
-    widget.callbacks.onPositionChanged?.call(next);
   }
 
   void _setHovered(RadialHitTarget target) {
@@ -793,6 +825,7 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
   }
 
   void _setThicknessFromPosition(Offset position) {
+    if (_controller.penSettings.type == RadialPenType.eraser) return;
     final geometry = RadialMenuGeometry(Size.square(_diameter));
     final fraction = geometry.arcFractionFor(
       position,
@@ -807,6 +840,7 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
   }
 
   void _setThickness(double thickness) {
+    if (_controller.penSettings.type == RadialPenType.eraser) return;
     _updatePen(_controller.penSettings.copyWith(thickness: thickness));
   }
 
@@ -824,6 +858,11 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
   List<RadialPagePreview> _visiblePagePreviews() {
     final pages = widget.pagePreviews;
     if (pages.isEmpty) return const <RadialPagePreview>[];
+    if (identical(_visiblePageSource, pages) &&
+        _visiblePageCurrentIndex == widget.currentPageIndex &&
+        _visiblePageWindowSize == widget.pageWindowSize) {
+      return _visiblePageSnapshot;
+    }
     final current = widget.currentPageIndex.clamp(0, pages.length - 1);
     final window = math.min(widget.pageWindowSize, pages.length);
     final clockwise = window ~/ 2;
@@ -835,7 +874,10 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
     for (var distance = counterClockwise; distance >= 1; distance--) {
       result.add(pages[(current - distance) % pages.length]);
     }
-    return List<RadialPagePreview>.unmodifiable(result);
+    _visiblePageSource = pages;
+    _visiblePageCurrentIndex = widget.currentPageIndex;
+    _visiblePageWindowSize = widget.pageWindowSize;
+    return _visiblePageSnapshot = List<RadialPagePreview>.unmodifiable(result);
   }
 
   void _beginPageWheel(Offset position) {
@@ -871,9 +913,13 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
     // Some digitizers expose the lower edge of a fist as several neighbouring
     // touch contacts. Those contacts belong to the board eraser and must not
     // be consumed as a five-finger page command.
-    if (_touchContactClassifier.isBroadTouch(event)) return;
+    // Individual fingertips on large infrared/capacitive boards are
+    // sometimes reported just above the ordinary broad-touch threshold. Only
+    // reject unambiguously palm-sized contacts here; compact-cluster and
+    // angular-coverage checks below still keep a fist from claiming pages.
+    if (_touchContactClassifier.isStrongBroadTouch(event)) return;
     if (widget.pagePreviews.length < 2 ||
-        _menuPointers.length >= 5 ||
+        _menuPointers.length >= _maximumPageGestureFingers ||
         !_isInFiveFingerGestureZone(event.position)) {
       return;
     }
@@ -883,14 +929,19 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
 
   void _tryStartFiveFingerPageGesture() {
     if (_fiveFingerPageGesture ||
-        _menuPointers.length != 5 ||
+        _suppressMenuActivation ||
+        _menuPointers.length < _minimumPageGestureFingers ||
+        _menuPointers.length > _maximumPageGestureFingers ||
         !_hasFiveFingerAngularCoverage()) {
       return;
     }
 
     _fiveFingerPageGesture = true;
     _suppressMenuActivation = true;
-    _suppressedMenuPointers.addAll(_menuPointers.keys);
+    _pageGesturePointers
+      ..clear()
+      ..addAll(_menuPointers.keys);
+    _suppressedMenuPointers.addAll(_pageGesturePointers);
     widget.callbacks.onFiveFingerPageGestureChanged?.call(true);
     _dragMode = _DragMode.none;
     _panStartTarget = RadialHitTarget.none;
@@ -902,7 +953,9 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
     _fiveFingerDetentPosition = 0;
     _fiveFingerAngularTravel
       ..clear()
-      ..addEntries(_menuPointers.keys.map((pointer) => MapEntry(pointer, 0.0)));
+      ..addEntries(
+        _pageGesturePointers.map((pointer) => MapEntry(pointer, 0.0)),
+      );
     // Deliberately do not open the menu or mutate its branch. The floating
     // preview is the only added surface while the five contacts are held.
     if (mounted) {
@@ -916,14 +969,18 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
     final previous = _menuPointers[event.pointer];
     if (previous == null) return;
     if (!_fiveFingerPageGesture &&
-        _touchContactClassifier.isBroadTouch(event)) {
+        (_touchContactClassifier.isStrongBroadTouch(event) ||
+            !_isInFiveFingerGestureZone(event.position))) {
       _menuPointers.remove(event.pointer);
       _fiveFingerAngularTravel.remove(event.pointer);
       return;
     }
     _menuPointers[event.pointer] = event.position;
     if (!_fiveFingerPageGesture) _tryStartFiveFingerPageGesture();
-    if (!_fiveFingerPageGesture || _menuPointers.length != 5) return;
+    if (!_fiveFingerPageGesture ||
+        !_pageGesturePointers.contains(event.pointer)) {
+      return;
+    }
     final center = _globalMenuCenter;
     if (center == null) return;
     var delta =
@@ -936,10 +993,11 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
   }
 
   void _handleFiveFingerPointerEnd(PointerEvent event) {
+    final wasGesturePointer = _pageGesturePointers.contains(event.pointer);
     _menuPointers.remove(event.pointer);
     _fiveFingerAngularTravel.remove(event.pointer);
     _suppressedMenuPointers.remove(event.pointer);
-    if (_fiveFingerPageGesture && _menuPointers.length < 5) {
+    if (_fiveFingerPageGesture && wasGesturePointer) {
       if (event is PointerUpEvent) {
         _commitFiveFingerPageGesture();
       } else {
@@ -970,6 +1028,20 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
   bool _isInFiveFingerGestureZone(Offset globalPosition) {
     final center = _globalMenuCenter;
     if (center == null) return false;
+    if (widget.confineToBounds) {
+      final renderObject = context.findRenderObject();
+      if (renderObject is! RenderBox ||
+          !renderObject.attached ||
+          !renderObject.hasSize) {
+        return false;
+      }
+      final local = renderObject.globalToLocal(globalPosition);
+      if (!local.dx.isFinite ||
+          !local.dy.isFinite ||
+          !(Offset.zero & renderObject.size).contains(local)) {
+        return false;
+      }
+    }
     final geometry = RadialMenuGeometry(Size.square(_diameter));
     final radius = (globalPosition - center).distance;
     // Keep the centre free for normal menu activation and for clustered palm
@@ -980,7 +1052,11 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
 
   bool _hasFiveFingerAngularCoverage() {
     final center = _globalMenuCenter;
-    if (center == null || _menuPointers.length != 5) return false;
+    if (center == null ||
+        _menuPointers.length < _minimumPageGestureFingers ||
+        _menuPointers.length > _maximumPageGestureFingers) {
+      return false;
+    }
     final angles =
         _menuPointers.values
             .map((position) => _angleAround(center, position))
@@ -1006,16 +1082,23 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
           : angles.first + math.pi * 2;
       largestGap = math.max(largestGap, next - current);
     }
-    // Five fingertips may naturally occupy only part of the wheel, but a
-    // clustered fist contact leaves one almost complete-circle gap. Requiring
-    // at least 153 degrees of circular coverage keeps a one-handed turn easy
-    // while rejecting that eraser footprint.
-    return largestGap <= math.pi * 1.15;
+    // At a screen edge or split divider, users can physically reach only a
+    // quadrant of the wheel. Ninety degrees of coverage plus the pair-distance
+    // requirement still rejects a compact fist cluster while making four
+    // genuine fingertips usable at every legal menu position.
+    return largestGap <= math.pi * 1.5;
   }
 
   void _emitCoherentFiveFingerDetents() {
     final pageCount = widget.pagePreviews.length;
-    if (pageCount < 2 || _fiveFingerAngularTravel.length != 5) return;
+    final pointerCount = _pageGesturePointers.length;
+    if (pageCount < 2 ||
+        pointerCount < _minimumPageGestureFingers ||
+        pointerCount > _maximumPageGestureFingers ||
+        _fiveFingerAngularTravel.length != pointerCount) {
+      return;
+    }
+    final requiredSupport = math.max(3, pointerCount - 1);
     var changed = false;
     while (true) {
       final values = _fiveFingerAngularTravel.values.toList(growable: false)
@@ -1032,9 +1115,9 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
       final backwardSupport = values
           .where((value) => value <= backwardThreshold)
           .length;
-      final direction = forwardSupport >= 4
+      final direction = forwardSupport >= requiredSupport
           ? 1
-          : backwardSupport >= 4
+          : backwardSupport >= requiredSupport
           ? -1
           : 0;
       if (direction == 0) break;
@@ -1062,6 +1145,7 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
     _pageWheelTravel = 0;
     _fiveFingerDetentPosition = 0;
     _fiveFingerAngularTravel.clear();
+    _pageGesturePointers.clear();
     if (mounted) setState(() {});
   }
 

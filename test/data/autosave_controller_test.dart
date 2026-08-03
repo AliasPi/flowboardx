@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -121,6 +122,87 @@ void main() {
     expect(repository.saved, isNotEmpty);
     await autosave.dispose();
   });
+
+  test('never starts a full save during latency-sensitive ink input', () async {
+    final repository = _MemoryRepository();
+    final base = WhiteboardDocument.create(
+      id: 'interactive',
+      now: DateTime.utc(2026),
+    );
+    final autosave = AutosaveController(
+      repository,
+      base.id,
+      debounce: const Duration(milliseconds: 1),
+      maxLatency: const Duration(milliseconds: 12),
+      interactionIdleDelay: const Duration(milliseconds: 15),
+    );
+
+    autosave.beginInteraction();
+    autosave.schedule(base.copyWith(revision: 1));
+    await Future<void>.delayed(const Duration(milliseconds: 35));
+    expect(
+      repository.saveAttempts,
+      0,
+      reason: 'document encoding must not compete with active stylus frames',
+    );
+
+    autosave.endInteraction();
+    await Future<void>.delayed(const Duration(milliseconds: 30));
+    expect(repository.saved.single.revision, 1);
+    await autosave.dispose();
+  });
+
+  test(
+    'queued pointer-down cancels save before repository snapshot work',
+    () async {
+      final repository = _MemoryRepository();
+      final document = WhiteboardDocument.create(
+        id: 'preflight-race',
+        now: DateTime.utc(2026),
+      );
+      final autosave = AutosaveController(
+        repository,
+        document.id,
+        debounce: Duration.zero,
+        interactionIdleDelay: const Duration(milliseconds: 15),
+      );
+
+      autosave.schedule(document);
+      Timer.run(autosave.beginInteraction);
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+
+      expect(
+        repository.saveAttempts,
+        0,
+        reason: 'queued input must win before an isolate snapshot is captured',
+      );
+
+      autosave.endInteraction();
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+      expect(repository.saved.single.id, document.id);
+      await autosave.dispose();
+    },
+  );
+
+  test(
+    'lifecycle flush remains durable during an active interaction',
+    () async {
+      final repository = _MemoryRepository();
+      final document = WhiteboardDocument.create(
+        id: 'interactive-flush',
+        now: DateTime.utc(2026),
+      );
+      final autosave = AutosaveController(repository, document.id);
+
+      autosave.beginInteraction();
+      autosave.schedule(document);
+      await autosave.flush();
+
+      expect(repository.saved.single.id, document.id);
+      autosave.endInteraction();
+      await autosave.dispose();
+    },
+  );
 }
 
 final class _MemoryRepository implements DocumentRepository {

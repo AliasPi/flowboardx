@@ -21,6 +21,58 @@ typedef CountdownScheduler =
 
 enum CountdownTimerStatus { idle, running, paused, finished }
 
+/// Presentation milestones that may request the non-modal large timer panel.
+///
+/// A stage is deliberately derived from the authoritative countdown state. It
+/// therefore also changes correctly after an app resume without relying on a
+/// particular one-second wake-up having run in the foreground.
+enum CountdownTimerPresentationStage { none, finalMinute, alarm }
+
+/// Immutable state consumed by every countdown presentation.
+///
+/// Keeping the toolbar and the large overlay on this single listenable avoids
+/// presentation-local timer copies and guarantees that both views render the
+/// same tick and alarm state.
+@immutable
+final class CountdownTimerState {
+  const CountdownTimerState({
+    required this.configuredDuration,
+    required this.remaining,
+    required this.status,
+    required this.alarmActive,
+  });
+
+  final Duration configuredDuration;
+  final Duration remaining;
+  final CountdownTimerStatus status;
+  final bool alarmActive;
+
+  bool get isRunning => status == CountdownTimerStatus.running;
+  bool get isPaused => status == CountdownTimerStatus.paused;
+  bool get isFinished => status == CountdownTimerStatus.finished;
+
+  CountdownTimerPresentationStage get presentationStage {
+    if (alarmActive) return CountdownTimerPresentationStage.alarm;
+    if (isRunning && remaining <= const Duration(minutes: 1)) {
+      return CountdownTimerPresentationStage.finalMinute;
+    }
+    return CountdownTimerPresentationStage.none;
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is CountdownTimerState &&
+          configuredDuration == other.configuredDuration &&
+          remaining == other.remaining &&
+          status == other.status &&
+          alarmActive == other.alarmActive;
+
+  @override
+  int get hashCode =>
+      Object.hash(configuredDuration, remaining, status, alarmActive);
+}
+
 /// Drift-resistant countdown state that owns at most one native timer.
 ///
 /// The controller derives the remaining duration from a monotonic deadline
@@ -32,14 +84,20 @@ final class CountdownTimerController extends ChangeNotifier {
     VoidCallback? onAlarm,
     CountdownNow? now,
     CountdownScheduler? scheduler,
-    this.refreshInterval = const Duration(milliseconds: 200),
+    this.refreshInterval = const Duration(seconds: 1),
+    this.alarmRepeatInterval = const Duration(seconds: 1),
   }) : assert(!refreshInterval.isNegative && refreshInterval > Duration.zero),
+       assert(
+         !alarmRepeatInterval.isNegative && alarmRepeatInterval > Duration.zero,
+       ),
        _configuredDuration = clampCountdownDuration(initialDuration),
        _remaining = clampCountdownDuration(initialDuration),
        _onAlarm = onAlarm,
        _clock = now == null ? _MonotonicClock() : null,
        _nowOverride = now,
-       _scheduler = scheduler ?? _scheduleWithDartTimer;
+       _scheduler = scheduler ?? _scheduleWithDartTimer {
+    _liveState = ValueNotifier<CountdownTimerState>(_snapshot());
+  }
 
   static const Duration maximumDuration = Duration(
     hours: 23,
@@ -48,6 +106,7 @@ final class CountdownTimerController extends ChangeNotifier {
   );
 
   final Duration refreshInterval;
+  final Duration alarmRepeatInterval;
   final VoidCallback? _onAlarm;
   final _MonotonicClock? _clock;
   final CountdownNow? _nowOverride;
@@ -57,9 +116,12 @@ final class CountdownTimerController extends ChangeNotifier {
   Duration _remaining;
   Duration? _deadline;
   CountdownWakeUp? _wakeUp;
+  CountdownWakeUp? _alarmWakeUp;
+  late final ValueNotifier<CountdownTimerState> _liveState;
   CountdownTimerStatus _status = CountdownTimerStatus.idle;
   int _generation = 0;
-  bool _alarmDelivered = false;
+  int _alarmGeneration = 0;
+  bool _alarmActive = false;
   bool _disposed = false;
 
   Duration get configuredDuration => _configuredDuration;
@@ -68,6 +130,12 @@ final class CountdownTimerController extends ChangeNotifier {
   bool get isRunning => _status == CountdownTimerStatus.running;
   bool get isPaused => _status == CountdownTimerStatus.paused;
   bool get isFinished => _status == CountdownTimerStatus.finished;
+  bool get isAlarmActive => _alarmActive;
+
+  /// Atomic live state shared by the toolbar and the resizable overlay.
+  ValueListenable<CountdownTimerState> get liveState => _liveState;
+
+  CountdownTimerState get state => _liveState.value;
 
   /// Remaining fraction in the inclusive range 0…1.
   double get remainingFraction {
@@ -84,6 +152,7 @@ final class CountdownTimerController extends ChangeNotifier {
     if (_disposed) return;
     final value = clampCountdownDuration(duration);
     _invalidateWakeUp();
+    _stopAlarm(notify: false);
     final changed =
         _configuredDuration != value ||
         _remaining != value ||
@@ -92,8 +161,7 @@ final class CountdownTimerController extends ChangeNotifier {
     _remaining = value;
     _deadline = null;
     _status = CountdownTimerStatus.idle;
-    _alarmDelivered = false;
-    if (changed) notifyListeners();
+    if (changed) _publish();
   }
 
   /// Starts a fresh timer or resumes a paused timer.
@@ -101,16 +169,16 @@ final class CountdownTimerController extends ChangeNotifier {
   /// A finished timer starts again with its configured duration.
   bool start() {
     if (_disposed || _status == CountdownTimerStatus.running) return false;
+    _stopAlarm(notify: false);
     if (_status == CountdownTimerStatus.finished) {
       _remaining = _configuredDuration;
-      _alarmDelivered = false;
     }
     if (_remaining <= Duration.zero) return false;
 
     _invalidateWakeUp();
     _deadline = _now() + _remaining;
     _status = CountdownTimerStatus.running;
-    notifyListeners();
+    _publish();
     _scheduleNextWakeUp();
     return true;
   }
@@ -123,7 +191,7 @@ final class CountdownTimerController extends ChangeNotifier {
     _invalidateWakeUp();
     _deadline = null;
     _status = CountdownTimerStatus.paused;
-    notifyListeners();
+    _publish();
     return true;
   }
 
@@ -131,14 +199,25 @@ final class CountdownTimerController extends ChangeNotifier {
   void reset() {
     if (_disposed) return;
     _invalidateWakeUp();
+    _stopAlarm(notify: false);
     final changed =
         _remaining != _configuredDuration ||
         _status != CountdownTimerStatus.idle;
     _remaining = _configuredDuration;
     _deadline = null;
     _status = CountdownTimerStatus.idle;
-    _alarmDelivered = false;
-    if (changed) notifyListeners();
+    if (changed) _publish();
+  }
+
+  /// Stops a finished timer's repeating alarm after an explicit user action.
+  ///
+  /// The timer remains at `00:00`, making the elapsed state visible until the
+  /// user starts it again or resets it.
+  bool acknowledgeAlarm() {
+    if (_disposed || !_alarmActive) return false;
+    _stopAlarm(notify: false);
+    _publish();
+    return true;
   }
 
   /// Synchronizes immediately, useful after returning from the background.
@@ -184,19 +263,25 @@ final class CountdownTimerController extends ChangeNotifier {
       _remaining = Duration.zero;
       _deadline = null;
       _status = CountdownTimerStatus.finished;
-      notifyListeners();
-      if (deliverAlarm) _deliverAlarmOnce();
+      if (deliverAlarm) _startAlarm();
+      _publish();
       return;
     }
 
     _remaining = nextRemaining;
-    notifyListeners();
+    _publish();
     if (scheduleNext) _scheduleNextWakeUp();
   }
 
-  void _deliverAlarmOnce() {
-    if (_alarmDelivered || _disposed) return;
-    _alarmDelivered = true;
+  void _startAlarm() {
+    if (_disposed || _alarmActive) return;
+    _alarmActive = true;
+    _deliverAlarmPulse();
+    _scheduleNextAlarmPulse();
+  }
+
+  void _deliverAlarmPulse() {
+    if (!_alarmActive || _disposed) return;
     final callback = _onAlarm;
     if (callback == null) return;
     try {
@@ -213,6 +298,45 @@ final class CountdownTimerController extends ChangeNotifier {
     }
   }
 
+  void _scheduleNextAlarmPulse() {
+    if (_disposed || !_alarmActive) return;
+    _alarmWakeUp?.cancel();
+    final generation = _alarmGeneration;
+    _alarmWakeUp = _scheduler(alarmRepeatInterval, () {
+      if (_disposed || generation != _alarmGeneration || !_alarmActive) {
+        return;
+      }
+      _alarmWakeUp = null;
+      _deliverAlarmPulse();
+      _scheduleNextAlarmPulse();
+    });
+  }
+
+  void _stopAlarm({required bool notify}) {
+    final changed = _alarmActive;
+    _alarmGeneration++;
+    _alarmWakeUp?.cancel();
+    _alarmWakeUp = null;
+    _alarmActive = false;
+    if (notify && changed) _publish();
+  }
+
+  CountdownTimerState _snapshot() => CountdownTimerState(
+    configuredDuration: _configuredDuration,
+    remaining: _remaining,
+    status: _status,
+    alarmActive: _alarmActive,
+  );
+
+  void _publish() {
+    if (_disposed) return;
+    final snapshot = _snapshot();
+    if (_liveState.value != snapshot) {
+      _liveState.value = snapshot;
+    }
+    if (!_disposed) notifyListeners();
+  }
+
   void _invalidateWakeUp() {
     _generation++;
     _wakeUp?.cancel();
@@ -224,7 +348,9 @@ final class CountdownTimerController extends ChangeNotifier {
     if (_disposed) return;
     _disposed = true;
     _invalidateWakeUp();
+    _stopAlarm(notify: false);
     _deadline = null;
+    _liveState.dispose();
     super.dispose();
   }
 }

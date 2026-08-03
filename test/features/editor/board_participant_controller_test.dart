@@ -34,10 +34,13 @@ void main() {
     expect(participant.penStyle.type, InkToolType.normal);
   });
 
-  test('participants keep independent stylus eraser thicknesses', () {
-    final left = BoardParticipantController(id: 'left')..updateEraserWidth(2);
+  test('selecting eraser preserves each participant ink thickness', () {
+    final left = BoardParticipantController(id: 'left')
+      ..updatePen(width: 2)
+      ..selectEraser();
     final right = BoardParticipantController(id: 'right')
-      ..updateEraserWidth(32);
+      ..updatePen(width: 32)
+      ..selectEraser();
     addTearDown(left.dispose);
     addTearDown(right.dispose);
 
@@ -46,8 +49,8 @@ void main() {
     expect(right.tool, BoardTool.eraser);
     expect(right.penStyle.width, 32);
 
-    left.updateEraserWidth(12);
-    expect(left.penStyle.width, 12);
+    left.selectEraser();
+    expect(left.penStyle.width, 2);
     expect(right.penStyle.width, 32);
   });
 

@@ -28,20 +28,12 @@ final class AddStrokeCommand implements DocumentCommand {
   @override
   WhiteboardDocument apply(WhiteboardDocument document) {
     final page = _page(document, pageId);
-    if (_allStrokeIds(page).contains(stroke.id)) {
+    if (_containsStrokeId(page, stroke.id)) {
       throw StateError('Strich-ID ${stroke.id} ist bereits vorhanden.');
     }
     if (objectId == null) {
-      final topmost = stroke.copyWith(
-        zIndex: nextBoardSceneZIndex(
-          objects: page.objects,
-          strokes: page.strokes,
-        ),
-      );
-      return document.replacePage(
-        page.copyWith(strokes: [...page.strokes, topmost]),
-        now: now,
-      );
+      final topmost = stroke.copyWith(zIndex: page.nextTopLevelSceneZIndex);
+      return document.replacePage(page.appendTopLevelStroke(topmost), now: now);
     }
     if (page.objectById(objectId!) == null) {
       throw StateError('Annotationsziel $objectId existiert nicht.');
@@ -64,22 +56,12 @@ final class AddStrokeCommand implements DocumentCommand {
               : '${objectId!}.pdf.$pdfPageIndex.annotations',
           objectId: objectId!,
           pdfPageIndex: pdfPageIndex,
-          strokes: [stroke.copyWith(zIndex: 0)],
-        ),
+        ).appendStroke(stroke, pdfPageIndex: pdfPageIndex),
       );
     } else {
-      final layer = layers[index];
-      final maximum = layer.strokes.fold<int>(
-        -1,
-        (value, candidate) =>
-            candidate.zIndex > value ? candidate.zIndex : value,
-      );
-      layers[index] = layers[index].copyWith(
+      layers[index] = layers[index].appendStroke(
+        stroke,
         pdfPageIndex: pdfPageIndex,
-        strokes: [
-          ...layer.strokes,
-          stroke.copyWith(zIndex: maximum + 1),
-        ],
       );
     }
     return document.replacePage(
@@ -102,12 +84,12 @@ final class AddObjectCommand implements DocumentCommand {
   @override
   WhiteboardDocument apply(WhiteboardDocument document) {
     final page = _page(document, pageId);
-    if (_allItemIds(page).contains(object.id)) {
+    if (_containsItemId(page, object.id)) {
       throw StateError('Objekt-ID ${object.id} ist bereits vorhanden.');
     }
     final topmost = copyBoardObjectWithZIndex(
       object,
-      nextBoardSceneZIndex(objects: page.objects, strokes: page.strokes),
+      page.nextTopLevelSceneZIndex,
     );
     return document.replacePage(
       page.copyWith(objects: [...page.objects, topmost]),
@@ -189,39 +171,46 @@ final class DeleteItemsCommand implements DocumentCommand {
     final nextObjects = page.objects
         .where((object) => !objectIds.contains(object.id))
         .toList();
-    final nextAnnotations = page.annotationLayers
-        .where((layer) => !objectIds.contains(layer.objectId))
-        .map(
-          (layer) => layer.copyWith(
-            strokes: layer.strokes.where(
-              (stroke) => !itemIds.contains(stroke.id),
-            ),
-          ),
-        )
-        .toList();
+    final nextAnnotations = <ObjectInkLayer>[
+      for (final layer in page.annotationLayers)
+        if (!objectIds.contains(layer.objectId))
+          if (layer.strokes.any((stroke) => itemIds.contains(stroke.id)))
+            layer.copyWith(
+              strokes: layer.strokes.where(
+                (stroke) => !itemIds.contains(stroke.id),
+              ),
+            )
+          else
+            layer,
+    ];
     final byStrokeId = {for (final stroke in nextStrokes) stroke.id: stroke};
     final nextGroups = _repairGroups(
       page.groups,
       byStrokeId,
       removedGroupIds: itemIds,
+      changedStrokeIds: strokeIds,
     );
     final nextContentGroups = _repairContentGroups(
       page.contentGroups,
       byStrokeId,
       {for (final object in nextObjects) object.id: object},
       removedGroupIds: itemIds,
+      changedItemIds: <String>{...strokeIds, ...objectIds},
     );
-    final remainingIds = {
-      ...nextStrokes.map((stroke) => stroke.id),
-      ...nextObjects.map((object) => object.id),
-      ...nextGroups.map((group) => group.id),
-      ...nextContentGroups.map((group) => group.id),
-    };
-    final nextSelection = page.selection.copyWith(
-      selectedItemIds: page.selection.selectedItemIds.where(
-        remainingIds.contains,
-      ),
-    );
+    var nextSelection = page.selection;
+    if (nextSelection.selectedItemIds.isNotEmpty) {
+      final remainingIds = {
+        ...nextStrokes.map((stroke) => stroke.id),
+        ...nextObjects.map((object) => object.id),
+        ...nextGroups.map((group) => group.id),
+        ...nextContentGroups.map((group) => group.id),
+      };
+      nextSelection = nextSelection.copyWith(
+        selectedItemIds: nextSelection.selectedItemIds.where(
+          remainingIds.contains,
+        ),
+      );
+    }
     return document.replacePage(
       page.copyWith(
         strokes: nextStrokes,
@@ -272,10 +261,14 @@ final class TransformItemsCommand implements DocumentCommand {
         )
         .toList();
     final byStrokeId = {for (final stroke in strokes) stroke.id: stroke};
-    final groups = _repairGroups(page.groups, byStrokeId);
+    final groups = _repairGroups(
+      page.groups,
+      byStrokeId,
+      changedStrokeIds: expandedIds,
+    );
     final contentGroups = _repairContentGroups(page.contentGroups, byStrokeId, {
       for (final object in objects) object.id: object,
-    });
+    }, changedItemIds: expandedIds);
     return document.replacePage(
       page.copyWith(
         strokes: strokes,
@@ -320,7 +313,7 @@ final class GroupItemsCommand implements DocumentCommand {
   @override
   WhiteboardDocument apply(WhiteboardDocument document) {
     final page = _page(document, pageId);
-    if (_allItemIds(page).contains(groupId)) {
+    if (_containsItemId(page, groupId)) {
       throw StateError('Gruppen-ID $groupId ist bereits vorhanden.');
     }
     final baseIds = {
@@ -542,23 +535,35 @@ BoardPage _page(WhiteboardDocument document, String pageId) {
   return page;
 }
 
-Set<String> _allItemIds(BoardPage page) => {
-  ...page.strokes.map((stroke) => stroke.id),
-  ...page.objects.map((object) => object.id),
-  ...page.groups.map((group) => group.id),
-  ...page.contentGroups.map((group) => group.id),
-  ...page.annotationLayers.map((layer) => layer.id),
-  ...page.annotationLayers
-      .expand((layer) => layer.strokes)
-      .map((stroke) => stroke.id),
-};
+bool _containsItemId(BoardPage page, String id) {
+  if (page.containsTopLevelStrokeId(id)) return true;
+  for (final object in page.objects) {
+    if (object.id == id) return true;
+  }
+  for (final group in page.groups) {
+    if (group.id == id) return true;
+  }
+  for (final group in page.contentGroups) {
+    if (group.id == id) return true;
+  }
+  for (final layer in page.annotationLayers) {
+    if (layer.id == id) return true;
+    for (final stroke in layer.strokes) {
+      if (stroke.id == id) return true;
+    }
+  }
+  return false;
+}
 
-Set<String> _allStrokeIds(BoardPage page) => {
-  ...page.strokes.map((stroke) => stroke.id),
-  ...page.annotationLayers
-      .expand((layer) => layer.strokes)
-      .map((stroke) => stroke.id),
-};
+bool _containsStrokeId(BoardPage page, String strokeId) {
+  if (page.containsTopLevelStrokeId(strokeId)) return true;
+  for (final layer in page.annotationLayers) {
+    for (final stroke in layer.strokes) {
+      if (stroke.id == strokeId) return true;
+    }
+  }
+  return false;
+}
 
 Set<String> _expandItemIds(BoardPage page, Iterable<String> selectedIds) {
   final result = selectedIds.toSet();
@@ -587,10 +592,16 @@ List<InkGroup> _repairGroups(
   Iterable<InkGroup> groups,
   Map<String, InkStroke> strokes, {
   Set<String> removedGroupIds = const {},
+  Set<String> changedStrokeIds = const {},
 }) {
   final result = <InkGroup>[];
   for (final group in groups) {
     if (removedGroupIds.contains(group.id)) continue;
+    final touchesChange = group.strokeIds.any(changedStrokeIds.contains);
+    if (!touchesChange && group.strokeIds.every(strokes.containsKey)) {
+      result.add(group);
+      continue;
+    }
     final members = group.strokeIds.where(strokes.containsKey).toList();
     if (members.isEmpty) continue;
     Rect2? bounds;
@@ -609,12 +620,18 @@ List<ContentGroup> _repairContentGroups(
   Map<String, InkStroke> strokes,
   Map<String, BoardObject> objects, {
   Set<String> removedGroupIds = const {},
+  Set<String> changedItemIds = const {},
 }) {
-  final validIds = {...strokes.keys, ...objects.keys};
+  bool isValid(String id) => strokes.containsKey(id) || objects.containsKey(id);
   final result = <ContentGroup>[];
   for (final group in groups) {
     if (removedGroupIds.contains(group.id)) continue;
-    final members = group.memberIds.where(validIds.contains).toList();
+    final touchesChange = group.memberIds.any(changedItemIds.contains);
+    if (!touchesChange && group.memberIds.every(isValid)) {
+      result.add(group);
+      continue;
+    }
+    final members = group.memberIds.where(isValid).toList();
     if (members.length < 2) continue;
     result.add(
       group.copyWith(

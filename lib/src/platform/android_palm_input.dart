@@ -58,6 +58,7 @@ final class NativePalmStroke {
     required this.radius,
     required this.contactCount,
     required this.source,
+    this.startedAsPalm = false,
     this.samples = const <NativePalmSample>[],
   });
 
@@ -74,6 +75,11 @@ final class NativePalmStroke {
 
   /// A bounded machine token such as `flag_cancel` or `tool_palm`.
   final String source;
+
+  /// Whether Android reported `TOOL_TYPE_PALM` on the initial DOWN packet.
+  /// A later FINGER-to-PALM promotion can be a misclassified selection; an
+  /// initial palm is explicit destructive intent from the device.
+  final bool startedAsPalm;
 
   static NativePalmStroke? tryParse(Object? value) {
     if (value is! Map) return null;
@@ -98,6 +104,10 @@ final class NativePalmStroke {
       final rawMajor = rawPoint['radiusMajor'] ?? rawPoint['radius'];
       final rawMinor = rawPoint['radiusMinor'];
       final rawOrientation = rawPoint['orientation'];
+      final rawTimestamp = rawPoint['timestampMillis'];
+      final rawSize = rawPoint['size'];
+      final rawPressure = rawPoint['pressure'];
+      final rawSampleContacts = rawPoint['contactCount'];
       final major = rawMajor is num && rawMajor.isFinite
           ? rawMajor.toDouble().clamp(0.0, 160.0)
           : 0.0;
@@ -116,6 +126,23 @@ final class NativePalmStroke {
           radiusMajor: major,
           radiusMinor: minor,
           orientation: orientation,
+          timeStamp: rawTimestamp is num && rawTimestamp.isFinite
+              ? Duration(
+                  microseconds: (rawTimestamp.toDouble() * 1000).round().clamp(
+                    0,
+                    0x7FFFFFFFFFFFFFFF,
+                  ),
+                )
+              : Duration.zero,
+          normalizedSize: rawSize is num && rawSize.isFinite
+              ? rawSize.toDouble().clamp(0.0, 1.0)
+              : 0,
+          normalizedPressure: rawPressure is num && rawPressure.isFinite
+              ? rawPressure.toDouble().clamp(0.0, 1.0)
+              : 0,
+          contactCount: rawSampleContacts is num
+              ? rawSampleContacts.toInt().clamp(1, 10)
+              : 1,
         ),
       );
     }
@@ -123,7 +150,7 @@ final class NativePalmStroke {
 
     final rawRadius = value['radius'];
     final radius = rawRadius is num && rawRadius.isFinite
-        ? rawRadius.toDouble().clamp(18.0, 96.0)
+        ? rawRadius.toDouble().clamp(18.0, 132.0)
         : 32.0;
     final rawContacts = value['contactCount'];
     final contactCount = rawContacts is num
@@ -134,12 +161,14 @@ final class NativePalmStroke {
         rawSource is String && RegExp(r'^[a-z0-9_]{1,32}$').hasMatch(rawSource)
         ? rawSource
         : 'native_palm';
+    final startedAsPalm = value['startedAsPalm'] == true;
     return NativePalmStroke(
       sessionId: rawId,
       points: List<Offset>.unmodifiable(points),
       radius: radius,
       contactCount: contactCount,
       source: source,
+      startedAsPalm: startedAsPalm,
       samples: List<NativePalmSample>.unmodifiable(samples),
     );
   }
@@ -152,11 +181,19 @@ final class NativePalmSample {
     required this.radiusMajor,
     required this.radiusMinor,
     required this.orientation,
+    this.timeStamp = Duration.zero,
+    this.normalizedSize = 0,
+    this.normalizedPressure = 0,
+    this.contactCount = 1,
   });
 
   final Offset position;
   final double radiusMajor;
   final double radiusMinor;
+  final Duration timeStamp;
+  final double normalizedSize;
+  final double normalizedPressure;
+  final int contactCount;
 
   /// Contact-major-axis angle measured from positive Y, in radians.
   final double orientation;

@@ -16,6 +16,58 @@ void main() {
     worldBoundaryX: boundary,
   );
 
+  test('initial split alignment places both inner edges on the divider', () {
+    final left = BoardViewport(scale: 1.35, offset: const Offset(275, 64));
+    final right = BoardViewport(scale: 1.35, offset: const Offset(275, 64));
+    addTearDown(left.dispose);
+    addTearDown(right.dispose);
+
+    left.alignToHorizontalPartition(
+      viewportSize: surfaceSize,
+      visibleScreenBounds: leftVisible,
+      horizontalConstraint: leftConstraint,
+    );
+    right.alignToHorizontalPartition(
+      viewportSize: surfaceSize,
+      visibleScreenBounds: rightVisible,
+      horizontalConstraint: rightConstraint,
+    );
+
+    expect(left.scale, 1.35);
+    expect(right.scale, 1.35);
+    expect(left.offset.dy, 64);
+    expect(right.offset.dy, 64);
+    expect(
+      left.screenToWorld(leftVisible.centerRight).dx,
+      closeTo(boundary, 1e-9),
+    );
+    expect(
+      right.screenToWorld(rightVisible.centerLeft).dx,
+      closeTo(boundary, 1e-9),
+    );
+  });
+
+  test('split alignment does not emit a redundant camera update', () {
+    final viewport = BoardViewport();
+    addTearDown(viewport.dispose);
+    var notifications = 0;
+    viewport.addListener(() => notifications++);
+
+    viewport.alignToHorizontalPartition(
+      viewportSize: surfaceSize,
+      visibleScreenBounds: leftVisible,
+      horizontalConstraint: leftConstraint,
+    );
+    expect(notifications, 1);
+
+    viewport.alignToHorizontalPartition(
+      viewportSize: surfaceSize,
+      visibleScreenBounds: leftVisible,
+      horizontalConstraint: leftConstraint,
+    );
+    expect(notifications, 1);
+  });
+
   test('left viewport cannot pan through the world divider', () {
     final viewport = BoardViewport();
     addTearDown(viewport.dispose);

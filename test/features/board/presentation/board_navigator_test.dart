@@ -99,6 +99,28 @@ void main() {
     });
   });
 
+  test('navigator samples the complete history with bounded work', () {
+    final indices = BoardNavigatorSampling.sampledIndices(
+      100000,
+      BoardNavigatorSampling.maximumStrokeCount,
+    );
+    final budgets = BoardNavigatorSampling.allocatePointBudgets(
+      List<int>.filled(indices.length, 10000, growable: false),
+    );
+
+    expect(indices, hasLength(BoardNavigatorSampling.maximumStrokeCount));
+    expect(indices.first, 0);
+    expect(indices.last, 99999);
+    for (var index = 1; index < indices.length; index++) {
+      expect(indices[index], greaterThan(indices[index - 1]));
+    }
+    expect(
+      budgets.fold<int>(0, (total, value) => total + value),
+      lessThanOrEqualTo(BoardNavigatorSampling.maximumTotalStrokePoints),
+    );
+    expect(budgets.every((value) => value > 0), isTrue);
+  });
+
   test('camera motion does not repaint static navigator content', () {
     final strokes = <InkStroke>[
       InkStroke(

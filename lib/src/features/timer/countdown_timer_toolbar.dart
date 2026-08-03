@@ -19,35 +19,57 @@ class CountdownTimerToolbarButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: controller,
-      builder: (context, _) {
-        final label = controller.status == CountdownTimerStatus.idle
+    return ValueListenableBuilder<CountdownTimerState>(
+      valueListenable: controller.liveState,
+      builder: (context, state, _) {
+        final label = state.alarmActive
+            ? 'Alarm bestätigen'
+            : state.status == CountdownTimerStatus.idle
             ? 'Timer'
-            : formatCountdown(controller.remaining);
-        final icon = controller.isRunning
+            : formatCountdown(state.remaining);
+        final icon = state.alarmActive
+            ? Icons.notifications_active_rounded
+            : state.isRunning
             ? Icons.timer_rounded
             : Icons.timer_outlined;
-        void onPressed() => showCountdownTimerSetup(
-          context,
-          controller: controller,
-          onShowLarge: onShowLarge,
-        );
+        void onPressed() {
+          if (state.alarmActive) {
+            // Alarm acknowledgement intentionally lives in the large panel.
+            // This avoids an accidental toolbar tap silently stopping an alarm
+            // while the acknowledgement UI is covered or off-screen.
+            onShowLarge();
+            return;
+          }
+          showCountdownTimerSetup(
+            context,
+            controller: controller,
+            onShowLarge: onShowLarge,
+          );
+        }
+
         if (showLabel) {
           return TextButton.icon(
             key: const ValueKey('countdown-toolbar-button'),
             onPressed: onPressed,
-            icon: Icon(icon),
+            icon: Icon(
+              icon,
+              color: state.alarmActive ? FlowboardColors.warning : null,
+            ),
             label: Text(label),
           );
         }
         return IconButton(
           key: const ValueKey('countdown-toolbar-button'),
-          tooltip: controller.isRunning
-              ? 'Timer: ${formatCountdown(controller.remaining)}'
+          tooltip: state.alarmActive
+              ? 'Alarm im großen Timerfenster bestätigen'
+              : state.isRunning
+              ? 'Timer: ${formatCountdown(state.remaining)}'
               : 'Timer einstellen',
           onPressed: onPressed,
-          icon: Icon(icon),
+          icon: Icon(
+            icon,
+            color: state.alarmActive ? FlowboardColors.warning : null,
+          ),
         );
       },
     );
@@ -87,6 +109,53 @@ class _CountdownTimerSetupDialogState extends State<CountdownTimerSetupDialog> {
 
   late int _editingSeconds = _initialSeconds();
   bool _dirty = false;
+  bool _autoDismissScheduled = false;
+  bool _routePopRequested = false;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.controller.addListener(_handleAutomaticPresentation);
+    _handleAutomaticPresentation();
+  }
+
+  @override
+  void didUpdateWidget(covariant CountdownTimerSetupDialog oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller == widget.controller) return;
+    oldWidget.controller.removeListener(_handleAutomaticPresentation);
+    _autoDismissScheduled = false;
+    _routePopRequested = false;
+    widget.controller.addListener(_handleAutomaticPresentation);
+    _handleAutomaticPresentation();
+  }
+
+  /// Never leave the setup dialog in front of the mandatory large display.
+  ///
+  /// This also covers a timer expiring while its setup dialog is still open:
+  /// the alarm acknowledgement remains reachable only in the large panel.
+  void _handleAutomaticPresentation() {
+    if (_autoDismissScheduled ||
+        widget.controller.state.presentationStage ==
+            CountdownTimerPresentationStage.none) {
+      return;
+    }
+    _autoDismissScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _routePopRequested) return;
+      final route = ModalRoute.of(context);
+      if (route == null || !route.isCurrent) return;
+      _routePopRequested = true;
+      widget.onShowLarge();
+      Navigator.of(context).pop();
+    });
+  }
+
+  @override
+  void dispose() {
+    widget.controller.removeListener(_handleAutomaticPresentation);
+    super.dispose();
+  }
 
   int _initialSeconds() {
     final source =
@@ -112,6 +181,10 @@ class _CountdownTimerSetupDialogState extends State<CountdownTimerSetupDialog> {
   }
 
   void _startOrPause() {
+    // Starting a short countdown publishes the final-minute milestone
+    // synchronously. Own the route pop here so its automatic callback cannot
+    // pop the editor route a second time while this dialog animates out.
+    _routePopRequested = true;
     if (widget.controller.isRunning && !_dirty) {
       widget.controller.pause();
     } else {
@@ -122,10 +195,15 @@ class _CountdownTimerSetupDialogState extends State<CountdownTimerSetupDialog> {
       }
       widget.controller.start();
     }
+    if (widget.controller.state.presentationStage !=
+        CountdownTimerPresentationStage.none) {
+      widget.onShowLarge();
+    }
     Navigator.of(context).pop();
   }
 
   void _showLarge() {
+    _routePopRequested = true;
     if (_dirty) {
       widget.controller.setDuration(Duration(seconds: _editingSeconds));
     }
@@ -161,7 +239,10 @@ class _CountdownTimerSetupDialogState extends State<CountdownTimerSetupDialog> {
                   ),
                   IconButton(
                     tooltip: 'Schließen',
-                    onPressed: () => Navigator.of(context).pop(),
+                    onPressed: () {
+                      _routePopRequested = true;
+                      Navigator.of(context).pop();
+                    },
                     icon: const Icon(Icons.close_rounded),
                   ),
                 ],

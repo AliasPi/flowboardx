@@ -198,6 +198,63 @@ abstract final class BoardNavigatorGeometry {
   }
 }
 
+/// Fixed work budgets for the transient overview.
+///
+/// The navigator is only 258x145 logical pixels. Processing every point from
+/// every persisted circle cannot add visible detail, but used to make its
+/// first repaint scale with the complete page history.
+abstract final class BoardNavigatorSampling {
+  static const int maximumObjectCount = 2000;
+  static const int maximumStrokeCount = 5000;
+  static const int maximumPointsPerStroke = 80;
+  static const int maximumTotalStrokePoints = 16000;
+
+  @visibleForTesting
+  static List<int> sampledIndices(int itemCount, int maximumCount) {
+    if (itemCount <= 0 || maximumCount <= 0) return const <int>[];
+    if (itemCount <= maximumCount) {
+      return List<int>.generate(itemCount, (index) => index, growable: false);
+    }
+    if (maximumCount == 1) return <int>[itemCount - 1];
+    return List<int>.generate(
+      maximumCount,
+      (slot) => slot * (itemCount - 1) ~/ (maximumCount - 1),
+      growable: false,
+    );
+  }
+
+  @visibleForTesting
+  static List<int> allocatePointBudgets(
+    Iterable<int> pointCounts, {
+    int totalPointBudget = maximumTotalStrokePoints,
+    int perStrokeLimit = maximumPointsPerStroke,
+  }) {
+    final counts = pointCounts.toList(growable: false);
+    var remainingPoints = math.max(0, totalPointBudget);
+    var remainingStrokes = counts.length;
+    final safePerStrokeLimit = math.max(0, perStrokeLimit);
+    final result = <int>[];
+    for (final count in counts) {
+      if (remainingStrokes <= 0 || count <= 0) {
+        if (remainingStrokes > 0) remainingStrokes--;
+        result.add(0);
+        continue;
+      }
+      final fairShare = remainingPoints <= 0
+          ? 0
+          : (remainingPoints / remainingStrokes).ceil();
+      final allocated = math.min(
+        count,
+        math.min(safePerStrokeLimit, fairShare),
+      );
+      remainingStrokes--;
+      remainingPoints = math.max(0, remainingPoints - allocated);
+      result.add(allocated);
+    }
+    return result;
+  }
+}
+
 /// Static page overview. Its repaint contract intentionally excludes camera
 /// state so pinch/pan only moves the lightweight red viewport rectangle.
 class BoardNavigatorContentPainter extends CustomPainter {
@@ -330,7 +387,12 @@ void _paintNavigatorContent(
   final objectPaint = Paint()
     ..color = const Color(0xFF52605D).withValues(alpha: .38)
     ..style = PaintingStyle.fill;
-  for (final object in objects.take(2000)) {
+  final objectIndices = BoardNavigatorSampling.sampledIndices(
+    objects.length,
+    BoardNavigatorSampling.maximumObjectCount,
+  );
+  for (final objectIndex in objectIndices) {
+    final object = objects[objectIndex];
     final bounds = object.transform.bounds;
     if (!bounds.left.isFinite ||
         !bounds.top.isFinite ||
@@ -352,11 +414,24 @@ void _paintNavigatorContent(
     ..strokeCap = StrokeCap.round
     ..strokeJoin = StrokeJoin.round
     ..strokeWidth = 1.15;
-  for (final stroke in strokes.take(5000)) {
+  final strokeIndices = BoardNavigatorSampling.sampledIndices(
+    strokes.length,
+    BoardNavigatorSampling.maximumStrokeCount,
+  );
+  final pointBudgets = BoardNavigatorSampling.allocatePointBudgets(
+    strokeIndices.map((index) => strokes[index].points.length),
+  );
+  for (var slot = 0; slot < strokeIndices.length; slot++) {
+    final stroke = strokes[strokeIndices[slot]];
     if (stroke.points.isEmpty) continue;
-    final step = math.max(1, (stroke.points.length / 80).ceil());
+    final pointBudget = pointBudgets[slot];
+    if (pointBudget <= 0) continue;
+    final sampleCount = math.min(pointBudget, stroke.points.length);
     Path? path;
-    for (var index = 0; index < stroke.points.length; index += step) {
+    for (var sample = 0; sample < sampleCount; sample++) {
+      final index = sampleCount == 1
+          ? 0
+          : sample * (stroke.points.length - 1) ~/ (sampleCount - 1);
       final point = stroke.points[index];
       if (!point.x.isFinite || !point.y.isFinite) continue;
       final mapped = BoardNavigatorGeometry.mapPoint(

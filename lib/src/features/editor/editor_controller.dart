@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:io';
 import 'dart:math' as math;
 
@@ -86,6 +87,8 @@ class EditorController extends ChangeNotifier {
         owner._debugBeforeHandwritingSnapshotCapture,
     sharedHistory: owner.history,
     sharedAutosave: owner.autosave,
+    sharedGroupingEngine: owner.groupingEngine,
+    sharedSelectionEngine: owner.selectionEngine,
     ownsDocumentSession: false,
     followsDocumentNavigation: false,
     activePageId: owner.page.id,
@@ -107,12 +110,16 @@ class EditorController extends ChangeNotifier {
     VoidCallback? debugBeforeHandwritingSnapshotCapture,
     CommandHistory? sharedHistory,
     AutosaveController? sharedAutosave,
+    InkGroupingEngine? sharedGroupingEngine,
+    SelectionEngine? sharedSelectionEngine,
     String? activePageId,
     bool persistInitialDocument = false,
   }) : _uuid = uuid ?? const Uuid(),
        history = sharedHistory ?? CommandHistory(initialDocument),
        autosave =
            sharedAutosave ?? AutosaveController(repository, initialDocument.id),
+       groupingEngine = sharedGroupingEngine ?? InkGroupingEngine(),
+       selectionEngine = sharedSelectionEngine ?? SelectionEngine(),
        viewport = BoardViewport(
          scale: initialDocument.currentPage.viewport.zoom,
          offset: Offset(
@@ -151,14 +158,19 @@ class EditorController extends ChangeNotifier {
   final Uuid _uuid;
   FileBoardAssetResolver? _assetResolver;
   String? _resolvedAssetSignature;
-  WhiteboardDocument? _assetSignatureDocument;
+  List<DocumentAsset>? _assetSignatureAssets;
+  WhiteboardDocument? _resolvedPageDocument;
+  String? _resolvedPageId;
+  BoardPage? _resolvedPage;
+  int _resolvedPageIndex = -1;
+  int _debugPageResolutionCount = 0;
   final CommandHistory history;
   final AutosaveController autosave;
   final BoardViewport viewport;
   final InkSessionManager inkSessions = InkSessionManager();
   final PointerPolicy pointerPolicy = const PointerPolicy();
-  final SelectionEngine selectionEngine = const SelectionEngine();
-  final InkGroupingEngine groupingEngine = InkGroupingEngine();
+  final SelectionEngine selectionEngine;
+  final InkGroupingEngine groupingEngine;
   final TemplateFactory templateFactory = TemplateFactory();
   final HandwritingRecognitionService handwritingRecognition;
   final VoidCallback? _debugBeforeHandwritingSnapshotCapture;
@@ -171,19 +183,46 @@ class EditorController extends ChangeNotifier {
   String _activePageId;
   final Map<String, ViewportState> _localViewports = <String, ViewportState>{};
   final Map<int, _AnnotationTarget> _annotationTargets = {};
+  final Set<int> _autosaveInkPointers = <int>{};
   final Map<String, double> _coverRevealPreviews = {};
   final Map<String, List<InkStroke>> _pendingEraseReplacements = {};
+  final Set<String> _pendingFreeEraseSourceIds = <String>{};
+  final Set<String> _pendingAnnotationEraseSourceIds = <String>{};
   final List<_PendingEraseSweep> _pendingEraseSweeps = [];
   String? _pendingErasePageId;
   int? _pendingEraseRevision;
   final SpatialIndex<InkStroke> _eraseIndex = SpatialIndex(cellSize: 160);
+  final _AnnotationEraseIndex _annotationEraseIndex = _AnnotationEraseIndex();
   List<InkStroke>? _eraseIndexedStrokes;
+  final Map<String, int> _eraseIndexedStrokePositions = <String, int>{};
   String? _eraseIndexedPageId;
+  int _erasePreviewVersion = 0;
+  int _cachedEraseStrokePreviewVersion = -1;
+  List<InkStroke>? _cachedEraseStrokeSource;
+  List<InkStroke>? _cachedEraseRenderStrokes;
+  int _cachedEraseAnnotationPreviewVersion = -1;
+  List<ObjectInkLayer>? _cachedEraseAnnotationSource;
+  List<ObjectInkLayer>? _cachedEraseRenderAnnotationLayers;
+  int _debugLastEraseStrokeCandidateCount = 0;
+  int _debugLastEraseAnnotationCandidateCount = 0;
+  int _debugEraseFullIndexBuildCount = 0;
+  int _debugErasePreviewReplayCount = 0;
   Set<String> _selectedIds;
-  BoardPage? _expandedSelectionPage;
-  Set<String> _expandedSelectionSource = const <String>{};
-  Set<String> _expandedSelectionCache = const <String>{};
+  BoardPage? _selectionMembersPage;
+  Set<String>? _selectionMembersSource;
+  _SelectionMembers _selectionMembersCache = _SelectionMembers.empty;
+  int _debugSelectionMemberRefreshCount = 0;
   TransformDelta? _selectionTransformPreview;
+  BoardPage? _cachedSelectionObjectPreviewPage;
+  TransformDelta? _cachedSelectionObjectPreview;
+  int _coverPreviewVersion = 0;
+  int _cachedSelectionObjectCoverVersion = -1;
+  List<BoardObject>? _cachedSelectionRenderObjects;
+  BoardPage? _cachedSelectionStrokePreviewPage;
+  TransformDelta? _cachedSelectionStrokePreview;
+  int _cachedSelectionStrokeEraseVersion = -1;
+  List<InkStroke>? _cachedSelectionRenderStrokes;
+  BoardViewportHorizontalConstraint? _contentHorizontalConstraint;
   String? _selectionInteractionOwner;
   bool _handwritingConversionInProgress = false;
   bool _returnToInkWhenInsertedSelectionClears = false;
@@ -200,11 +239,34 @@ class EditorController extends ChangeNotifier {
   bool saving = false;
 
   WhiteboardDocument get document => history.document;
-  BoardPage get page =>
-      document.pageById(_activePageId) ?? document.currentPage;
+  BoardPage get page {
+    _resolveActivePage();
+    return _resolvedPage!;
+  }
+
   int get currentPageIndex {
-    final index = document.pages.indexWhere((page) => page.id == this.page.id);
-    return index < 0 ? document.currentPageIndex : index;
+    _resolveActivePage();
+    return _resolvedPageIndex;
+  }
+
+  void _resolveActivePage() {
+    final currentDocument = document;
+    if (identical(_resolvedPageDocument, currentDocument) &&
+        _resolvedPageId == _activePageId &&
+        _resolvedPage != null) {
+      return;
+    }
+    var index = _resolvedPageIndex;
+    if (index < 0 ||
+        index >= currentDocument.pages.length ||
+        currentDocument.pages[index].id != _activePageId) {
+      index = currentDocument.pageIndexById(_activePageId) ?? -1;
+    }
+    _resolvedPageDocument = currentDocument;
+    _resolvedPageId = _activePageId;
+    _resolvedPageIndex = index < 0 ? currentDocument.currentPageIndex : index;
+    _resolvedPage = currentDocument.pages[_resolvedPageIndex];
+    _debugPageResolutionCount++;
   }
 
   Set<String> get selectedIds =>
@@ -215,6 +277,24 @@ class EditorController extends ChangeNotifier {
   bool get canUndo => history.canUndoFor(_historyOwnerId);
   bool get canRedo => history.canRedoFor(_historyOwnerId);
   bool get canPaste => _clipboard != null;
+  BoardViewportHorizontalConstraint? get contentHorizontalConstraint =>
+      _contentHorizontalConstraint;
+  @visibleForTesting
+  int get debugLastEraseStrokeCandidateCount =>
+      _debugLastEraseStrokeCandidateCount;
+  @visibleForTesting
+  int get debugLastEraseAnnotationCandidateCount =>
+      _debugLastEraseAnnotationCandidateCount;
+  @visibleForTesting
+  int get debugEraseFullIndexBuildCount => _debugEraseFullIndexBuildCount;
+  @visibleForTesting
+  int get debugErasePreviewReplayCount => _debugErasePreviewReplayCount;
+  @visibleForTesting
+  int get debugIndexedAnnotationStrokeCount => _annotationEraseIndex.length;
+  @visibleForTesting
+  int get debugSelectionMemberRefreshCount => _debugSelectionMemberRefreshCount;
+  @visibleForTesting
+  int get debugPageResolutionCount => _debugPageResolutionCount;
   List<int> get recentCustomPenColors {
     final encoded = document.metadata.custom[recentPenColorsMetadataKey];
     if (encoded == null || encoded.isEmpty) return const <int>[];
@@ -239,8 +319,8 @@ class EditorController extends ChangeNotifier {
 
   FileBoardAssetResolver get assetResolver {
     final currentDocument = document;
-    if (!identical(_assetSignatureDocument, currentDocument)) {
-      _assetSignatureDocument = currentDocument;
+    if (!identical(_assetSignatureAssets, currentDocument.assets)) {
+      _assetSignatureAssets = currentDocument.assets;
       final signature = currentDocument.assets
           .map((asset) => '${asset.id}:${asset.relativePath}:${asset.sha256}')
           .join('|');
@@ -257,28 +337,48 @@ class EditorController extends ChangeNotifier {
 
   List<BoardObject> get renderObjects {
     final preview = _selectionTransformPreview;
+    final currentPage = page;
     if (preview == null && _coverRevealPreviews.isEmpty) {
-      return page.objects;
+      return currentPage.objects;
     }
-    final previewIds = preview == null
-        ? const <String>{}
-        : _expandedSelectionIds;
-    return page.objects
-        .map((object) {
-          final revealPreview = _coverRevealPreviews[object.id];
-          final withReveal = object is CoverObject && revealPreview != null
-              ? object.copyWithReveal(revealPreview)
-              : object;
-          if (_selectionTransformPreview == null ||
-              !previewIds.contains(object.id)) {
-            return withReveal;
-          }
-          return _previewTransformedObject(
-            withReveal,
-            _selectionTransformPreview!,
-          );
-        })
-        .toList(growable: false);
+    if (identical(_cachedSelectionObjectPreviewPage, currentPage) &&
+        identical(_cachedSelectionObjectPreview, preview) &&
+        _cachedSelectionObjectCoverVersion == _coverPreviewVersion &&
+        _cachedSelectionRenderObjects != null) {
+      return _cachedSelectionRenderObjects!;
+    }
+
+    final replacements = <int, BoardObject>{};
+    if (_coverRevealPreviews.isNotEmpty) {
+      for (var index = 0; index < currentPage.objects.length; index++) {
+        final object = currentPage.objects[index];
+        final reveal = _coverRevealPreviews[object.id];
+        if (object is CoverObject && reveal != null) {
+          replacements[index] = object.copyWithReveal(reveal);
+        }
+      }
+    }
+    if (preview != null) {
+      final members = _selectionMembers;
+      for (
+        var memberIndex = 0;
+        memberIndex < members.objectIndices.length;
+        memberIndex++
+      ) {
+        final sourceIndex = members.objectIndices[memberIndex];
+        final source =
+            replacements[sourceIndex] ?? members.objects[memberIndex];
+        replacements[sourceIndex] = _previewTransformedObject(source, preview);
+      }
+    }
+    final visible = replacements.isEmpty
+        ? currentPage.objects
+        : _SparseObjectPreviewList(currentPage.objects, replacements);
+    _cachedSelectionObjectPreviewPage = currentPage;
+    _cachedSelectionObjectPreview = preview;
+    _cachedSelectionObjectCoverVersion = _coverPreviewVersion;
+    _cachedSelectionRenderObjects = visible;
+    return visible;
   }
 
   BoardObject _previewTransformedObject(
@@ -299,40 +399,124 @@ class EditorController extends ChangeNotifier {
 
   List<InkStroke> get renderStrokes {
     final preview = _selectionTransformPreview;
-    if (preview == null && _pendingEraseReplacements.isEmpty) {
-      return page.strokes;
+    final currentPage = page;
+    if (preview == null && _pendingFreeEraseSourceIds.isEmpty) {
+      return currentPage.strokes;
     }
-    final previewIds = _expandedSelectionIds;
-    return <InkStroke>[
-      for (final source in page.strokes)
-        for (final stroke
-            in _pendingEraseReplacements[source.id] ?? <InkStroke>[source])
-          if (preview != null && previewIds.contains(source.id))
-            stroke.transformed(preview)
-          else
-            stroke,
-    ];
+    if (preview == null) {
+      if (_cachedEraseStrokePreviewVersion == _erasePreviewVersion &&
+          identical(_cachedEraseStrokeSource, currentPage.strokes) &&
+          _cachedEraseRenderStrokes != null) {
+        return _cachedEraseRenderStrokes!;
+      }
+      _synchronizeEraseIndex(currentPage);
+      final patches = <_StrokePreviewPatch>[];
+      for (final sourceId in _pendingFreeEraseSourceIds) {
+        final sourceIndex = _eraseIndexedStrokePositions[sourceId];
+        final replacements = _pendingEraseReplacements[sourceId];
+        if (sourceIndex == null || replacements == null) continue;
+        patches.add(
+          _StrokePreviewPatch(
+            sourceIndex: sourceIndex,
+            replacements: replacements,
+          ),
+        );
+      }
+      final visible = patches.isEmpty
+          ? currentPage.strokes
+          : _SparseStrokePreviewList(currentPage.strokes, patches);
+      _cachedEraseStrokePreviewVersion = _erasePreviewVersion;
+      _cachedEraseStrokeSource = currentPage.strokes;
+      _cachedEraseRenderStrokes = visible;
+      return visible;
+    }
+    if (identical(_cachedSelectionStrokePreviewPage, currentPage) &&
+        identical(_cachedSelectionStrokePreview, preview) &&
+        _cachedSelectionStrokeEraseVersion == _erasePreviewVersion &&
+        _cachedSelectionRenderStrokes != null) {
+      return _cachedSelectionRenderStrokes!;
+    }
+
+    final members = _selectionMembers;
+    List<InkStroke> visible;
+    if (_pendingFreeEraseSourceIds.isEmpty) {
+      if (members.strokeIndices.isEmpty) {
+        visible = currentPage.strokes;
+      } else {
+        visible = _SparseStrokeSelectionPreviewList(
+          currentPage.strokes,
+          <int, InkStroke>{
+            for (var index = 0; index < members.strokeIndices.length; index++)
+              members.strokeIndices[index]: members.strokes[index].transformed(
+                preview,
+              ),
+          },
+        );
+      }
+    } else {
+      // Erasing cancels selection gestures in BoardSurface, so this is only a
+      // defensive path for external/controller-level callers. Preserve exact
+      // fragment semantics without complicating the common sparse overlay.
+      final previewIds = _expandedSelectionIds;
+      visible = <InkStroke>[
+        for (final source in currentPage.strokes)
+          for (final stroke
+              in _pendingEraseReplacements[source.id] ?? <InkStroke>[source])
+            if (previewIds.contains(source.id))
+              stroke.transformed(preview)
+            else
+              stroke,
+      ];
+    }
+    _cachedSelectionStrokePreviewPage = currentPage;
+    _cachedSelectionStrokePreview = preview;
+    _cachedSelectionStrokeEraseVersion = _erasePreviewVersion;
+    _cachedSelectionRenderStrokes = visible;
+    return visible;
   }
 
   /// Annotation strokes share the same live erase preview as free board ink.
   /// The immutable page remains untouched until [commitErase], keeping a whole
   /// fist gesture as one Undo/Auto-Save operation.
   List<ObjectInkLayer> get renderAnnotationLayers {
-    if (_pendingEraseReplacements.isEmpty) return page.annotationLayers;
-    return page.annotationLayers
-        .map((layer) {
-          if (!layer.strokes.any(
-            (stroke) => _pendingEraseReplacements.containsKey(stroke.id),
-          )) {
-            return layer;
-          }
-          final visible = <InkStroke>[
-            for (final source in layer.strokes)
-              ...(_pendingEraseReplacements[source.id] ?? <InkStroke>[source]),
-          ];
-          return layer.copyWith(strokes: visible);
-        })
-        .toList(growable: false);
+    final currentPage = page;
+    if (_pendingAnnotationEraseSourceIds.isEmpty) {
+      return currentPage.annotationLayers;
+    }
+    if (_cachedEraseAnnotationPreviewVersion == _erasePreviewVersion &&
+        identical(_cachedEraseAnnotationSource, currentPage.annotationLayers) &&
+        _cachedEraseRenderAnnotationLayers != null) {
+      return _cachedEraseRenderAnnotationLayers!;
+    }
+
+    _annotationEraseIndex.synchronize(currentPage);
+    final affectedLayers = <ObjectInkLayer>{};
+    for (final sourceId in _pendingAnnotationEraseSourceIds) {
+      affectedLayers.addAll(
+        _annotationEraseIndex.layersContainingStroke(sourceId),
+      );
+    }
+    final replacements = <int, ObjectInkLayer>{};
+    for (final layer in affectedLayers) {
+      final layerIndex = _annotationEraseIndex.indexOfLayer(layer);
+      if (layerIndex == null) continue;
+      replacements[layerIndex] = layer.copyWith(
+        strokes: <InkStroke>[
+          for (final source in layer.strokes)
+            ...(_pendingEraseReplacements[source.id] ?? <InkStroke>[source]),
+        ],
+      );
+    }
+    final visible = replacements.isEmpty
+        ? currentPage.annotationLayers
+        : _SparseAnnotationLayerPreviewList(
+            currentPage.annotationLayers,
+            replacements,
+          );
+    _cachedEraseAnnotationPreviewVersion = _erasePreviewVersion;
+    _cachedEraseAnnotationSource = currentPage.annotationLayers;
+    _cachedEraseRenderAnnotationLayers = visible;
+    return visible;
   }
 
   /// Sessions always sample in world units so their distance threshold and
@@ -342,7 +526,7 @@ class EditorController extends ChangeNotifier {
   CoverObject? get selectedCover {
     if (_selectedIds.length != 1) return null;
     final id = _selectedIds.single;
-    for (final object in page.objects) {
+    for (final object in _selectionMembers.objects) {
       if (object is! CoverObject || object.id != id) continue;
       final reveal = _coverRevealPreviews[id];
       final withReveal = reveal == null
@@ -362,7 +546,7 @@ class EditorController extends ChangeNotifier {
   PdfObject? get selectedPdf {
     if (_selectedIds.length != 1) return null;
     final id = _selectedIds.single;
-    for (final object in page.objects) {
+    for (final object in _selectionMembers.objects) {
       if (object is PdfObject && object.id == id) return object;
     }
     return null;
@@ -370,60 +554,60 @@ class EditorController extends ChangeNotifier {
 
   ContentGroup? get selectedContentGroup {
     if (_selectedIds.length != 1) return null;
-    final id = _selectedIds.single;
-    for (final group in page.contentGroups) {
-      if (group.id == id) return group;
-    }
-    return null;
+    return _selectionMembers.selectedContentGroup;
   }
 
   TextObject? get selectedTextObject {
     if (_selectedIds.length != 1) return null;
-    final selected = page.objectById(_selectedIds.single);
-    return selected is TextObject ? selected : null;
+    final id = _selectedIds.single;
+    for (final object in _selectionMembers.objects) {
+      if (object is TextObject && object.id == id) return object;
+    }
+    return null;
   }
 
   bool get canGroupSelection =>
       selectedContentGroup == null && _expandedSelectionIds.length >= 2;
   bool get canArrangeSelection {
-    final expanded = _expandedSelectionIds;
-    return page.objects.any((object) => expanded.contains(object.id)) ||
-        page.strokes.any((stroke) => expanded.contains(stroke.id));
+    final members = _selectionMembers;
+    return members.objects.isNotEmpty || members.strokes.isNotEmpty;
   }
 
-  bool get hasSelectedHandwriting =>
-      page.strokes.any((stroke) => _expandedSelectionIds.contains(stroke.id));
+  bool get hasSelectedHandwriting => _selectionMembers.strokes.isNotEmpty;
   bool get isHandwritingConversionInProgress =>
       _handwritingConversionInProgress;
 
   double coverRevealValue(String objectId, double persisted) =>
       _coverRevealPreviews[objectId] ?? persisted;
 
-  Set<String> get _expandedSelectionIds {
-    if (_selectedIds.isEmpty) return const <String>{};
+  Set<String> get _expandedSelectionIds => _selectionMembers.expandedIds;
+
+  _SelectionMembers get _selectionMembers {
+    if (_selectedIds.isEmpty) return _SelectionMembers.empty;
     final currentPage = page;
-    if (identical(_expandedSelectionPage, currentPage) &&
-        setEquals(_expandedSelectionSource, _selectedIds)) {
-      return _expandedSelectionCache;
+    if (identical(_selectionMembersPage, currentPage) &&
+        identical(_selectionMembersSource, _selectedIds)) {
+      return _selectionMembersCache;
     }
-    final result = <String>{};
-    for (final id in _selectedIds) {
-      final contentGroup = currentPage.contentGroups
-          .where((group) => group.id == id)
-          .firstOrNull;
-      if (contentGroup != null) {
-        result.addAll(contentGroup.memberIds);
-        continue;
-      }
-      final inkGroup = currentPage.groups
-          .where((group) => group.id == id)
-          .firstOrNull;
-      result.addAll(inkGroup?.strokeIds ?? [id]);
-    }
-    _expandedSelectionPage = currentPage;
-    _expandedSelectionSource = Set<String>.unmodifiable(_selectedIds);
-    _expandedSelectionCache = Set<String>.unmodifiable(result);
-    return _expandedSelectionCache;
+    final resolved = selectionEngine.resolveSelectionMembers(
+      currentPage,
+      _selectedIds,
+    );
+
+    _selectionMembersPage = currentPage;
+    _selectionMembersSource = _selectedIds;
+    _selectionMembersCache = _SelectionMembers(
+      expandedIds: resolved.expandedIds,
+      objectIndices: resolved.objectIndices,
+      objects: resolved.objects,
+      strokeIndices: resolved.strokeIndices,
+      strokes: resolved.strokes,
+      selectedGroupBounds: resolved.selectedGroupBounds,
+      selectedContentGroup: resolved.selectedContentGroup,
+      baseBounds: resolved.bounds,
+    );
+    _debugSelectionMemberRefreshCount++;
+    return _selectionMembersCache;
   }
 
   void setTool(BoardTool value) {
@@ -556,7 +740,15 @@ class EditorController extends ChangeNotifier {
       authorId: authorId ?? 'pointer-${event.device}',
       samplingPosition: samplingPosition,
     );
-    if (!began) _annotationTargets.remove(event.pointer);
+    if (!began) {
+      _annotationTargets.remove(event.pointer);
+    } else if (_autosaveInkPointers.add(event.pointer)) {
+      // Copying/encoding the complete document during a pen gesture creates
+      // page-count-dependent frame stalls on smartboards. Keep the newest
+      // immutable snapshot pending, then persist after a short input-idle
+      // window (or immediately on lifecycle flush).
+      autosave.beginInteraction();
+    }
     return began;
   }
 
@@ -578,28 +770,34 @@ class EditorController extends ChangeNotifier {
     Offset worldPosition, {
     Offset? samplingPosition,
   }) {
-    final target = _annotationTargets.remove(event.pointer);
-    final stroke = inkSessions.end(
-      event,
-      target == null ? _clampWorldOffset(worldPosition) : worldPosition,
-      samplingPosition: samplingPosition,
-    );
-    if (stroke == null || stroke.points.isEmpty) return;
-    final storedStroke = target?.toLocalStroke(stroke) ?? stroke;
-    execute(
-      AddStrokeAndRegroupCommand(
-        pageId: page.id,
-        stroke: storedStroke,
-        objectId: target?.objectId,
-        pdfPageIndex: target?.pdfPageIndex,
-        grouping: groupingEngine,
-      ),
-    );
+    final heldAutosave = _autosaveInkPointers.remove(event.pointer);
+    try {
+      final target = _annotationTargets.remove(event.pointer);
+      final stroke = inkSessions.end(
+        event,
+        target == null ? _clampWorldOffset(worldPosition) : worldPosition,
+        samplingPosition: samplingPosition,
+      );
+      if (stroke == null || stroke.points.isEmpty) return;
+      final storedStroke = target?.toLocalStroke(stroke) ?? stroke;
+      execute(
+        AddStrokeAndRegroupCommand(
+          pageId: page.id,
+          stroke: storedStroke,
+          objectId: target?.objectId,
+          pdfPageIndex: target?.pdfPageIndex,
+          grouping: groupingEngine,
+        ),
+      );
+    } finally {
+      if (heldAutosave) autosave.endInteraction();
+    }
   }
 
   void cancelInk(int pointer) {
     _annotationTargets.remove(pointer);
     inkSessions.cancel(pointer);
+    if (_autosaveInkPointers.remove(pointer)) autosave.endInteraction();
   }
 
   void eraseAt(Offset worldPosition, {double radius = 24}) =>
@@ -617,6 +815,7 @@ class EditorController extends ChangeNotifier {
   /// sequential for exact geometry, while listeners observe one atomic frame
   /// update instead of up to five complete board rebuilds.
   void eraseSweeps(Iterable<InkEraserSweep> values) {
+    final currentPage = page;
     var changed = false;
     for (final value in values) {
       final start = value.start;
@@ -631,38 +830,44 @@ class EditorController extends ChangeNotifier {
       final safeRadius = radius.isFinite && radius > 0
           ? radius.clamp(.25, 256.0)
           : 24.0;
-      if (_pendingErasePageId != null && _pendingErasePageId != page.id) {
+      if (_pendingErasePageId != null &&
+          _pendingErasePageId != currentPage.id) {
         _clearPendingErase();
       }
-      _pendingErasePageId ??= page.id;
+      _pendingErasePageId ??= currentPage.id;
       _pendingEraseRevision ??= document.revision;
+      final horizontalConstraint = _contentHorizontalConstraint;
       final sweep = _PendingEraseSweep(
         start: start,
         end: end,
         radius: safeRadius,
+        eraseMinimumX:
+            horizontalConstraint?.side == BoardViewportPartitionSide.right
+            ? horizontalConstraint!.worldBoundaryX
+            : null,
+        eraseMaximumX:
+            horizontalConstraint?.side == BoardViewportPartitionSide.left
+            ? horizontalConstraint!.worldBoundaryX
+            : null,
       );
       _pendingEraseSweeps.add(sweep);
-      changed = _stageEraseSweep(sweep) || changed;
+      changed = _stageEraseSweep(sweep, currentPage) || changed;
     }
-    if (changed) notifyListeners();
+    if (changed) {
+      _invalidateErasePreviewCaches();
+      notifyListeners();
+    }
   }
 
-  bool _stageEraseSweep(_PendingEraseSweep sweep) {
+  bool _stageEraseSweep(_PendingEraseSweep sweep, BoardPage currentPage) {
     final start = sweep.start;
     final end = sweep.end;
     final safeRadius = sweep.radius;
+    final sourceIds = sweep.sourceIds;
     final capturedSourceIds = <String>{};
-    bool accepts(InkStroke stroke) {
-      final sourceIds = sweep.sourceIds;
-      return sourceIds == null ||
-          sourceIds.any(
-            (sourceId) =>
-                stroke.id == sourceId ||
-                stroke.id.startsWith('$sourceId.erase.'),
-          );
-    }
 
-    _synchronizeEraseIndex();
+    _synchronizeEraseIndex(currentPage);
+    _annotationEraseIndex.synchronize(currentPage);
     final query = Rect.fromLTRB(
       math.min(start.dx, end.dx) - safeRadius,
       math.min(start.dy, end.dy) - safeRadius,
@@ -670,8 +875,10 @@ class EditorController extends ChangeNotifier {
       math.max(start.dy, end.dy) + safeRadius,
     );
     var changed = false;
-    for (final stroke in _eraseIndex.query(query)) {
-      if (accepts(stroke) &&
+    final strokeCandidates = _eraseIndex.query(query);
+    _debugLastEraseStrokeCandidateCount = strokeCandidates.length;
+    for (final stroke in strokeCandidates) {
+      if (_acceptsEraseSource(stroke.id, sourceIds) &&
           _strokeTouchesCapsule(stroke, start, end, safeRadius)) {
         final strokeRadius = stroke.width.isFinite
             ? math.max(0.0, stroke.width / 2)
@@ -681,6 +888,8 @@ class EditorController extends ChangeNotifier {
           start,
           end,
           radius: safeRadius + strokeRadius,
+          eraseMinimumX: sweep.eraseMinimumX,
+          eraseMaximumX: sweep.eraseMaximumX,
         );
         if (strokeChanged && sweep.sourceIds == null) {
           capturedSourceIds.add(stroke.id);
@@ -688,59 +897,42 @@ class EditorController extends ChangeNotifier {
         changed = strokeChanged || changed;
       }
     }
-    for (final object in page.objects) {
-      final pdfPageIndex = object is PdfObject
-          ? object.activeSourcePageIndex
-          : null;
-      final layer = activeObjectInkLayer(object, page.annotationLayers);
-      if (layer == null ||
-          !object.transform.bounds
-              .inflate(safeRadius)
-              .intersects(
-                Rect2(
-                  left: query.left,
-                  top: query.top,
-                  width: query.width,
-                  height: query.height,
-                ),
-              )) {
-        continue;
-      }
-      final target = _AnnotationTarget(
-        object.id,
-        object.transform,
-        pdfPageIndex: pdfPageIndex,
-      );
-      for (final stroke in layer.strokes) {
-        if (accepts(stroke) &&
-            _annotationStrokeTouchesWorldCapsule(
-              stroke,
-              target,
-              start,
-              end,
-              safeRadius,
-            )) {
-          final localWidth = stroke.width.isFinite ? stroke.width : 0.0;
-          final strokeRadius = math.max(
-            0.0,
-            localWidth * target.minimumExtent / 2,
-          );
-          final strokeChanged = _stageStrokeErase(
+    final annotationCandidates = _annotationEraseIndex.query(query);
+    _debugLastEraseAnnotationCandidateCount = annotationCandidates.length;
+    for (final entry in annotationCandidates) {
+      final stroke = entry.stroke;
+      if (!_acceptsEraseSource(stroke.id, sourceIds) ||
+          !_annotationStrokeTouchesWorldCapsule(
             stroke,
+            entry.target,
             start,
             end,
-            radius: safeRadius + strokeRadius,
-            project: (point) {
-              final world = target.pointToWorld(point);
-              return Vec2(world.dx, world.dy);
-            },
-          );
-          if (strokeChanged && sweep.sourceIds == null) {
-            capturedSourceIds.add(stroke.id);
-          }
-          changed = strokeChanged || changed;
-        }
+            safeRadius,
+          )) {
+        continue;
       }
+      final localWidth = stroke.width.isFinite ? stroke.width : 0.0;
+      final strokeRadius = math.max(
+        0.0,
+        localWidth * entry.target.minimumExtent / 2,
+      );
+      final strokeChanged = _stageStrokeErase(
+        stroke,
+        start,
+        end,
+        radius: safeRadius + strokeRadius,
+        isAnnotation: true,
+        eraseMinimumX: sweep.eraseMinimumX,
+        eraseMaximumX: sweep.eraseMaximumX,
+        project: (point) {
+          final world = entry.target.pointToWorld(point);
+          return Vec2(world.dx, world.dy);
+        },
+      );
+      if (strokeChanged && sweep.sourceIds == null) {
+        capturedSourceIds.add(stroke.id);
+      }
+      changed = strokeChanged || changed;
     }
     sweep.sourceIds ??= Set<String>.unmodifiable(capturedSourceIds);
     return changed;
@@ -781,18 +973,22 @@ class EditorController extends ChangeNotifier {
     }
     _rebaseSelectionAfterErase(selectionBefore, selectedContentGroups);
     final validStrokeIds = page.strokes.map((stroke) => stroke.id).toSet();
+    final nextSelection = <String>{..._selectedIds};
     var selectionChanged = false;
     for (final selectedId in selectionBefore) {
       final fragments = replacements[selectedId];
       if (fragments == null) continue;
       for (final fragment in fragments) {
         if (validStrokeIds.contains(fragment.id) &&
-            _selectedIds.add(fragment.id)) {
+            nextSelection.add(fragment.id)) {
           selectionChanged = true;
         }
       }
     }
-    if (selectionChanged) notifyListeners();
+    if (selectionChanged) {
+      _selectedIds = nextSelection;
+      notifyListeners();
+    }
   }
 
   void cancelErase() {
@@ -805,26 +1001,39 @@ class EditorController extends ChangeNotifier {
 
   void _rebuildPendingErasePreview() {
     if (_pendingEraseSweeps.isEmpty) return;
-    if (_pendingErasePageId != page.id) {
+    _debugErasePreviewReplayCount++;
+    final currentPage = page;
+    if (_pendingErasePageId != currentPage.id) {
       _clearPendingErase();
       return;
     }
     final sweeps = List<_PendingEraseSweep>.of(_pendingEraseSweeps);
     _pendingEraseReplacements.clear();
+    _pendingFreeEraseSourceIds.clear();
+    _pendingAnnotationEraseSourceIds.clear();
     _eraseIndexedStrokes = null;
     _eraseIndexedPageId = null;
+    _eraseIndexedStrokePositions.clear();
     _eraseIndex.clear();
     for (final sweep in sweeps) {
-      _stageEraseSweep(sweep);
+      _stageEraseSweep(sweep, currentPage);
     }
+    _invalidateErasePreviewCaches();
     _pendingEraseRevision = document.revision;
   }
 
   void _clearPendingErase() {
+    final hadPreview =
+        _pendingEraseReplacements.isNotEmpty ||
+        _pendingFreeEraseSourceIds.isNotEmpty ||
+        _pendingAnnotationEraseSourceIds.isNotEmpty;
     _pendingEraseReplacements.clear();
+    _pendingFreeEraseSourceIds.clear();
+    _pendingAnnotationEraseSourceIds.clear();
     _pendingEraseSweeps.clear();
     _pendingErasePageId = null;
     _pendingEraseRevision = null;
+    if (hadPreview) _invalidateErasePreviewCaches();
   }
 
   bool _stageStrokeErase(
@@ -832,7 +1041,10 @@ class EditorController extends ChangeNotifier {
     Offset start,
     Offset end, {
     required double radius,
+    bool isAnnotation = false,
     InkPointProjection? project,
+    double? eraseMinimumX,
+    double? eraseMaximumX,
   }) {
     final current = _pendingEraseReplacements[source.id] ?? <InkStroke>[source];
     final next = <InkStroke>[];
@@ -844,6 +1056,8 @@ class EditorController extends ChangeNotifier {
         eraserEnd: Vec2(end.dx, end.dy),
         radius: radius,
         project: project,
+        eraseMinimumX: eraseMinimumX,
+        eraseMaximumX: eraseMaximumX,
         idFactory: (sourceId, fragmentIndex) => '$sourceId.erase.${_uuid.v4()}',
       );
       changed = changed || result.changed;
@@ -851,7 +1065,33 @@ class EditorController extends ChangeNotifier {
     }
     if (!changed) return false;
     _pendingEraseReplacements[source.id] = List<InkStroke>.unmodifiable(next);
+    if (isAnnotation) {
+      _pendingAnnotationEraseSourceIds.add(source.id);
+    } else {
+      _pendingFreeEraseSourceIds.add(source.id);
+    }
     return true;
+  }
+
+  void _invalidateErasePreviewCaches() {
+    _erasePreviewVersion++;
+    _cachedEraseStrokePreviewVersion = -1;
+    _cachedEraseStrokeSource = null;
+    _cachedEraseRenderStrokes = null;
+    _cachedEraseAnnotationPreviewVersion = -1;
+    _cachedEraseAnnotationSource = null;
+    _cachedEraseRenderAnnotationLayers = null;
+  }
+
+  static bool _acceptsEraseSource(String strokeId, Set<String>? sourceIds) {
+    if (sourceIds == null || sourceIds.contains(strokeId)) return true;
+    var ancestor = strokeId;
+    while (true) {
+      final separator = ancestor.lastIndexOf('.erase.');
+      if (separator <= 0) return false;
+      ancestor = ancestor.substring(0, separator);
+      if (sourceIds.contains(ancestor)) return true;
+    }
   }
 
   void selectAt(Offset worldPosition, {double? viewportScale}) {
@@ -859,11 +1099,21 @@ class EditorController extends ChangeNotifier {
     final hitScale = viewportScale != null && viewportScale.isFinite
         ? viewportScale.clamp(BoardViewport.minScale, BoardViewport.maxScale)
         : viewport.scale;
-    final candidates = selectionEngine.candidatesAt(
-      page,
-      Vec2(worldPosition.dx, worldPosition.dy),
-      tolerance: 14 / hitScale,
-    );
+    final selectionPoint = Vec2(worldPosition.dx, worldPosition.dy);
+    final selectionTolerance = 14 / hitScale;
+    final candidates = selectionEngine
+        .candidatesAt(
+          page,
+          selectionPoint,
+          tolerance: selectionTolerance,
+          inkGroupCandidates: groupingEngine.selectionCandidatesAt(
+            page,
+            selectionPoint,
+            tolerance: selectionTolerance,
+          ),
+        )
+        .where((candidate) => _belongsToContentPartition(candidate.bounds))
+        .toList(growable: false);
     if (candidates.isEmpty) {
       final resumeInk = _returnToInkWhenInsertedSelectionClears;
       _selectedIds = <String>{};
@@ -892,13 +1142,15 @@ class EditorController extends ChangeNotifier {
   void selectRectangle(Rect worldRect) {
     _selectionTransformPreview = null;
     _returnToInkWhenInsertedSelectionClears = false;
-    _selectedIds = selectionEngine.itemsInRectangle(
-      page,
-      Rect2(
-        left: worldRect.left,
-        top: worldRect.top,
-        width: worldRect.width,
-        height: worldRect.height,
+    _selectedIds = _filterSelectionForContentPartition(
+      selectionEngine.itemsInRectangle(
+        page,
+        Rect2(
+          left: worldRect.left,
+          top: worldRect.top,
+          width: worldRect.width,
+          height: worldRect.height,
+        ),
       ),
     );
     notifyListeners();
@@ -907,9 +1159,11 @@ class EditorController extends ChangeNotifier {
   void selectLasso(List<Offset> points) {
     _selectionTransformPreview = null;
     _returnToInkWhenInsertedSelectionClears = false;
-    _selectedIds = selectionEngine.itemsInLasso(
-      page,
-      points.map((point) => Vec2(point.dx, point.dy)).toList(growable: false),
+    _selectedIds = _filterSelectionForContentPartition(
+      selectionEngine.itemsInLasso(
+        page,
+        points.map((point) => Vec2(point.dx, point.dy)).toList(growable: false),
+      ),
     );
     notifyListeners();
   }
@@ -917,8 +1171,68 @@ class EditorController extends ChangeNotifier {
   void selectAll() {
     _selectionTransformPreview = null;
     _returnToInkWhenInsertedSelectionClears = false;
-    _selectedIds = selectionEngine.allItems(page);
+    _selectedIds = _filterSelectionForContentPartition(
+      selectionEngine.allItems(page),
+    );
     notifyListeners();
+  }
+
+  /// Assigns this interaction controller to one immutable half of the board.
+  ///
+  /// Camera constraints alone are insufficient: a pointer may remain inside
+  /// its screen half while a large selection crosses the world-space divider.
+  /// Keeping the content partition in the controller makes every selection
+  /// path use the same rule, independent of input device and UI surface.
+  void setContentHorizontalConstraint(
+    BoardViewportHorizontalConstraint? constraint,
+  ) {
+    final normalized = constraint != null && constraint.isValid
+        ? constraint
+        : null;
+    final current = _contentHorizontalConstraint;
+    if (current?.side == normalized?.side &&
+        current?.worldBoundaryX == normalized?.worldBoundaryX) {
+      return;
+    }
+    _contentHorizontalConstraint = normalized;
+    _selectionTransformPreview = null;
+    _returnToInkWhenInsertedSelectionClears = false;
+    _selectedIds = _filterSelectionForContentPartition(_selectedIds);
+    notifyListeners();
+  }
+
+  Set<String> _filterSelectionForContentPartition(Iterable<String> ids) {
+    if (_contentHorizontalConstraint == null) return ids.toSet();
+    return <String>{
+      for (final id in ids)
+        if (_selectionItemBounds(id) case final bounds?)
+          if (_belongsToContentPartition(bounds)) id,
+    };
+  }
+
+  Rect2? _selectionItemBounds(String id) {
+    for (final group in page.contentGroups) {
+      if (group.id == id) return group.bounds;
+    }
+    for (final group in page.groups) {
+      if (group.id == id) return group.bounds;
+    }
+    final object = page.objectById(id);
+    if (object != null) return object.transform.bounds;
+    final stroke = page.strokeById(id);
+    return stroke?.bounds;
+  }
+
+  bool _belongsToContentPartition(Rect2 bounds) {
+    final constraint = _contentHorizontalConstraint;
+    if (constraint == null) return true;
+    final centerX = bounds.center.x;
+    if (!centerX.isFinite) return false;
+    return switch (constraint.side) {
+      // Half-open ownership gives an item on the divider exactly one owner.
+      BoardViewportPartitionSide.left => centerX < constraint.worldBoundaryX,
+      BoardViewportPartitionSide.right => centerX >= constraint.worldBoundaryX,
+    };
   }
 
   void clearSelection() {
@@ -934,8 +1248,7 @@ class EditorController extends ChangeNotifier {
     notifyListeners();
   }
 
-  Rect2 get _baseSelectionBounds =>
-      selectionEngine.boundsOf(page, _selectedIds);
+  Rect2 get _baseSelectionBounds => _selectionMembers.baseBounds;
 
   Rect2 get selectionBounds {
     final bounds = _baseSelectionBounds;
@@ -944,10 +1257,7 @@ class EditorController extends ChangeNotifier {
     // Transform each selected scene item before uniting its bounds. Rotating
     // the already axis-aligned aggregate would create an oversized frame when
     // an object has previously been rotated.
-    return selectionEngine.boundsOf(
-      page.copyWith(objects: renderObjects, strokes: renderStrokes),
-      _selectedIds,
-    );
+    return _transformedSelectionBounds(preview);
   }
 
   /// Serializes selection previews across both participant surfaces.
@@ -972,24 +1282,37 @@ class EditorController extends ChangeNotifier {
         !worldPosition.dy.isFinite) {
       return false;
     }
-    final expanded = _expandedSelectionIds;
     final point = Vec2(worldPosition.dx, worldPosition.dy);
-    for (final object in page.objects) {
-      if (expanded.contains(object.id) &&
-          object.transform.containsWorld(point, tolerance: tolerance)) {
+    // The visible selection frame is an interaction surface, not only a
+    // decoration. This is especially important for handwriting and multiple
+    // disjoint items: requiring a hit on an individual stroke made moving an
+    // already selected block unnecessarily precise. The same aggregate bounds
+    // drive the painted frame, so every point visibly inside it can start a
+    // move or a two-finger scale gesture.
+    if (selectionBounds.inflate(tolerance).contains(point)) return true;
+
+    // Retain the exact member checks as a defensive fallback for degenerate
+    // zero-sized bounds and custom objects whose hit area may intentionally
+    // extend beyond their aggregate axis-aligned frame.
+    final members = _selectionMembers;
+    for (final bounds in members.selectedGroupBounds) {
+      if (bounds.inflate(tolerance).contains(point)) return true;
+    }
+    for (final object in members.objects) {
+      if (object.transform.containsWorld(point, tolerance: tolerance)) {
         return true;
       }
     }
-    final candidates = selectionEngine.candidatesAt(
-      page,
-      point,
-      tolerance: tolerance,
-    );
-    return candidates.any(
-      (candidate) =>
-          _selectedIds.contains(candidate.id) ||
-          candidate.itemIds.any(expanded.contains),
-    );
+    for (final stroke in members.strokes) {
+      if (selectionEngine.strokeContainsPoint(
+        stroke,
+        point,
+        tolerance: tolerance,
+      )) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /// The persisted angle shown by the manual rotation control. A mixed
@@ -998,31 +1321,143 @@ class EditorController extends ChangeNotifier {
   double get selectionRotationDegrees {
     final expanded = _expandedSelectionIds;
     if (expanded.length != 1) return 0;
-    final object = page.objectById(expanded.single);
-    if (object == null) return 0;
+    final objects = _selectionMembers.objects;
+    if (objects.length != 1 || objects.single.id != expanded.single) return 0;
+    final object = objects.single;
     return object.transform.rotationRadians * 180 / math.pi;
+  }
+
+  Rect2 get _selectionTransformRegion {
+    final world = viewport.worldBounds;
+    final constraint = _contentHorizontalConstraint;
+    if (constraint == null || !constraint.isValid) {
+      return Rect2(
+        left: world.left,
+        top: world.top,
+        width: world.width,
+        height: world.height,
+      );
+    }
+    final boundary = constraint.worldBoundaryX.clamp(world.left, world.right);
+    return switch (constraint.side) {
+      BoardViewportPartitionSide.left => Rect2(
+        left: world.left,
+        top: world.top,
+        width: boundary - world.left,
+        height: world.height,
+      ),
+      BoardViewportPartitionSide.right => Rect2(
+        left: boundary,
+        top: world.top,
+        width: world.right - boundary,
+        height: world.height,
+      ),
+    };
+  }
+
+  Rect2 _transformedStrokeBounds(InkStroke stroke, TransformDelta delta) {
+    final halfWidth = stroke.width / 2;
+    final visible = stroke.bounds;
+    final centerLineBounds = Rect2(
+      left: visible.left + halfWidth,
+      top: visible.top + halfWidth,
+      width: math.max(0, visible.width - stroke.width),
+      height: math.max(0, visible.height - stroke.width),
+    ).transformed(delta);
+    final nextWidth =
+        stroke.width *
+        math.sqrt(
+          (delta.scaleX.abs() * delta.scaleY.abs()).clamp(
+            0.0001,
+            double.infinity,
+          ),
+        );
+    return centerLineBounds.inflate(nextWidth / 2);
+  }
+
+  Rect2 _transformedSelectionBounds(TransformDelta delta) {
+    final members = _selectionMembers;
+    Rect2? result;
+    for (final object in members.objects) {
+      final bounds = object.transform.apply(delta).bounds;
+      result = result == null ? bounds : result.union(bounds);
+    }
+    for (final stroke in members.strokes) {
+      final bounds = _transformedStrokeBounds(stroke, delta);
+      result = result == null ? bounds : result.union(bounds);
+    }
+    return result ?? const Rect2.zero();
+  }
+
+  TransformDelta? _constrainSelectionTransform(TransformDelta requested) {
+    if (_selectedIds.isEmpty ||
+        !requested.dx.isFinite ||
+        !requested.dy.isFinite ||
+        !requested.scaleX.isFinite ||
+        !requested.scaleY.isFinite ||
+        !requested.anchor.x.isFinite ||
+        !requested.anchor.y.isFinite ||
+        !requested.rotationRadians.isFinite ||
+        !requested.scaleAxisRadians.isFinite) {
+      return null;
+    }
+    final bounds = _transformedSelectionBounds(requested);
+    final allowed = _selectionTransformRegion;
+    if (bounds.isEmpty ||
+        !bounds.left.isFinite ||
+        !bounds.top.isFinite ||
+        !bounds.width.isFinite ||
+        !bounds.height.isFinite ||
+        allowed.isEmpty ||
+        bounds.width > allowed.width + .0001 ||
+        bounds.height > allowed.height + .0001) {
+      return null;
+    }
+    var correctionX = 0.0;
+    var correctionY = 0.0;
+    if (bounds.left < allowed.left) {
+      correctionX = allowed.left - bounds.left;
+    }
+    if (bounds.right + correctionX > allowed.right) {
+      correctionX = allowed.right - bounds.right;
+    }
+    if (bounds.top < allowed.top) {
+      correctionY = allowed.top - bounds.top;
+    }
+    if (bounds.bottom + correctionY > allowed.bottom) {
+      correctionY = allowed.bottom - bounds.bottom;
+    }
+    return TransformDelta(
+      dx: requested.dx + correctionX,
+      dy: requested.dy + correctionY,
+      scaleX: requested.scaleX,
+      scaleY: requested.scaleY,
+      anchor: requested.anchor,
+      rotationRadians: requested.rotationRadians,
+      scaleAxisRadians: requested.scaleAxisRadians,
+    );
+  }
+
+  void _previewSelectionTransform(TransformDelta requested) {
+    // An identity preview deliberately replaces a previously valid preview
+    // when a new sample is impossible. A malformed/oversized gesture can
+    // therefore never commit the last valid frame accidentally.
+    _selectionTransformPreview =
+        _constrainSelectionTransform(requested) ?? const TransformDelta();
+    notifyListeners();
   }
 
   void previewMoveSelection(Offset delta) {
     if (_selectedIds.isEmpty || !delta.dx.isFinite || !delta.dy.isFinite) {
       return;
     }
-    final bounds = _baseSelectionBounds;
-    final world = viewport.worldBounds;
-    var dx = delta.dx;
-    var dy = delta.dy;
-    if (bounds.left + dx < world.left) dx = world.left - bounds.left;
-    if (bounds.right + dx > world.right) dx = world.right - bounds.right;
-    if (bounds.top + dy < world.top) dy = world.top - bounds.top;
-    if (bounds.bottom + dy > world.bottom) dy = world.bottom - bounds.bottom;
-    _selectionTransformPreview = TransformDelta(dx: dx, dy: dy);
-    notifyListeners();
+    _previewSelectionTransform(TransformDelta(dx: delta.dx, dy: delta.dy));
   }
 
   void previewScaleSelection(double scale, {required Offset anchor}) {
     if (_selectedIds.isEmpty || !scale.isFinite) return;
     final bounds = _baseSelectionBounds;
-    final world = viewport.worldBounds;
+    final world = _selectionTransformRegion;
     final availableX = bounds.right > anchor.dx
         ? (world.right - anchor.dx) / (bounds.right - anchor.dx)
         : 20.0;
@@ -1031,12 +1466,13 @@ class EditorController extends ChangeNotifier {
         : 20.0;
     final maximum = math.min(20.0, math.min(availableX, availableY));
     final safe = scale.clamp(.05, math.max(.05, maximum)).toDouble();
-    _selectionTransformPreview = TransformDelta(
-      scaleX: safe,
-      scaleY: safe,
-      anchor: Vec2(anchor.dx, anchor.dy),
+    _previewSelectionTransform(
+      TransformDelta(
+        scaleX: safe,
+        scaleY: safe,
+        anchor: Vec2(anchor.dx, anchor.dy),
+      ),
     );
-    notifyListeners();
   }
 
   /// Previews an axis-aligned resize around a fixed opposite edge/corner.
@@ -1061,7 +1497,7 @@ class EditorController extends ChangeNotifier {
     }
     final bounds = _baseSelectionBounds;
     if (bounds.isEmpty) return;
-    final world = viewport.worldBounds;
+    final world = _selectionTransformRegion;
 
     double maximumScaleX() {
       var maximum = 20.0;
@@ -1099,13 +1535,14 @@ class EditorController extends ChangeNotifier {
 
     final safeX = scaleX.clamp(.05, maximumScaleX()).toDouble();
     final safeY = scaleY.clamp(.05, maximumScaleY()).toDouble();
-    _selectionTransformPreview = TransformDelta(
-      scaleX: safeX,
-      scaleY: safeY,
-      anchor: Vec2(anchor.dx, anchor.dy),
-      scaleAxisRadians: scaleAxisRadians,
+    _previewSelectionTransform(
+      TransformDelta(
+        scaleX: safeX,
+        scaleY: safeY,
+        anchor: Vec2(anchor.dx, anchor.dy),
+        scaleAxisRadians: scaleAxisRadians,
+      ),
     );
-    notifyListeners();
   }
 
   /// Rotates the complete selection around [anchor] without changing its
@@ -1127,30 +1564,7 @@ class EditorController extends ChangeNotifier {
       anchor: Vec2(anchor.dx, anchor.dy),
       rotationRadians: rotationRadians,
     );
-    final rotatedBounds = base.transformed(delta);
-    final world = viewport.worldBounds;
-    var dx = 0.0;
-    var dy = 0.0;
-    if (rotatedBounds.width <= world.width) {
-      if (rotatedBounds.left < world.left) dx = world.left - rotatedBounds.left;
-      if (rotatedBounds.right + dx > world.right) {
-        dx = world.right - rotatedBounds.right;
-      }
-    }
-    if (rotatedBounds.height <= world.height) {
-      if (rotatedBounds.top < world.top) dy = world.top - rotatedBounds.top;
-      if (rotatedBounds.bottom + dy > world.bottom) {
-        dy = world.bottom - rotatedBounds.bottom;
-      }
-    }
-    delta = TransformDelta(
-      dx: dx,
-      dy: dy,
-      anchor: Vec2(anchor.dx, anchor.dy),
-      rotationRadians: rotationRadians,
-    );
-    _selectionTransformPreview = delta;
-    notifyListeners();
+    _previewSelectionTransform(delta);
   }
 
   void rotateSelectionBy(double rotationRadians) {
@@ -1170,14 +1584,24 @@ class EditorController extends ChangeNotifier {
   void mirrorSelectionHorizontally() {
     if (_selectedIds.isEmpty) return;
     final center = _baseSelectionBounds.center;
-    _selectionTransformPreview = TransformDelta(scaleX: -1, anchor: center);
+    _selectionTransformPreview = _constrainSelectionTransform(
+      TransformDelta(scaleX: -1, anchor: center),
+    );
     commitSelectionTransform();
   }
 
   void commitSelectionTransform() {
-    final preview = _selectionTransformPreview;
-    if (preview == null) return;
+    final requested = _selectionTransformPreview;
+    if (requested == null) return;
+    // Re-evaluate immediately before mutation. Both participant controllers
+    // share a document history, so the other side may have committed between
+    // this gesture's preview and pointer-up.
+    final preview = _constrainSelectionTransform(requested);
     _selectionTransformPreview = null;
+    if (preview == null) {
+      notifyListeners();
+      return;
+    }
     final identity =
         preview.dx.abs() < .0001 &&
         preview.dy.abs() < .0001 &&
@@ -1237,11 +1661,56 @@ class EditorController extends ChangeNotifier {
     paste(offset: const Offset(36, 36));
   }
 
+  Offset? _constrainBoundsTranslation(Rect2 bounds, Offset requested) {
+    if (bounds.isEmpty ||
+        !requested.dx.isFinite ||
+        !requested.dy.isFinite ||
+        !bounds.left.isFinite ||
+        !bounds.top.isFinite ||
+        !bounds.width.isFinite ||
+        !bounds.height.isFinite) {
+      return null;
+    }
+    final allowed = _selectionTransformRegion;
+    if (bounds.width > allowed.width + .0001 ||
+        bounds.height > allowed.height + .0001) {
+      return null;
+    }
+    var dx = requested.dx;
+    var dy = requested.dy;
+    if (bounds.left + dx < allowed.left) dx = allowed.left - bounds.left;
+    if (bounds.right + dx > allowed.right) dx = allowed.right - bounds.right;
+    if (bounds.top + dy < allowed.top) dy = allowed.top - bounds.top;
+    if (bounds.bottom + dy > allowed.bottom) {
+      dy = allowed.bottom - bounds.bottom;
+    }
+    return Offset(dx, dy);
+  }
+
   void paste({Offset offset = const Offset(28, 28)}) {
     final payload = _clipboard;
     if (payload == null) return;
+    Rect2? payloadBounds;
+    for (final stroke in payload.strokes) {
+      payloadBounds = payloadBounds == null
+          ? stroke.bounds
+          : payloadBounds.union(stroke.bounds);
+    }
+    for (final object in payload.objects) {
+      payloadBounds = payloadBounds == null
+          ? object.transform.bounds
+          : payloadBounds.union(object.transform.bounds);
+    }
+    final safeOffset = payloadBounds == null
+        ? null
+        : _constrainBoundsTranslation(payloadBounds, offset);
+    if (safeOffset == null) {
+      lastError = 'Der Inhalt ist zu groß für den verfügbaren Dokumentbereich.';
+      notifyListeners();
+      return;
+    }
     final idMap = <String, String>{};
-    final delta = TransformDelta(dx: offset.dx, dy: offset.dy);
+    final delta = TransformDelta(dx: safeOffset.dx, dy: safeOffset.dy);
     var strokes = payload.strokes.map((stroke) {
       final id = _uuid.v4();
       idMap[stroke.id] = id;
@@ -1259,10 +1728,7 @@ class EditorController extends ChangeNotifier {
       objects: objects,
       strokes: strokes,
     );
-    final firstZIndex = nextBoardSceneZIndex(
-      objects: page.objects,
-      strokes: page.strokes,
-    );
+    final firstZIndex = page.nextTopLevelSceneZIndex;
     final layeredScene = <BoardSceneItem>[
       for (var index = 0; index < copiedScene.length; index++)
         copiedScene[index].withZIndex(firstZIndex + index),
@@ -1365,7 +1831,7 @@ class EditorController extends ChangeNotifier {
     final group = selectedContentGroup;
     if (group == null) return;
     execute(UngroupItemsCommand(page.id, group.id));
-    _selectedIds = group.memberIds.toSet();
+    _selectedIds = _filterSelectionForContentPartition(group.memberIds);
     notifyListeners();
   }
 
@@ -1467,10 +1933,7 @@ class EditorController extends ChangeNotifier {
         fontSize: math.max(24, math.min(72, textBounds.height * .72)),
         colorArgb: snapshot.canonicalStrokes.first.colorArgb,
         sourceStrokeIds: snapshot.canonicalStrokes.map((stroke) => stroke.id),
-        zIndex: nextBoardSceneZIndex(
-          objects: page.objects,
-          strokes: page.strokes,
-        ),
+        zIndex: page.nextTopLevelSceneZIndex,
       );
       textObject = textObject.copyWith(
         transform: TextObjectLayout.fit(
@@ -1886,6 +2349,51 @@ class EditorController extends ChangeNotifier {
     _afterPageChanged();
   }
 
+  /// Deletes [pageId] through the shared command history.
+  ///
+  /// Participant views keep their own navigation state. When an independent
+  /// participant deletes the page they are currently viewing, select the
+  /// nearest surviving page *before* publishing the document mutation. This
+  /// prevents the synchronous history notification from briefly falling back
+  /// to the document owner's globally selected page.
+  bool deletePage(String pageId) {
+    if (!_allowNavigation()) return false;
+    final pages = document.pages;
+    if (pages.length <= 1) {
+      lastError = 'Die letzte verbleibende Seite kann nicht gelöscht werden.';
+      notifyListeners();
+      return false;
+    }
+    final deleteIndex = document.pageIndexById(pageId);
+    if (deleteIndex == null) {
+      lastError = 'Die ausgewählte Seite existiert nicht mehr.';
+      notifyListeners();
+      return false;
+    }
+
+    final previousActivePageId = page.id;
+    final deletesActivePage = previousActivePageId == pageId;
+    if (deletesActivePage) {
+      commitViewport();
+      if (!_followsDocumentNavigation) {
+        final replacementOldIndex = deleteIndex < pages.length - 1
+            ? deleteIndex + 1
+            : deleteIndex - 1;
+        _activePageId = pages[replacementOldIndex].id;
+      }
+    }
+
+    final deleted = execute(RemovePageCommand(pageId));
+    if (!deleted) {
+      _activePageId = previousActivePageId;
+      return false;
+    }
+    if (deletesActivePage && !_followsDocumentNavigation) {
+      _afterPageChanged();
+    }
+    return true;
+  }
+
   void addTemplate(TemplateKind kind) {
     if (!_allowNavigation()) return;
     if (document.pages.length >= WhiteboardDocument.maxPageCount) return;
@@ -2135,12 +2643,17 @@ class EditorController extends ChangeNotifier {
 
   void previewCoverReveal(String objectId, double reveal) {
     if (!reveal.isFinite) return;
-    _coverRevealPreviews[objectId] = reveal.clamp(0, 1);
+    final normalized = reveal.clamp(0.0, 1.0);
+    if (_coverRevealPreviews[objectId] == normalized) return;
+    _coverRevealPreviews[objectId] = normalized;
+    _coverPreviewVersion++;
     notifyListeners();
   }
 
   void commitCoverReveal(String objectId, double reveal) {
-    _coverRevealPreviews.remove(objectId);
+    if (_coverRevealPreviews.remove(objectId) != null) {
+      _coverPreviewVersion++;
+    }
     final current = page.objectById(objectId);
     if (current is! CoverObject) {
       notifyListeners();
@@ -2160,7 +2673,10 @@ class EditorController extends ChangeNotifier {
   }
 
   void cancelCoverReveal(String objectId) {
-    if (_coverRevealPreviews.remove(objectId) != null) notifyListeners();
+    if (_coverRevealPreviews.remove(objectId) != null) {
+      _coverPreviewVersion++;
+      notifyListeners();
+    }
   }
 
   void setPdfActivePage(String objectId, int activePageIndex) {
@@ -2530,8 +3046,9 @@ class EditorController extends ChangeNotifier {
     if (!_allowNavigation()) return;
     try {
       lastError = null;
+      final previousPageId = page.id;
       history.undo(ownerId: _historyOwnerId);
-      _repairTransientState();
+      _repairTransientState(previousPageId);
     } catch (error) {
       lastError = 'Rückgängig fehlgeschlagen: $error';
       notifyListeners();
@@ -2542,8 +3059,9 @@ class EditorController extends ChangeNotifier {
     if (!_allowNavigation()) return;
     try {
       lastError = null;
+      final previousPageId = page.id;
       history.redo(ownerId: _historyOwnerId);
-      _repairTransientState();
+      _repairTransientState(previousPageId);
     } catch (error) {
       lastError = 'Wiederholen fehlgeschlagen: $error';
       notifyListeners();
@@ -2597,6 +3115,10 @@ class EditorController extends ChangeNotifier {
   Future<void> close() async {
     if (_closed) return;
     _closed = true;
+    for (var index = 0; index < _autosaveInkPointers.length; index++) {
+      autosave.endInteraction();
+    }
+    _autosaveInkPointers.clear();
     _settingsPersistenceTimer?.cancel();
     if (_ownsDocumentSession) _persistSettings();
     await _historySubscription.cancel();
@@ -2604,6 +3126,7 @@ class EditorController extends ChangeNotifier {
     if (_ownsDocumentSession) {
       await autosave.dispose();
       await history.dispose();
+      selectionEngine.clearCaches();
     }
   }
 
@@ -2636,52 +3159,117 @@ class EditorController extends ChangeNotifier {
 
   void _onDocumentChanged(WhiteboardDocument value) {
     if (_ownsDocumentSession) autosave.schedule(value);
-    final requestedPage = value.pageById(_activePageId);
+    final previousActivePageId = _activePageId;
+    final previousPageIndex = _resolvedPageIndex;
+    final activePageWasRemoved = value.pageById(previousActivePageId) == null;
     if (_followsDocumentNavigation) {
       _activePageId = value.currentPage.id;
-    } else if (requestedPage == null) {
-      _activePageId = value.currentPage.id;
+    } else {
+      final hint = previousPageIndex;
+      final activePageStillPresent =
+          hint >= 0 &&
+          hint < value.pages.length &&
+          value.pages[hint].id == _activePageId;
+      if (!activePageStillPresent && activePageWasRemoved) {
+        // Keep the participant at the same local slot where possible: after
+        // deleting page N this shows the former page N+1, or the previous page
+        // when the removed page was last. Falling back to currentPage would
+        // leak the other participant's navigation into this half.
+        final fallbackIndex = previousPageIndex < 0
+            ? value.currentPageIndex
+            : previousPageIndex.clamp(0, value.pages.length - 1);
+        _activePageId = value.pages[fallbackIndex].id;
+      }
     }
-    if (_pendingEraseSweeps.isNotEmpty) _rebuildPendingErasePreview();
+    if (_pendingEraseSweeps.isNotEmpty && _pendingErasePageId == page.id) {
+      final currentPage = page;
+      final freeInkChanged =
+          _pendingFreeEraseSourceIds.isNotEmpty &&
+          !_eraseSourcesAreUnchangedOrAppended(currentPage);
+      final annotationInkChanged =
+          _pendingAnnotationEraseSourceIds.isNotEmpty &&
+          !_annotationEraseIndex.referencesSameSources(currentPage);
+      if (freeInkChanged || annotationInkChanged) {
+        // A concurrent partial erase/replacement must be reflected immediately
+        // so both participants see the same gaps. This replay is intentionally
+        // limited to destructive source changes: replaying every accumulated
+        // sweep for ordinary appended ink made long concurrent gestures grow
+        // quadratically.
+        _rebuildPendingErasePreview();
+      } else {
+        // Appended ink did not exist when an earlier sweep passed and therefore
+        // must not be erased retroactively. Extending the spatial index here
+        // still makes it available to the participant's next sweep.
+        if (_pendingFreeEraseSourceIds.isNotEmpty) {
+          _synchronizeEraseIndex(currentPage);
+        }
+        _pendingEraseRevision = value.revision;
+      }
+    }
     _removeInvalidSelectionIds();
+    if (activePageWasRemoved) {
+      _afterPageChanged();
+      return;
+    }
     notifyListeners();
   }
 
-  void _afterPageChanged() {
-    _coverRevealPreviews.clear();
+  bool _eraseSourcesAreUnchangedOrAppended(BoardPage currentPage) {
+    if (_eraseIndexedPageId != currentPage.id) return false;
+    final previous = _eraseIndexedStrokes;
+    final next = currentPage.strokes;
+    if (identical(previous, next)) return true;
+    final appendList = next is SingleAppendSceneList<InkStroke>
+        ? next as SingleAppendSceneList<InkStroke>
+        : null;
+    return previous != null &&
+        appendList != null &&
+        appendList.isSingleAppendOf(previous);
+  }
+
+  void _afterPageChanged({bool restoreViewport = true}) {
+    if (_coverRevealPreviews.isNotEmpty) {
+      _coverRevealPreviews.clear();
+      _coverPreviewVersion++;
+    }
     _clearPendingErase();
     _selectionTransformPreview = null;
     _selectionInteractionOwner = null;
     _eraseIndexedStrokes = null;
     _eraseIndexedPageId = null;
+    _eraseIndexedStrokePositions.clear();
     _eraseIndex.clear();
-    _selectedIds = page.selection.selectedItemIds.toSet();
-    _returnToInkWhenInsertedSelectionClears = false;
-    final persisted = _followsDocumentNavigation
-        ? page.viewport
-        : _localViewports[page.id] ?? page.viewport;
-    viewport.restore(
-      scale: persisted.zoom,
-      offset: Offset(persisted.offsetX, persisted.offsetY),
+    _annotationEraseIndex.clear();
+    _debugLastEraseStrokeCandidateCount = 0;
+    _debugLastEraseAnnotationCandidateCount = 0;
+    _selectedIds = _filterSelectionForContentPartition(
+      page.selection.selectedItemIds,
     );
-    groupingEngine.invalidatePage(page.id);
+    _returnToInkWhenInsertedSelectionClears = false;
+    if (restoreViewport) {
+      final persisted = _followsDocumentNavigation
+          ? page.viewport
+          : _localViewports[page.id] ?? page.viewport;
+      viewport.restore(
+        scale: persisted.zoom,
+        offset: Offset(persisted.offsetX, persisted.offsetY),
+      );
+    }
     notifyListeners();
   }
 
-  void _repairTransientState() {
+  void _repairTransientState(String previousPageId) {
     _removeInvalidSelectionIds();
-    _afterPageChanged();
+    // Content-only Undo/Redo must never move a participant's independent
+    // camera. Restoring the stale pre-split viewport here exposed the other
+    // half for one frame until BoardSurface's post-frame clamp ran.
+    _afterPageChanged(restoreViewport: page.id != previousPageId);
   }
 
   void _removeInvalidSelectionIds() {
     if (_selectedIds.isEmpty) return;
-    final valid = <String>{
-      ...page.strokes.map((stroke) => stroke.id),
-      ...page.objects.map((object) => object.id),
-      ...page.groups.map((group) => group.id),
-      ...page.contentGroups.map((group) => group.id),
-    };
-    _selectedIds.removeWhere((id) => !valid.contains(id));
+    final retained = selectionEngine.retainExistingIds(page, _selectedIds);
+    if (retained.length != _selectedIds.length) _selectedIds = retained;
   }
 
   void _rebaseSelectionAfterErase(
@@ -2711,8 +3299,9 @@ class EditorController extends ChangeNotifier {
         rebased.addAll(formerMembers.where(sceneItemIds.contains));
       }
     }
-    if (setEquals(_selectedIds, rebased)) return;
-    _selectedIds = rebased;
+    final partitioned = _filterSelectionForContentPartition(rebased);
+    if (setEquals(_selectedIds, partitioned)) return;
+    _selectedIds = partitioned;
     _selectionTransformPreview = null;
     if (_selectedIds.isEmpty) _returnToInkWhenInsertedSelectionClears = false;
     notifyListeners();
@@ -2868,22 +3457,47 @@ class EditorController extends ChangeNotifier {
     );
   }
 
-  void _synchronizeEraseIndex() {
-    if (_eraseIndexedPageId == page.id &&
-        identical(_eraseIndexedStrokes, page.strokes)) {
+  void _synchronizeEraseIndex(BoardPage currentPage) {
+    if (_eraseIndexedPageId == currentPage.id &&
+        identical(_eraseIndexedStrokes, currentPage.strokes)) {
+      return;
+    }
+    final previous = _eraseIndexedStrokes;
+    final next = currentPage.strokes;
+    final appendList = next is SingleAppendSceneList<InkStroke>
+        ? next as SingleAppendSceneList<InkStroke>
+        : null;
+    if (_eraseIndexedPageId == currentPage.id &&
+        previous != null &&
+        appendList != null &&
+        appendList.isSingleAppendOf(previous)) {
+      final index = next.length - 1;
+      final stroke = next[index];
+      _eraseIndexedStrokePositions[stroke.id] = index;
+      _insertStrokeIntoEraseIndex(stroke);
+      _eraseIndexedStrokes = next;
       return;
     }
     _eraseIndex.clear();
-    for (final stroke in page.strokes) {
-      final bounds = stroke.bounds;
-      _eraseIndex.insert(
-        stroke,
-        Rect.fromLTWH(bounds.left, bounds.top, bounds.width, bounds.height),
-      );
+    _eraseIndexedStrokePositions.clear();
+    for (var index = 0; index < currentPage.strokes.length; index++) {
+      final stroke = currentPage.strokes[index];
+      _eraseIndexedStrokePositions[stroke.id] = index;
+      _insertStrokeIntoEraseIndex(stroke);
     }
-    _eraseIndexedPageId = page.id;
-    _eraseIndexedStrokes = page.strokes;
+    _eraseIndexedPageId = currentPage.id;
+    _eraseIndexedStrokes = currentPage.strokes;
+    _debugEraseFullIndexBuildCount++;
   }
+
+  void _insertStrokeIntoEraseIndex(InkStroke stroke) =>
+      _eraseIndex.insertMappedPolyline<InkPoint>(
+        stroke,
+        stroke.points,
+        xOf: _inkPointX,
+        yOf: _inkPointY,
+        inflate: math.max(0, stroke.width / 2),
+      );
 
   static bool _strokeTouchesCircle(
     InkStroke stroke,
@@ -3194,34 +3808,216 @@ final class _HandwritingConversionSnapshot {
   );
 }
 
+final class _SelectionMembers {
+  _SelectionMembers({
+    required Iterable<String> expandedIds,
+    required Iterable<int> objectIndices,
+    required Iterable<BoardObject> objects,
+    required Iterable<int> strokeIndices,
+    required Iterable<InkStroke> strokes,
+    required Iterable<Rect2> selectedGroupBounds,
+    required this.selectedContentGroup,
+    required this.baseBounds,
+  }) : expandedIds = Set<String>.unmodifiable(expandedIds),
+       objectIndices = List<int>.unmodifiable(objectIndices),
+       objects = List<BoardObject>.unmodifiable(objects),
+       strokeIndices = List<int>.unmodifiable(strokeIndices),
+       strokes = List<InkStroke>.unmodifiable(strokes),
+       selectedGroupBounds = List<Rect2>.unmodifiable(selectedGroupBounds);
+
+  const _SelectionMembers._empty()
+    : expandedIds = const <String>{},
+      objectIndices = const <int>[],
+      objects = const <BoardObject>[],
+      strokeIndices = const <int>[],
+      strokes = const <InkStroke>[],
+      selectedGroupBounds = const <Rect2>[],
+      selectedContentGroup = null,
+      baseBounds = const Rect2.zero();
+
+  static const _SelectionMembers empty = _SelectionMembers._empty();
+
+  final Set<String> expandedIds;
+  final List<int> objectIndices;
+  final List<BoardObject> objects;
+  final List<int> strokeIndices;
+  final List<InkStroke> strokes;
+  final List<Rect2> selectedGroupBounds;
+  final ContentGroup? selectedContentGroup;
+  final Rect2 baseBounds;
+}
+
+/// Fixed-length immutable overlay for the few objects changed by a live cover
+/// or selection transform. Constructing it is proportional to changed items,
+/// while ordinary indexed iteration still follows the page's scene order.
+final class _SparseObjectPreviewList extends ListBase<BoardObject>
+    implements FixedSceneListOverlay<BoardObject> {
+  _SparseObjectPreviewList(this._source, Map<int, BoardObject> replacements)
+    : _replacements = Map<int, BoardObject>.unmodifiable(replacements);
+
+  final List<BoardObject> _source;
+  final Map<int, BoardObject> _replacements;
+
+  @override
+  List<BoardObject> get sceneSource => _source;
+
+  @override
+  Map<int, BoardObject> get sceneReplacements => _replacements;
+
+  @override
+  int get length => _source.length;
+
+  @override
+  set length(int value) =>
+      throw UnsupportedError('Object preview lists are immutable.');
+
+  @override
+  BoardObject operator [](int index) {
+    RangeError.checkValidIndex(index, this);
+    return _replacements[index] ?? _source[index];
+  }
+
+  @override
+  void operator []=(int index, BoardObject value) =>
+      throw UnsupportedError('Object preview lists are immutable.');
+
+  @override
+  Iterator<BoardObject> get iterator => _values().iterator;
+
+  Iterable<BoardObject> _values() sync* {
+    for (var index = 0; index < _source.length; index++) {
+      yield _replacements[index] ?? _source[index];
+    }
+  }
+}
+
+/// Fixed-length immutable overlay for selected strokes. Unlike the eraser
+/// preview it never changes list length, so every replacement keeps its source
+/// index and unrelated stroke identities remain available to renderer caches.
+final class _SparseStrokeSelectionPreviewList extends ListBase<InkStroke>
+    implements FixedSceneListOverlay<InkStroke> {
+  _SparseStrokeSelectionPreviewList(
+    this._source,
+    Map<int, InkStroke> replacements,
+  ) : _replacements = Map<int, InkStroke>.unmodifiable(replacements);
+
+  final List<InkStroke> _source;
+  final Map<int, InkStroke> _replacements;
+
+  @override
+  List<InkStroke> get sceneSource => _source;
+
+  @override
+  Map<int, InkStroke> get sceneReplacements => _replacements;
+
+  @override
+  int get length => _source.length;
+
+  @override
+  set length(int value) =>
+      throw UnsupportedError('Selection preview lists are immutable.');
+
+  @override
+  InkStroke operator [](int index) {
+    RangeError.checkValidIndex(index, this);
+    return _replacements[index] ?? _source[index];
+  }
+
+  @override
+  void operator []=(int index, InkStroke value) =>
+      throw UnsupportedError('Selection preview lists are immutable.');
+
+  @override
+  Iterator<InkStroke> get iterator => _values().iterator;
+
+  Iterable<InkStroke> _values() sync* {
+    for (var index = 0; index < _source.length; index++) {
+      yield _replacements[index] ?? _source[index];
+    }
+  }
+}
+
 class _AnnotationTarget {
-  const _AnnotationTarget(this.objectId, this.transform, {this.pdfPageIndex});
+  factory _AnnotationTarget(
+    String objectId,
+    ObjectTransform transform, {
+    int? pdfPageIndex,
+  }) {
+    final cosine = math.cos(transform.rotationRadians);
+    final sine = math.sin(transform.rotationRadians);
+    final centerX = transform.x + transform.width / 2;
+    final centerY = transform.y + transform.height / 2;
+    final baseX = transform.x + (transform.flipX ? transform.width : 0);
+    final baseY = transform.y + (transform.flipY ? transform.height : 0);
+    final scaleX = transform.flipX ? -transform.width : transform.width;
+    final scaleY = transform.flipY ? -transform.height : transform.height;
+    return _AnnotationTarget._(
+      objectId,
+      transform,
+      pdfPageIndex,
+      cosine,
+      sine,
+      centerX + (baseX - centerX) * cosine - (baseY - centerY) * sine,
+      scaleX * cosine,
+      -scaleY * sine,
+      centerY + (baseX - centerX) * sine + (baseY - centerY) * cosine,
+      scaleX * sine,
+      scaleY * cosine,
+    );
+  }
+
+  const _AnnotationTarget._(
+    this.objectId,
+    this.transform,
+    this.pdfPageIndex,
+    this._cosine,
+    this._sine,
+    this._worldXBase,
+    this._worldXX,
+    this._worldXY,
+    this._worldYBase,
+    this._worldYX,
+    this._worldYY,
+  );
+
   final String objectId;
   final ObjectTransform transform;
   final int? pdfPageIndex;
+  final double _cosine;
+  final double _sine;
+  final double _worldXBase;
+  final double _worldXX;
+  final double _worldXY;
+  final double _worldYBase;
+  final double _worldYX;
+  final double _worldYY;
 
   double get minimumExtent =>
       (transform.width < transform.height ? transform.width : transform.height)
           .clamp(1, double.infinity);
 
   Offset toLocal(Offset world) {
-    final local = transform.worldToLocal(Vec2(world.dx, world.dy));
-    return Offset(local.x / transform.width, local.y / transform.height);
+    final normalized = _worldToNormalized(world.dx, world.dy);
+    return Offset(normalized.$1, normalized.$2);
   }
 
-  Offset pointToWorld(InkPoint point) {
-    final world = transform.localToWorld(
-      Vec2(point.x * transform.width, point.y * transform.height),
-    );
-    return Offset(world.x, world.y);
-  }
+  Offset pointToWorld(InkPoint point) => Offset(
+    _worldXBase + _worldXX * point.x + _worldXY * point.y,
+    _worldYBase + _worldYX * point.x + _worldYY * point.y,
+  );
+
+  double pointWorldX(InkPoint point) =>
+      _worldXBase + _worldXX * point.x + _worldXY * point.y;
+
+  double pointWorldY(InkPoint point) =>
+      _worldYBase + _worldYX * point.x + _worldYY * point.y;
 
   InkStroke toLocalStroke(InkStroke stroke) => stroke.copyWith(
     points: stroke.points.map((point) {
-      final local = transform.worldToLocal(point.position);
+      final local = _worldToNormalized(point.x, point.y);
       return InkPoint(
-        x: local.x / transform.width,
-        y: local.y / transform.height,
+        x: local.$1,
+        y: local.$2,
         pressure: point.pressure,
         timestampMicros: point.timestampMicros,
         tiltX: point.tiltX,
@@ -3230,6 +4026,286 @@ class _AnnotationTarget {
     }),
     width: stroke.width / minimumExtent,
   );
+
+  (double, double) _worldToNormalized(double worldX, double worldY) {
+    final centerX = transform.x + transform.width / 2;
+    final centerY = transform.y + transform.height / 2;
+    final deltaX = worldX - centerX;
+    final deltaY = worldY - centerY;
+    final unrotatedX = centerX + deltaX * _cosine + deltaY * _sine;
+    final unrotatedY = centerY - deltaX * _sine + deltaY * _cosine;
+    final localX = unrotatedX - transform.x;
+    final localY = unrotatedY - transform.y;
+    return (
+      (transform.flipX ? transform.width - localX : localX) / transform.width,
+      (transform.flipY ? transform.height - localY : localY) / transform.height,
+    );
+  }
+}
+
+/// Spatially indexes only the annotation strokes that are currently rendered.
+///
+/// Rebuilding is O(objects + layers + annotation points), but only happens
+/// when either immutable source list changes. Pointer moves then query nearby
+/// strokes directly instead of performing an O(objects * layers) lookup and
+/// scanning every stroke of each intersecting object.
+final class _AnnotationEraseIndex {
+  final SpatialIndex<_IndexedAnnotationStroke> _spatial =
+      SpatialIndex<_IndexedAnnotationStroke>(cellSize: 160);
+  final Map<String, ObjectInkLayer> _legacyLayerByObject =
+      <String, ObjectInkLayer>{};
+  final Map<String, Map<int, ObjectInkLayer>> _pageLayersByObject =
+      <String, Map<int, ObjectInkLayer>>{};
+  final Map<String, Set<ObjectInkLayer>> _layersByStrokeId =
+      <String, Set<ObjectInkLayer>>{};
+  final Map<ObjectInkLayer, int> _layerPositions = <ObjectInkLayer, int>{};
+
+  String? _pageId;
+  List<BoardObject>? _objects;
+  List<ObjectInkLayer>? _layers;
+
+  int get length => _spatial.length;
+
+  bool referencesSameSources(BoardPage page) =>
+      _pageId == page.id &&
+      identical(_objects, page.objects) &&
+      identical(_layers, page.annotationLayers);
+
+  void synchronize(BoardPage page) {
+    if (referencesSameSources(page)) {
+      return;
+    }
+    clear();
+    _pageId = page.id;
+    _objects = page.objects;
+    _layers = page.annotationLayers;
+
+    for (var index = 0; index < page.annotationLayers.length; index++) {
+      final layer = page.annotationLayers[index];
+      _layerPositions[layer] = index;
+      for (final stroke in layer.strokes) {
+        (_layersByStrokeId[stroke.id] ??= <ObjectInkLayer>{}).add(layer);
+      }
+      if (!layer.visible) continue;
+      final pdfPageIndex = layer.pdfPageIndex;
+      if (pdfPageIndex == null) {
+        _legacyLayerByObject.putIfAbsent(layer.objectId, () => layer);
+      } else {
+        (_pageLayersByObject[layer.objectId] ??= <int, ObjectInkLayer>{})
+            .putIfAbsent(pdfPageIndex, () => layer);
+      }
+    }
+
+    for (final object in page.objects) {
+      final layer = _visibleLayerFor(object);
+      if (layer == null || layer.strokes.isEmpty) continue;
+      final target = _AnnotationTarget(
+        object.id,
+        object.transform,
+        pdfPageIndex: object is PdfObject ? object.activeSourcePageIndex : null,
+      );
+      for (final stroke in layer.strokes) {
+        final entry = _IndexedAnnotationStroke(stroke: stroke, target: target);
+        final localWidth = stroke.width.isFinite ? stroke.width : 0.0;
+        _spatial.insertMappedPolyline<InkPoint>(
+          entry,
+          stroke.points,
+          xOf: target.pointWorldX,
+          yOf: target.pointWorldY,
+          inflate: math.max(0.0, localWidth * target.minimumExtent / 2),
+        );
+      }
+    }
+  }
+
+  Set<_IndexedAnnotationStroke> query(Rect area) => _spatial.query(area);
+
+  Iterable<ObjectInkLayer> layersContainingStroke(String strokeId) =>
+      _layersByStrokeId[strokeId] ?? const <ObjectInkLayer>{};
+
+  int? indexOfLayer(ObjectInkLayer layer) => _layerPositions[layer];
+
+  void clear() {
+    _spatial.clear();
+    _legacyLayerByObject.clear();
+    _pageLayersByObject.clear();
+    _layersByStrokeId.clear();
+    _layerPositions.clear();
+    _pageId = null;
+    _objects = null;
+    _layers = null;
+  }
+
+  ObjectInkLayer? _visibleLayerFor(BoardObject object) {
+    if (object is PdfObject) {
+      final exact =
+          _pageLayersByObject[object.id]?[object.activeSourcePageIndex];
+      if (exact != null) return exact;
+    }
+    return _legacyLayerByObject[object.id];
+  }
+}
+
+final class _IndexedAnnotationStroke {
+  const _IndexedAnnotationStroke({required this.stroke, required this.target});
+
+  final InkStroke stroke;
+  final _AnnotationTarget target;
+}
+
+final class _StrokePreviewPatch {
+  const _StrokePreviewPatch({
+    required this.sourceIndex,
+    required this.replacements,
+  });
+
+  final int sourceIndex;
+  final List<InkStroke> replacements;
+}
+
+final class _ResolvedStrokePreviewPatch {
+  const _ResolvedStrokePreviewPatch({
+    required this.sourceIndex,
+    required this.previewStart,
+    required this.deltaAfter,
+    required this.replacements,
+  });
+
+  final int sourceIndex;
+  final int previewStart;
+  final int deltaAfter;
+  final List<InkStroke> replacements;
+
+  int get previewEnd => previewStart + replacements.length;
+}
+
+/// Immutable sparse overlay over the page's stroke list.
+///
+/// Creating an erase preview is O(changed strokes log changed strokes), not
+/// O(all page strokes). Consumers still see a normal [List] in original scene
+/// order; full traversal only occurs when a renderer actually consumes it.
+final class _SparseStrokePreviewList extends ListBase<InkStroke> {
+  factory _SparseStrokePreviewList(
+    List<InkStroke> source,
+    List<_StrokePreviewPatch> patches,
+  ) {
+    final sorted = List<_StrokePreviewPatch>.of(
+      patches,
+    )..sort((first, second) => first.sourceIndex.compareTo(second.sourceIndex));
+    final resolved = <_ResolvedStrokePreviewPatch>[];
+    var delta = 0;
+    for (final patch in sorted) {
+      final previewStart = patch.sourceIndex + delta;
+      delta += patch.replacements.length - 1;
+      resolved.add(
+        _ResolvedStrokePreviewPatch(
+          sourceIndex: patch.sourceIndex,
+          previewStart: previewStart,
+          deltaAfter: delta,
+          replacements: patch.replacements,
+        ),
+      );
+    }
+    return _SparseStrokePreviewList._(
+      source,
+      List<_ResolvedStrokePreviewPatch>.unmodifiable(resolved),
+      source.length + delta,
+    );
+  }
+
+  const _SparseStrokePreviewList._(this._source, this._patches, this._length);
+
+  final List<InkStroke> _source;
+  final List<_ResolvedStrokePreviewPatch> _patches;
+  final int _length;
+
+  @override
+  int get length => _length;
+
+  @override
+  set length(int value) =>
+      throw UnsupportedError('Erase preview lists are immutable.');
+
+  @override
+  InkStroke operator [](int index) {
+    RangeError.checkValidIndex(index, this);
+    var low = 0;
+    var high = _patches.length - 1;
+    var candidateIndex = -1;
+    while (low <= high) {
+      final middle = (low + high) >> 1;
+      if (_patches[middle].previewStart <= index) {
+        candidateIndex = middle;
+        low = middle + 1;
+      } else {
+        high = middle - 1;
+      }
+    }
+    if (candidateIndex < 0) return _source[index];
+    final patch = _patches[candidateIndex];
+    if (index < patch.previewEnd) {
+      return patch.replacements[index - patch.previewStart];
+    }
+    return _source[index - patch.deltaAfter];
+  }
+
+  @override
+  void operator []=(int index, InkStroke value) =>
+      throw UnsupportedError('Erase preview lists are immutable.');
+
+  @override
+  Iterator<InkStroke> get iterator => _values().iterator;
+
+  Iterable<InkStroke> _values() sync* {
+    var patchIndex = 0;
+    for (var sourceIndex = 0; sourceIndex < _source.length; sourceIndex++) {
+      if (patchIndex < _patches.length &&
+          _patches[patchIndex].sourceIndex == sourceIndex) {
+        yield* _patches[patchIndex].replacements;
+        patchIndex++;
+      } else {
+        yield _source[sourceIndex];
+      }
+    }
+  }
+}
+
+/// Fixed-length sparse overlay for the few annotation layers changed by one
+/// eraser gesture. It avoids copying every unrelated layer on every MOVE.
+final class _SparseAnnotationLayerPreviewList extends ListBase<ObjectInkLayer> {
+  _SparseAnnotationLayerPreviewList(
+    this._source,
+    Map<int, ObjectInkLayer> replacements,
+  ) : _replacements = Map<int, ObjectInkLayer>.unmodifiable(replacements);
+
+  final List<ObjectInkLayer> _source;
+  final Map<int, ObjectInkLayer> _replacements;
+
+  @override
+  int get length => _source.length;
+
+  @override
+  set length(int value) =>
+      throw UnsupportedError('Erase preview lists are immutable.');
+
+  @override
+  ObjectInkLayer operator [](int index) {
+    RangeError.checkValidIndex(index, this);
+    return _replacements[index] ?? _source[index];
+  }
+
+  @override
+  void operator []=(int index, ObjectInkLayer value) =>
+      throw UnsupportedError('Erase preview lists are immutable.');
+
+  @override
+  Iterator<ObjectInkLayer> get iterator => _values().iterator;
+
+  Iterable<ObjectInkLayer> _values() sync* {
+    for (var index = 0; index < _source.length; index++) {
+      yield _replacements[index] ?? _source[index];
+    }
+  }
 }
 
 final class _PendingEraseSweep {
@@ -3237,13 +4313,20 @@ final class _PendingEraseSweep {
     required this.start,
     required this.end,
     required this.radius,
+    this.eraseMinimumX,
+    this.eraseMaximumX,
   });
 
   final Offset start;
   final Offset end;
   final double radius;
+  final double? eraseMinimumX;
+  final double? eraseMaximumX;
   Set<String>? sourceIds;
 }
+
+double _inkPointX(InkPoint point) => point.x;
+double _inkPointY(InkPoint point) => point.y;
 
 class _ClipboardPayload {
   const _ClipboardPayload({

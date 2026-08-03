@@ -3,9 +3,10 @@ package de.flowboardx.flowboard_x
 /**
  * Final safety gate before a native Android palm trace is replayed as eraser.
  *
- * Android's cancellation signal identifies an unintended touch, not the
- * user's intent to erase. Flowboard therefore requires wipe movement and
- * rejects every trace which overlapped a live stylus protection zone.
+ * Android's cancellation signal identifies an interrupted touch, not the
+ * user's intent to erase. Non-explicit contacts therefore require independent
+ * broad-contact evidence as well as wipe movement. Every trace which
+ * overlapped a live stylus protection zone is rejected.
  */
 object PalmTraceDecision {
     fun shouldReplayAsEraser(

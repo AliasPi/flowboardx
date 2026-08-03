@@ -228,7 +228,7 @@ void main() {
   );
 
   testWidgets(
-    'native Samsung palm trace rolls navigation back and commits one erase',
+    'explicit native palm trace rolls navigation back and commits one erase',
     (tester) async {
       tester.view.devicePixelRatio = 1;
       tester.view.physicalSize = const Size(900, 700);
@@ -299,8 +299,8 @@ void main() {
             Offset(550, 370),
           ],
           radius: 34,
-          contactCount: 2,
-          source: 'system_canceled',
+          contactCount: 1,
+          source: 'tool_type_palm',
         ),
       );
       await tester.pump();
@@ -973,7 +973,7 @@ void main() {
   );
 
   testWidgets(
-    'broadness first reported on PointerCancel replays the buffered erase path',
+    'PointerCancel cannot turn a completed finger drag into an eraser',
     (tester) async {
       tester.view.devicePixelRatio = 1;
       tester.view.physicalSize = const Size(900, 700);
@@ -1036,7 +1036,11 @@ void main() {
           size: .12,
         ),
       );
-      expect(controller.viewport.offset, isNot(initialOffset));
+      // A narrow finger starting on content owns direct manipulation. A
+      // vendor CANCEL may report inflated final geometry, but that packet is
+      // not proof of eraser intent and must only roll the preview back.
+      expect(controller.viewport.offset, initialOffset);
+      expect(controller.renderStrokes.single.points.first.x, closeTo(500, .01));
       await tester.sendEventToBinding(
         const PointerCancelEvent(
           pointer: 451,
@@ -1052,10 +1056,9 @@ void main() {
 
       expect(controller.viewport.offset, initialOffset);
       expect(controller.page.strokes, hasLength(1));
-      expect(controller.renderStrokes, isEmpty);
+      expect(controller.renderStrokes, hasLength(1));
+      expect(controller.renderStrokes.single.points.first.x, closeTo(390, .01));
       await tester.pump(const Duration(milliseconds: 220));
-      expect(controller.page.strokes, isEmpty);
-      controller.undo();
       expect(controller.page.strokes, hasLength(1));
       expect(controller.canUndo, isFalse);
       await controller.flush();
@@ -1063,7 +1066,7 @@ void main() {
   );
 
   testWidgets(
-    'late palm footprint cancels shape preview and erases continuously',
+    'late broad single-finger footprint remains non-destructive navigation',
     (tester) async {
       tester.view.devicePixelRatio = 1;
       tester.view.physicalSize = const Size(900, 700);
@@ -1139,7 +1142,7 @@ void main() {
       await tester.pump();
 
       expect(controller.page.strokes, hasLength(1));
-      expect(controller.renderStrokes, isEmpty);
+      expect(controller.renderStrokes, hasLength(1));
       expect(controller.page.objects, isEmpty);
 
       await tester.sendEventToBinding(
@@ -1151,15 +1154,15 @@ void main() {
         ),
       );
       await tester.pump();
-      expect(controller.page.strokes, isEmpty);
+      expect(controller.page.strokes, hasLength(1));
       expect(controller.page.objects, isEmpty);
-      expect(controller.canUndo, isTrue);
+      expect(controller.canUndo, isFalse);
       await controller.flush();
     },
   );
 
   testWidgets(
-    'late strong palm takes over multi-touch and rolls viewport back',
+    'late broad single-touch metadata cannot take over multi-touch navigation',
     (tester) async {
       tester.view.devicePixelRatio = 1;
       tester.view.physicalSize = const Size(900, 700);
@@ -1252,29 +1255,51 @@ void main() {
           kind: PointerDeviceKind.touch,
           position: Offset(430, 300),
           delta: Offset(190, 20),
-          radiusMajor: 26,
-          radiusMinor: 10,
-          size: .31,
+          radiusMajor: 32,
+          radiusMinor: 16,
+          size: .45,
           buttons: kPrimaryButton,
         ),
       );
-      expect(controller.viewport.offset, persistedOffset);
-      expect(controller.viewport.scale, persistedScale);
+      // One strong packet is not enough to reinterpret a finger mid-gesture.
+      expect(
+        controller.viewport.offset != persistedOffset ||
+            controller.viewport.scale != persistedScale,
+        isTrue,
+      );
+      await tester.sendEventToBinding(
+        const PointerMoveEvent(
+          pointer: 61,
+          device: 61,
+          kind: PointerDeviceKind.touch,
+          position: Offset(470, 300),
+          delta: Offset(40, 0),
+          radiusMajor: 32,
+          radiusMinor: 16,
+          size: .45,
+          buttons: kPrimaryButton,
+        ),
+      );
+      expect(
+        controller.viewport.offset != persistedOffset ||
+            controller.viewport.scale != persistedScale,
+        isTrue,
+      );
       await tester.sendEventToBinding(
         const PointerMoveEvent(
           pointer: 61,
           device: 61,
           kind: PointerDeviceKind.touch,
           position: Offset(560, 300),
-          delta: Offset(130, 0),
-          radiusMajor: 26,
-          radiusMinor: 10,
-          size: .31,
+          delta: Offset(90, 0),
+          radiusMajor: 42,
+          radiusMinor: 22,
+          size: .72,
           buttons: kPrimaryButton,
         ),
       );
       await tester.pump();
-      expect(controller.renderStrokes, isEmpty);
+      expect(controller.renderStrokes, hasLength(1));
 
       await tester.sendEventToBinding(
         const PointerUpEvent(
@@ -1293,13 +1318,13 @@ void main() {
         ),
       );
       await tester.pump();
-      expect(controller.page.strokes, isEmpty);
-      expect(controller.canUndo, isTrue);
+      expect(controller.page.strokes, hasLength(1));
+      expect(controller.canUndo, isFalse);
       await controller.flush();
     },
   );
 
-  testWidgets('broad palm down cancels existing provisional navigation', (
+  testWidgets('broad third finger cannot cancel provisional navigation', (
     tester,
   ) async {
     tester.view.devicePixelRatio = 1;
@@ -1337,6 +1362,7 @@ void main() {
     await first.moveBy(const Offset(50, 20));
     await second.moveBy(const Offset(70, 20));
     expect(controller.viewport.offset, isNot(persistedOffset));
+    final navigationOffset = controller.viewport.offset;
 
     await tester.sendEventToBinding(
       const PointerDownEvent(
@@ -1349,10 +1375,10 @@ void main() {
         size: .34,
       ),
     );
-    expect(controller.viewport.offset, persistedOffset);
+    expect(controller.viewport.offset, navigationOffset);
     await first.moveBy(const Offset(80, 30));
     await second.moveBy(const Offset(-80, -30));
-    expect(controller.viewport.offset, persistedOffset);
+    expect(controller.viewport.offset, isNot(persistedOffset));
 
     await tester.sendEventToBinding(
       const PointerUpEvent(
@@ -1367,228 +1393,216 @@ void main() {
     await controller.flush();
   });
 
-  testWidgets(
-    'broad fist contact rolls back an owned selection move before erasing',
-    (tester) async {
-      tester.view.devicePixelRatio = 1;
-      tester.view.physicalSize = const Size(900, 700);
-      addTearDown(() {
-        tester.view.resetDevicePixelRatio();
-        tester.view.resetPhysicalSize();
-      });
-      final base = WhiteboardDocument.create(id: 'palm-over-selection');
-      final shape = ShapeObject(
-        id: 'selected-shape',
-        transform: const ObjectTransform(
-          x: 100,
-          y: 100,
-          width: 200,
-          height: 200,
-        ),
-      );
-      final stroke = InkStroke(
-        id: 'erasable-stroke',
-        points: const <InkPoint>[
-          InkPoint(x: 500, y: 295),
-          InkPoint(x: 500, y: 305),
+  testWidgets('broad second finger never erases during a selection move', (
+    tester,
+  ) async {
+    tester.view.devicePixelRatio = 1;
+    tester.view.physicalSize = const Size(900, 700);
+    addTearDown(() {
+      tester.view.resetDevicePixelRatio();
+      tester.view.resetPhysicalSize();
+    });
+    final base = WhiteboardDocument.create(id: 'palm-over-selection');
+    final shape = ShapeObject(
+      id: 'selected-shape',
+      transform: const ObjectTransform(x: 100, y: 100, width: 200, height: 200),
+    );
+    final stroke = InkStroke(
+      id: 'erasable-stroke',
+      points: const <InkPoint>[
+        InkPoint(x: 500, y: 295),
+        InkPoint(x: 500, y: 305),
+      ],
+    );
+    final controller = EditorController(
+      document: base.copyWith(
+        pages: <BoardPage>[
+          base.currentPage.copyWith(
+            objects: <BoardObject>[shape],
+            strokes: <InkStroke>[stroke],
+            selection: SelectionState(
+              selectedItemIds: const <String>['selected-shape'],
+            ),
+          ),
         ],
-      );
-      final controller = EditorController(
-        document: base.copyWith(
-          pages: <BoardPage>[
-            base.currentPage.copyWith(
-              objects: <BoardObject>[shape],
-              strokes: <InkStroke>[stroke],
-              selection: SelectionState(
-                selectedItemIds: const <String>['selected-shape'],
+      ),
+      repository: _MemoryRepository(),
+      assetDirectory: Directory.current,
+    );
+    addTearDown(() async {
+      await controller.close();
+      controller.dispose();
+    });
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(body: BoardSurface(controller: controller)),
+      ),
+    );
+
+    await tester.sendEventToBinding(
+      const PointerDownEvent(
+        pointer: 81,
+        device: 81,
+        kind: PointerDeviceKind.touch,
+        position: Offset(150, 150),
+        radiusMajor: 7,
+        radiusMinor: 5,
+        size: .12,
+      ),
+    );
+    await tester.sendEventToBinding(
+      const PointerMoveEvent(
+        pointer: 81,
+        device: 81,
+        kind: PointerDeviceKind.touch,
+        position: Offset(250, 180),
+        delta: Offset(100, 30),
+        radiusMajor: 7,
+        radiusMinor: 5,
+        size: .12,
+        buttons: kPrimaryButton,
+      ),
+    );
+    expect(controller.renderObjects.single.transform.x, 200);
+
+    await tester.sendEventToBinding(
+      const PointerDownEvent(
+        pointer: 82,
+        device: 82,
+        kind: PointerDeviceKind.touch,
+        position: Offset(500, 300),
+        radiusMajor: 30,
+        radiusMinor: 16,
+        size: .34,
+      ),
+    );
+    await tester.pump();
+    expect(controller.renderObjects.single.transform.x, 100);
+    expect(controller.page.objects.single.transform.x, 100);
+    expect(controller.renderStrokes, hasLength(1));
+
+    await tester.sendEventToBinding(
+      const PointerUpEvent(
+        pointer: 82,
+        device: 82,
+        kind: PointerDeviceKind.touch,
+        position: Offset(500, 300),
+      ),
+    );
+    await tester.sendEventToBinding(
+      const PointerUpEvent(
+        pointer: 81,
+        device: 81,
+        kind: PointerDeviceKind.touch,
+        position: Offset(250, 180),
+      ),
+    );
+    await tester.pump();
+    expect(controller.page.strokes, hasLength(1));
+    expect(controller.page.objects.single.transform.x, 100);
+    await controller.flush();
+  });
+
+  testWidgets('broad single finger on a selection handle only resizes', (
+    tester,
+  ) async {
+    tester.view.devicePixelRatio = 1;
+    tester.view.physicalSize = const Size(900, 700);
+    addTearDown(() {
+      tester.view.resetDevicePixelRatio();
+      tester.view.resetPhysicalSize();
+    });
+    final base = WhiteboardDocument.create(id: 'palm-over-resize-handle');
+    const originalTransform = ObjectTransform(
+      x: 200,
+      y: 180,
+      width: 200,
+      height: 160,
+    );
+    final controller = EditorController(
+      document: base.copyWith(
+        pages: <BoardPage>[
+          base.currentPage.copyWith(
+            objects: <BoardObject>[
+              ShapeObject(id: 'selected-shape', transform: originalTransform),
+            ],
+            strokes: <InkStroke>[
+              InkStroke(
+                id: 'behind-resize-handle',
+                points: const <InkPoint>[
+                  InkPoint(x: 380, y: 340),
+                  InkPoint(x: 520, y: 340),
+                ],
+                width: 8,
               ),
+            ],
+            selection: SelectionState(
+              selectedItemIds: const <String>['selected-shape'],
             ),
-          ],
-        ),
-        repository: _MemoryRepository(),
-        assetDirectory: Directory.current,
-      );
-      addTearDown(() async {
-        await controller.close();
-        controller.dispose();
-      });
-      await tester.pumpWidget(
-        MaterialApp(
-          home: Scaffold(body: BoardSurface(controller: controller)),
-        ),
-      );
+          ),
+        ],
+      ),
+      repository: _MemoryRepository(),
+      assetDirectory: Directory.current,
+    )..setTool(BoardTool.selectRectangle);
+    addTearDown(() async {
+      await controller.close();
+      controller.dispose();
+    });
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(body: BoardSurface(controller: controller)),
+      ),
+    );
+    await tester.pump();
+    final handle = tester.getCenter(find.bySemanticsLabel('Auswahl skalieren'));
 
-      await tester.sendEventToBinding(
-        const PointerDownEvent(
-          pointer: 81,
-          device: 81,
-          kind: PointerDeviceKind.touch,
-          position: Offset(150, 150),
-          radiusMajor: 7,
-          radiusMinor: 5,
-          size: .12,
-        ),
-      );
-      await tester.sendEventToBinding(
-        const PointerMoveEvent(
-          pointer: 81,
-          device: 81,
-          kind: PointerDeviceKind.touch,
-          position: Offset(250, 180),
-          delta: Offset(100, 30),
-          radiusMajor: 7,
-          radiusMinor: 5,
-          size: .12,
-          buttons: kPrimaryButton,
-        ),
-      );
-      expect(controller.renderObjects.single.transform.x, 200);
+    await tester.sendEventToBinding(
+      PointerDownEvent(
+        pointer: 490,
+        device: 490,
+        kind: PointerDeviceKind.touch,
+        position: handle,
+        radiusMajor: 31,
+        radiusMinor: 18,
+        size: .34,
+      ),
+    );
+    await tester.sendEventToBinding(
+      PointerMoveEvent(
+        pointer: 490,
+        device: 490,
+        kind: PointerDeviceKind.touch,
+        position: handle + const Offset(110, 0),
+        delta: const Offset(110, 0),
+        buttons: kPrimaryButton,
+        radiusMajor: 31,
+        radiusMinor: 18,
+        size: .34,
+      ),
+    );
+    await tester.sendEventToBinding(
+      PointerUpEvent(
+        pointer: 490,
+        device: 490,
+        kind: PointerDeviceKind.touch,
+        position: handle + const Offset(110, 0),
+        radiusMajor: 31,
+        radiusMinor: 18,
+        size: .34,
+      ),
+    );
+    await tester.pump();
 
-      await tester.sendEventToBinding(
-        const PointerDownEvent(
-          pointer: 82,
-          device: 82,
-          kind: PointerDeviceKind.touch,
-          position: Offset(500, 300),
-          radiusMajor: 30,
-          radiusMinor: 16,
-          size: .34,
-        ),
-      );
-      await tester.pump();
-      expect(controller.renderObjects.single.transform.x, 100);
-      expect(controller.page.objects.single.transform.x, 100);
-      expect(controller.renderStrokes, isEmpty);
+    expect(controller.page.objects.single.transform, isNot(originalTransform));
+    expect(_strokesCrossX(controller.page.strokes, 450), isTrue);
+    controller.undo();
+    expect(controller.page.strokes, hasLength(1));
+    expect(controller.page.objects.single.transform, originalTransform);
+    await controller.flush();
+  });
 
-      await tester.sendEventToBinding(
-        const PointerUpEvent(
-          pointer: 82,
-          device: 82,
-          kind: PointerDeviceKind.touch,
-          position: Offset(500, 300),
-        ),
-      );
-      await tester.sendEventToBinding(
-        const PointerUpEvent(
-          pointer: 81,
-          device: 81,
-          kind: PointerDeviceKind.touch,
-          position: Offset(250, 180),
-        ),
-      );
-      await tester.pump();
-      expect(controller.page.strokes, isEmpty);
-      expect(controller.page.objects.single.transform.x, 100);
-      await controller.flush();
-    },
-  );
-
-  testWidgets(
-    'broad palm over a selection handle wins before the resize recognizer',
-    (tester) async {
-      tester.view.devicePixelRatio = 1;
-      tester.view.physicalSize = const Size(900, 700);
-      addTearDown(() {
-        tester.view.resetDevicePixelRatio();
-        tester.view.resetPhysicalSize();
-      });
-      final base = WhiteboardDocument.create(id: 'palm-over-resize-handle');
-      const originalTransform = ObjectTransform(
-        x: 200,
-        y: 180,
-        width: 200,
-        height: 160,
-      );
-      final controller = EditorController(
-        document: base.copyWith(
-          pages: <BoardPage>[
-            base.currentPage.copyWith(
-              objects: <BoardObject>[
-                ShapeObject(id: 'selected-shape', transform: originalTransform),
-              ],
-              strokes: <InkStroke>[
-                InkStroke(
-                  id: 'behind-resize-handle',
-                  points: const <InkPoint>[
-                    InkPoint(x: 380, y: 340),
-                    InkPoint(x: 520, y: 340),
-                  ],
-                  width: 8,
-                ),
-              ],
-              selection: SelectionState(
-                selectedItemIds: const <String>['selected-shape'],
-              ),
-            ),
-          ],
-        ),
-        repository: _MemoryRepository(),
-        assetDirectory: Directory.current,
-      )..setTool(BoardTool.selectRectangle);
-      addTearDown(() async {
-        await controller.close();
-        controller.dispose();
-      });
-      await tester.pumpWidget(
-        MaterialApp(
-          home: Scaffold(body: BoardSurface(controller: controller)),
-        ),
-      );
-      await tester.pump();
-      final handle = tester.getCenter(
-        find.bySemanticsLabel('Auswahl skalieren'),
-      );
-
-      await tester.sendEventToBinding(
-        PointerDownEvent(
-          pointer: 490,
-          device: 490,
-          kind: PointerDeviceKind.touch,
-          position: handle,
-          radiusMajor: 31,
-          radiusMinor: 18,
-          size: .34,
-        ),
-      );
-      await tester.sendEventToBinding(
-        PointerMoveEvent(
-          pointer: 490,
-          device: 490,
-          kind: PointerDeviceKind.touch,
-          position: handle + const Offset(110, 0),
-          delta: const Offset(110, 0),
-          buttons: kPrimaryButton,
-          radiusMajor: 31,
-          radiusMinor: 18,
-          size: .34,
-        ),
-      );
-      await tester.sendEventToBinding(
-        PointerUpEvent(
-          pointer: 490,
-          device: 490,
-          kind: PointerDeviceKind.touch,
-          position: handle + const Offset(110, 0),
-          radiusMajor: 31,
-          radiusMinor: 18,
-          size: .34,
-        ),
-      );
-      await tester.pump();
-
-      expect(controller.page.objects.single.transform, originalTransform);
-      // The accurately centred palm footprint no longer expands the major
-      // axis into an oversized circle. It still wins arbitration and removes
-      // the swept section beneath the hand without resizing the selection.
-      expect(_strokesCrossX(controller.page.strokes, 450), isFalse);
-      controller.undo();
-      expect(controller.page.strokes, hasLength(1));
-      expect(controller.page.objects.single.transform, originalTransform);
-      await controller.flush();
-    },
-  );
-
-  testWidgets('broad palm over the navigator cannot move the camera', (
+  testWidgets('broad single finger remains valid navigator input', (
     tester,
   ) async {
     tester.view.devicePixelRatio = 1;
@@ -1669,7 +1683,7 @@ void main() {
     );
     await tester.pump();
     expect(controller.viewport.scale, beforeScale);
-    expect(controller.viewport.offset, beforeOffset);
+    expect(controller.viewport.offset, isNot(beforeOffset));
     await controller.flush();
   });
 
@@ -1788,7 +1802,7 @@ void main() {
     },
   );
 
-  testWidgets('multiple fist contacts commit one combined undo operation', (
+  testWidgets('two broad finger contacts never become destructive', (
     tester,
   ) async {
     tester.view.devicePixelRatio = 1;
@@ -1848,7 +1862,7 @@ void main() {
     }
     await tester.pump();
     expect(controller.page.strokes, hasLength(2));
-    expect(controller.renderStrokes, isEmpty);
+    expect(controller.renderStrokes, hasLength(2));
     expect(controller.canUndo, isFalse);
 
     await tester.sendEventToBinding(
@@ -1870,10 +1884,8 @@ void main() {
       ),
     );
     await tester.pump();
-    expect(controller.page.strokes, isEmpty);
-    expect(controller.canUndo, isTrue);
-    controller.undo();
     expect(controller.page.strokes, hasLength(2));
+    expect(controller.canUndo, isFalse);
     await controller.flush();
   });
 

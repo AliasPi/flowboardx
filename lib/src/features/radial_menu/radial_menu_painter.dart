@@ -157,7 +157,15 @@ class RadialMenuPainter extends CustomPainter {
     };
   }
 
-  bool get hasThicknessSlider => branch == RadialMenuBranch.pen;
+  /// The thickness control belongs to drawing ink, not to erasing.
+  ///
+  /// Eraser size is derived from the live contact footprint. Keeping the
+  /// slider visible while the eraser was selected suggested that a SMART-style
+  /// palm/fist eraser had to be configured manually and also made the stylus
+  /// eraser depend on the last pen width.
+  bool get hasThicknessSlider =>
+      branch == RadialMenuBranch.pen &&
+      penSettings.type != RadialPenType.eraser;
 
   int? get _parentIndex => switch (branch) {
     RadialMenuBranch.pen => RadialMenuAction.pen.index,
@@ -181,7 +189,7 @@ class RadialMenuPainter extends CustomPainter {
       : geometry.compactSubmenuSpan;
 
   double _thicknessSpan(RadialMenuGeometry geometry) =>
-      branch == RadialMenuBranch.pen ? geometry.thicknessSpan : 0;
+      hasThicknessSlider ? geometry.thicknessSpan : 0;
 
   double _tertiaryStartAngle(RadialMenuGeometry geometry) =>
       _submenuStartAngle(geometry) + _thicknessSpan(geometry);
@@ -1178,6 +1186,7 @@ class RadialMenuPainter extends CustomPainter {
       canvas,
       center - Offset(painter.width / 2, painter.height / 2),
     );
+    painter.dispose();
   }
 
   void _drawText(
@@ -1210,6 +1219,7 @@ class RadialMenuPainter extends CustomPainter {
       canvas,
       center - Offset(painter.width / 2, painter.height / 2),
     );
+    painter.dispose();
   }
 
   void _drawColorSwatch(
@@ -1459,7 +1469,15 @@ class RadialMenuPainter extends CustomPainter {
     };
   }
 
-  String _tertiarySemanticLabel(int index) => _tertiaryContent(index).$2;
+  String _tertiarySemanticLabel(int index) {
+    if (branch == RadialMenuBranch.pen &&
+        index >= 0 &&
+        index < RadialPenType.values.length &&
+        RadialPenType.values[index] == RadialPenType.eraser) {
+      return '${_tertiaryContent(index).$2}, automatische Größe';
+    }
+    return _tertiaryContent(index).$2;
+  }
 
   String _colorLabel(Color color) {
     const known = <int, String>{
@@ -1705,13 +1723,18 @@ class RadialMenuPainter extends CustomPainter {
         currentPageIndex != oldDelegate.currentPageIndex ||
         !listEquals(templateEntries, oldDelegate.templateEntries) ||
         surfaceSize != oldDelegate.surfaceSize ||
-        openProgress != oldDelegate.openProgress ||
-        submenuProgress != oldDelegate.submenuProgress ||
+        _primarySemanticsVisible != oldDelegate._primarySemanticsVisible ||
+        _submenuSemanticsVisible != oldDelegate._submenuSemanticsVisible ||
         canUndo != oldDelegate.canUndo ||
         canRedo != oldDelegate.canRedo ||
         labels != oldDelegate.labels ||
         textDirection != oldDelegate.textDirection;
   }
+
+  bool get _primarySemanticsVisible => isOpen && openProgress >= .72;
+
+  bool get _submenuSemanticsVisible =>
+      _primarySemanticsVisible && branch != null && submenuProgress >= .55;
 
   double _lerp(double a, double b, double t) => a + (b - a) * t;
 }

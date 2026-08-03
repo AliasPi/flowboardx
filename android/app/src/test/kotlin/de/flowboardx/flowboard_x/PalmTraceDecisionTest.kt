@@ -60,4 +60,69 @@ class PalmTraceDecisionTest {
             ),
         )
     }
+
+    @Test
+    fun movingCanceledSmartboardFingersWithPressureOneNeverErase() {
+        val evidence = PalmContactEvidence.isStrongEraserEvidence(
+            compactMultiContact = false,
+        )
+        assertFalse(evidence)
+        assertFalse(
+            PalmTraceDecision.shouldReplayAsEraser(
+                overlappedStylusProtection = false,
+                explicitNativePalm = false,
+                canceledBySystem = true,
+                hasCancellationEvidence = evidence,
+                pathLengthDp = 240.0,
+                displacementDp = 180.0,
+            ),
+        )
+    }
+
+    @Test
+    fun pinnedSizeAloneNeverEnablesDestructiveReplay() {
+        val evidence = PalmContactEvidence.isStrongEraserEvidence(
+            compactMultiContact = false,
+        )
+
+        assertFalse(evidence)
+        assertFalse(
+            PalmTraceDecision.shouldReplayAsEraser(
+                overlappedStylusProtection = false,
+                explicitNativePalm = false,
+                canceledBySystem = true,
+                hasCancellationEvidence = evidence,
+                pathLengthDp = 80.0,
+                displacementDp = 60.0,
+            ),
+        )
+    }
+
+    @Test
+    fun broadCanceledSingleFingerNeverEnablesDestructiveReplay() {
+        val evidence = PalmContactEvidence.isStrongEraserEvidence(
+            compactMultiContact = false,
+        )
+
+        assertFalse(evidence)
+        assertFalse(
+            PalmTraceDecision.shouldReplayAsEraser(
+                overlappedStylusProtection = false,
+                explicitNativePalm = false,
+                canceledBySystem = true,
+                hasCancellationEvidence = evidence,
+                pathLengthDp = 80.0,
+                displacementDp = 60.0,
+            ),
+        )
+    }
+
+    @Test
+    fun threeCompactContactsRemainIndependentPalmEvidence() {
+        assertTrue(
+            PalmContactEvidence.isStrongEraserEvidence(
+                compactMultiContact = true,
+            ),
+        )
+    }
 }

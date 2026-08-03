@@ -24,6 +24,8 @@ import '../board/engine/input_policy.dart';
 import '../board/presentation/board_surface.dart';
 import '../export_share/export_share.dart';
 import '../library/document_preview.dart';
+import '../pages/editor_page_controls.dart';
+import '../pages/page_thumbnail_invalidation_index.dart';
 import '../pages/page_thumbnail_renderer.dart';
 import '../radial_menu/radial_menu.dart';
 import '../templates/templates.dart';
@@ -36,6 +38,7 @@ import 'board_export_factory.dart';
 import 'board_participant_controller.dart';
 import 'editor_controller.dart';
 import 'editor_help_dialog.dart';
+import 'editor_pen_quick_controls.dart';
 import 'participant_mode_toggle.dart';
 import 'pdf_import_dialog.dart';
 import 'pdf_import_coordinator.dart';
@@ -57,14 +60,15 @@ final class _OpenedPdfPreview {
 /// surface.
 final class _EditorShellSnapshot {
   const _EditorShellSnapshot({
-    required this.documentRevision,
+    required this.documentTitle,
+    required this.pageCount,
+    required this.currentPageIndex,
     required this.pageId,
     required this.tool,
     required this.shape,
     required this.penColor,
     required this.penWidth,
     required this.penType,
-    required this.selectionHash,
     required this.saving,
     required this.lastError,
     required this.canUndo,
@@ -75,14 +79,15 @@ final class _EditorShellSnapshot {
   factory _EditorShellSnapshot.from(EditorController controller) {
     final pen = controller.penStyle;
     return _EditorShellSnapshot(
-      documentRevision: controller.document.revision,
+      documentTitle: controller.document.title,
+      pageCount: controller.document.pages.length,
+      currentPageIndex: controller.currentPageIndex,
       pageId: controller.page.id,
       tool: controller.tool,
       shape: controller.activeShape,
       penColor: pen.colorArgb,
       penWidth: pen.width,
       penType: pen.type,
-      selectionHash: Object.hashAllUnordered(controller.selectedSceneItemIds),
       saving: controller.saving,
       lastError: controller.lastError,
       canUndo: controller.canUndo,
@@ -91,14 +96,15 @@ final class _EditorShellSnapshot {
     );
   }
 
-  final int documentRevision;
+  final String documentTitle;
+  final int pageCount;
+  final int currentPageIndex;
   final String pageId;
   final BoardTool tool;
   final ShapeKind shape;
   final int penColor;
   final double penWidth;
   final InkToolType penType;
-  final int selectionHash;
   final bool saving;
   final String? lastError;
   final bool canUndo;
@@ -108,14 +114,15 @@ final class _EditorShellSnapshot {
   @override
   bool operator ==(Object other) =>
       other is _EditorShellSnapshot &&
-      other.documentRevision == documentRevision &&
+      other.documentTitle == documentTitle &&
+      other.pageCount == pageCount &&
+      other.currentPageIndex == currentPageIndex &&
       other.pageId == pageId &&
       other.tool == tool &&
       other.shape == shape &&
       other.penColor == penColor &&
       other.penWidth == penWidth &&
       other.penType == penType &&
-      other.selectionHash == selectionHash &&
       other.saving == saving &&
       other.lastError == lastError &&
       other.canUndo == canUndo &&
@@ -124,14 +131,15 @@ final class _EditorShellSnapshot {
 
   @override
   int get hashCode => Object.hash(
-    documentRevision,
+    documentTitle,
+    pageCount,
+    currentPageIndex,
     pageId,
     tool,
     shape,
     penColor,
     penWidth,
     penType,
-    selectionHash,
     saving,
     lastError,
     canUndo,
@@ -181,25 +189,32 @@ class _EditorScreenState extends State<EditorScreen>
   bool _secondaryParticipantInitialized = false;
   final PdfShareController _shareController = PdfShareController();
   final PageThumbnailRenderer _thumbnailRenderer = PageThumbnailRenderer();
+  final PageThumbnailInvalidationIndex _thumbnailInvalidation =
+      PageThumbnailInvalidationIndex();
   final Map<String, ui.Image> _thumbnails = {};
   final Map<String, int> _thumbnailIdentity = {};
   int _thumbnailGeneration = 0;
-  int _lastThumbnailIdentity = -1;
+  int _thumbnailImageRevision = 0;
   WhiteboardDocument? _thumbnailObservedDocument;
+  List<BoardPage>? _radialPreviewPageSource;
+  int _radialPreviewThumbnailRevision = -1;
+  List<RadialPagePreview> _cachedRadialPagePreviews =
+      const <RadialPagePreview>[];
   _EditorShellSnapshot? _primaryShellSnapshot;
   _EditorShellSnapshot? _secondaryShellSnapshot;
   Timer? _thumbnailDebounce;
   bool _thumbnailRefreshRunning = false;
   bool _thumbnailRefreshQueued = false;
   bool _pageSheetOpen = false;
+  bool _pageDeleteDialogOpen = false;
   bool _exporting = false;
   double? _exportProgress;
   bool _leaving = false;
   bool _topBarCollapsed = false;
   bool _fingerDrawingEnabled = false;
   late final CountdownTimerController _countdownTimer;
-  bool _largeTimerVisible = false;
-  Rect? _largeTimerRect;
+  final CountdownTimerOverlayPresenter _largeTimerPresenter =
+      CountdownTimerOverlayPresenter();
   Size _layoutSize = Size.zero;
   int _radialPositionResetToken = 0;
   int _secondaryRadialPositionResetToken = 0;
@@ -301,6 +316,7 @@ class _EditorScreenState extends State<EditorScreen>
     _secondaryRadial.dispose();
     _primaryParticipant.dispose();
     _secondaryParticipant.dispose();
+    _largeTimerPresenter.dispose();
     _countdownTimer.dispose();
     _radialPageGestureActive.dispose();
     _secondaryRadialPageGestureActive.dispose();
@@ -326,7 +342,12 @@ class _EditorScreenState extends State<EditorScreen>
         body: LayoutBuilder(
           builder: (context, constraints) {
             _layoutSize = constraints.biggest;
+            // Every visible editor layer is positioned. The timer milestone
+            // listener intentionally renders as SizedBox.shrink; without an
+            // expanding fit that zero-sized non-positioned child collapses
+            // the entire Stack on real Navigator routes.
             return Stack(
+              fit: StackFit.expand,
               children: [
                 Positioned.fill(
                   child: _buildBoardWorkspace(constraints.biggest),
@@ -340,6 +361,7 @@ class _EditorScreenState extends State<EditorScreen>
                         : math.max(0, constraints.maxWidth - 32),
                     collapsed: _topBarCollapsed,
                     controller: _editor,
+                    secondaryController: _secondaryEditor,
                     onBack: _leave,
                     onRename: _rename,
                     onPages: _showPagesSheet,
@@ -356,26 +378,30 @@ class _EditorScreenState extends State<EditorScreen>
                     onFingerDrawingChanged: (enabled) =>
                         setState(() => _fingerDrawingEnabled = enabled),
                     countdownTimer: _countdownTimer,
-                    onShowLargeTimer: () =>
-                        setState(() => _largeTimerVisible = true),
+                    onShowLargeTimer: _showLargeTimer,
+                    onPenColorChanged: (editor, color) =>
+                        _applyQuickPen(editor, color: color),
+                    onCustomPenColorRequested: (editor) =>
+                        unawaited(_chooseQuickPenColor(editor)),
+                    onPenTypeChanged: (editor, type) =>
+                        _applyQuickPen(editor, type: type),
+                    onAddPage: (editor) => _addPageAndShowWheel(
+                      editor: editor,
+                      source: identical(editor, _secondaryEditor)
+                          ? _secondaryRadial
+                          : _radial,
+                    ),
+                    onDeletePage: (editor, pageId) =>
+                        _confirmAndDeletePage(editor, pageId),
                     onToggleCollapsed: () =>
                         setState(() => _topBarCollapsed = !_topBarCollapsed),
                   ),
                 ),
+                CountdownTimerAutoPresentation(
+                  controller: _countdownTimer,
+                  onShowLarge: _showLargeTimer,
+                ),
                 ..._buildRadialMenus(constraints.biggest),
-                if (_largeTimerVisible)
-                  CountdownTimerOverlay(
-                    controller: _countdownTimer,
-                    bounds: Rect.fromLTWH(
-                      12,
-                      84,
-                      math.max(0, constraints.maxWidth - 24),
-                      math.max(0, constraints.maxHeight - 96),
-                    ),
-                    initialRect: _largeTimerRect,
-                    onRectChanged: (value) => _largeTimerRect = value,
-                    onClose: () => setState(() => _largeTimerVisible = false),
-                  ),
                 if ((_editor.lastError ?? _secondaryEditor.lastError)
                     case final message?)
                   Positioned(
@@ -626,15 +652,27 @@ class _EditorScreenState extends State<EditorScreen>
     );
   }
 
-  List<RadialPagePreview> get _radialPagePreviews => [
-    for (var index = 0; index < _editor.document.pages.length; index++)
-      RadialPagePreview(
-        pageIndex: index,
-        pageNumber: index + 1,
-        thumbnail: _thumbnails[_editor.document.pages[index].id],
-        semanticLabel: _editor.document.pages[index].name,
-      ),
-  ];
+  List<RadialPagePreview> get _radialPagePreviews {
+    final pages = _editor.document.pages;
+    if (identical(_radialPreviewPageSource, pages) &&
+        _radialPreviewThumbnailRevision == _thumbnailImageRevision) {
+      return _cachedRadialPagePreviews;
+    }
+    _radialPreviewPageSource = pages;
+    _radialPreviewThumbnailRevision = _thumbnailImageRevision;
+    _cachedRadialPagePreviews =
+        List<RadialPagePreview>.unmodifiable(<RadialPagePreview>[
+          for (var index = 0; index < pages.length; index++)
+            RadialPagePreview(
+              pageIndex: index,
+              pageNumber: index + 1,
+              pageId: pages[index].id,
+              thumbnail: _thumbnails[pages[index].id],
+              semanticLabel: pages[index].name,
+            ),
+        ]);
+    return _cachedRadialPagePreviews;
+  }
 
   RadialMenuCallbacks _radialCallbacks({
     required RadialMenuController radial,
@@ -704,6 +742,19 @@ class _EditorScreenState extends State<EditorScreen>
       }
     },
     onPageSelected: participantEditor.goToPage,
+    onPageDeleteRequested: (preview) {
+      final stableId = preview.pageId;
+      final fallbackIndex = preview.pageIndex;
+      final pageId =
+          stableId ??
+          (fallbackIndex >= 0 &&
+                  fallbackIndex < participantEditor.document.pages.length
+              ? participantEditor.document.pages[fallbackIndex].id
+              : null);
+      if (pageId != null) {
+        unawaited(_confirmAndDeletePage(participantEditor, pageId));
+      }
+    },
     onTemplateSelected: (entry) =>
         _useRadialTemplate(entry, editor: participantEditor),
     onShapeRequested: (shape) =>
@@ -757,6 +808,44 @@ class _EditorScreenState extends State<EditorScreen>
     return selected;
   }
 
+  void _applyQuickPen(
+    EditorController editor, {
+    Color? color,
+    InkToolType? type,
+  }) {
+    final secondary = identical(editor, _secondaryEditor);
+    final participant = secondary ? _secondaryParticipant : _primaryParticipant;
+    final radial = secondary ? _secondaryRadial : _radial;
+    final current = participant.penStyle;
+    final nextColor = color ?? Color(current.colorArgb);
+    final nextType = type ?? current.type;
+    _updateParticipantPen(
+      participant,
+      colorArgb: nextColor.toARGB32(),
+      width: current.width,
+      type: nextType,
+    );
+    radial.setPenSettings(
+      RadialPenSettings(
+        color: nextColor,
+        thickness: current.width.clamp(1, 32),
+        type: _radialType(nextType),
+      ),
+    );
+  }
+
+  Future<void> _chooseQuickPenColor(EditorController editor) async {
+    final participant = identical(editor, _secondaryEditor)
+        ? _secondaryParticipant
+        : _primaryParticipant;
+    final selected = await _chooseCustomPenColor(
+      Color(participant.penStyle.colorArgb),
+    );
+    if (selected != null && mounted) {
+      _applyQuickPen(editor, color: selected);
+    }
+  }
+
   bool _isPrimaryParticipant(BoardParticipantController participant) =>
       identical(participant, _primaryParticipant);
 
@@ -789,10 +878,11 @@ class _EditorScreenState extends State<EditorScreen>
   ) {
     final inkType = _inkType(settings.type);
     if (inkType == null) {
-      _editorFor(participant)
-        ..updatePen(width: settings.thickness)
-        ..setTool(BoardTool.eraser);
-      participant.updateEraserWidth(settings.thickness);
+      // The eraser has no manually configured width. Preserve the participant's
+      // ink width and let BoardSurface derive one screen-space footprint from
+      // every physical eraser/palm contact.
+      _editorFor(participant).setTool(BoardTool.eraser);
+      participant.selectEraser();
       return;
     }
     _updateParticipantPen(
@@ -899,11 +989,74 @@ class _EditorScreenState extends State<EditorScreen>
       }
     }
 
+    final splitWorldBoundary = _editor.viewport.worldBounds.center.dx;
+    if (mode == EditorParticipantMode.twoPeople) {
+      _editor.setContentHorizontalConstraint(
+        BoardViewportHorizontalConstraint(
+          side: BoardViewportPartitionSide.left,
+          worldBoundaryX: splitWorldBoundary,
+        ),
+      );
+      _secondaryEditor.setContentHorizontalConstraint(
+        BoardViewportHorizontalConstraint(
+          side: BoardViewportPartitionSide.right,
+          worldBoundaryX: splitWorldBoundary,
+        ),
+      );
+    } else {
+      _editor.setContentHorizontalConstraint(null);
+      _secondaryEditor.setContentHorizontalConstraint(null);
+    }
+
     setState(() {
       _participantMode = mode;
       _radialPositionResetToken++;
       _secondaryRadialPositionResetToken++;
     });
+    if (mode == EditorParticipantMode.twoPeople) {
+      _alignParticipantViewportsToDivider();
+    }
+  }
+
+  void _alignParticipantViewportsToDivider() {
+    final size = _layoutSize;
+    if (size.isEmpty || !size.width.isFinite || !size.height.isFinite) return;
+
+    const dividerWidth = 3.0;
+    final halfWidth = math.max(0.0, (size.width - dividerWidth) / 2);
+    final leftRegion = Rect.fromLTWH(0, 0, halfWidth, size.height);
+    final rightRegion = Rect.fromLTWH(
+      halfWidth + dividerWidth,
+      0,
+      halfWidth,
+      size.height,
+    );
+    final splitWorldBoundary = _editor.viewport.worldBounds.center.dx;
+    _editor.viewport.alignToHorizontalPartition(
+      viewportSize: size,
+      visibleScreenBounds: leftRegion,
+      horizontalConstraint: BoardViewportHorizontalConstraint(
+        side: BoardViewportPartitionSide.left,
+        worldBoundaryX: splitWorldBoundary,
+      ),
+    );
+    _secondaryEditor.viewport.alignToHorizontalPartition(
+      viewportSize: size,
+      visibleScreenBounds: rightRegion,
+      horizontalConstraint: BoardViewportHorizontalConstraint(
+        side: BoardViewportPartitionSide.right,
+        worldBoundaryX: splitWorldBoundary,
+      ),
+    );
+  }
+
+  void _showLargeTimer() {
+    if (!mounted) return;
+    if (!_largeTimerPresenter.show(context, controller: _countdownTimer)) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _showLargeTimer();
+      });
+    }
   }
 
   void _onEditorChanged() {
@@ -918,14 +1071,17 @@ class _EditorScreenState extends State<EditorScreen>
     final currentDocument = _editor.document;
     if (!identical(_thumbnailObservedDocument, currentDocument)) {
       _thumbnailObservedDocument = currentDocument;
-      final assetFingerprints = _thumbnailAssetFingerprints(currentDocument);
-      final thumbnailIdentity = Object.hashAll(
-        currentDocument.pages.map(
-          (page) => _pageThumbnailFingerprint(page, assetFingerprints),
-        ),
-      );
-      if (thumbnailIdentity != _lastThumbnailIdentity) {
-        _lastThumbnailIdentity = thumbnailIdentity;
+      final invalidation = _thumbnailInvalidation.synchronize(currentDocument);
+      if (!invalidation.isEmpty) {
+        _thumbnailGeneration++;
+        for (final pageId in invalidation.removedPageIds) {
+          final oldImage = _thumbnails.remove(pageId);
+          if (oldImage != null) _disposeThumbnailAfterFrame(oldImage);
+          _thumbnailIdentity.remove(pageId);
+          _thumbnailImageRevision++;
+        }
+      }
+      if (invalidation.dirtyPageIds.isNotEmpty) {
         _scheduleThumbnailRefresh();
       }
     }
@@ -971,9 +1127,7 @@ class _EditorScreenState extends State<EditorScreen>
   }
 
   void _startThumbnailRefresh() {
-    if (_editor.inkSessions.isWriting ||
-        (_participantMode == EditorParticipantMode.twoPeople &&
-            _secondaryEditor.inkSessions.isWriting)) {
+    if (_inkInputIsLatencySensitive) {
       _scheduleThumbnailRefresh();
       return;
     }
@@ -1012,30 +1166,101 @@ class _EditorScreenState extends State<EditorScreen>
   }
 
   Future<void> _refreshThumbnails() async {
-    final generation = ++_thumbnailGeneration;
+    final generation = _thumbnailGeneration;
     final document = _editor.document;
-    final keepIds = document.pages.map((page) => page.id).toSet();
-    for (final removed
-        in _thumbnails.keys.where((id) => !keepIds.contains(id)).toList()) {
-      final oldImage = _thumbnails.remove(removed);
-      if (oldImage != null) _disposeThumbnailAfterFrame(oldImage);
-      _thumbnailIdentity.remove(removed);
+    final pending = <({String pageId, int identity, ui.Image image})>[];
+
+    void discardPending() {
+      for (final entry in pending) {
+        entry.image.dispose();
+      }
+      pending.clear();
     }
-    final orderedPages = <BoardPage>[
-      document.currentPage,
-      ...document.pages.where((page) => page.id != document.currentPage.id),
-    ];
-    final assetFingerprints = _thumbnailAssetFingerprints(document);
-    for (final page in orderedPages) {
+
+    Future<void> publishPending() async {
+      if (pending.isEmpty) return;
+      if (!mounted ||
+          generation != _thumbnailGeneration ||
+          _pageSheetOpen ||
+          _inkInputIsLatencySensitive) {
+        discardPending();
+        return;
+      }
+      final staleImages = <ui.Image>[];
+      var changed = false;
+      for (final entry in pending) {
+        if (_thumbnailInvalidation.revisionFor(entry.pageId) !=
+            entry.identity) {
+          entry.image.dispose();
+          continue;
+        }
+        final oldImage = _thumbnails[entry.pageId];
+        _thumbnails[entry.pageId] = entry.image;
+        _thumbnailIdentity[entry.pageId] = entry.identity;
+        _thumbnailImageRevision++;
+        changed = true;
+        if (oldImage != null && !identical(oldImage, entry.image)) {
+          staleImages.add(oldImage);
+        }
+      }
+      pending.clear();
+      if (!changed || !mounted) {
+        for (final image in staleImages) {
+          image.dispose();
+        }
+        return;
+      }
+      // Publishing several previews in one frame avoids rebuilding both board
+      // surfaces and radial menus once per page during a 100-page recovery.
+      setState(() {});
+      await SchedulerBinding.instance.endOfFrame;
+      for (final image in staleImages) {
+        image.dispose();
+      }
+    }
+
+    final pageCount = document.pages.length;
+    final currentIndex = document.currentPageIndex;
+    for (var order = 0; order < pageCount; order++) {
+      final pageIndex = order == 0
+          ? currentIndex
+          : order <= currentIndex
+          ? order - 1
+          : order;
+      final page = document.pages[pageIndex];
+      if (_inkInputIsLatencySensitive) {
+        discardPending();
+        _scheduleThumbnailRefresh();
+        return;
+      }
       if (_pageSheetOpen) {
+        discardPending();
         _thumbnailRefreshQueued = true;
         return;
       }
-      final identity = _pageThumbnailFingerprint(page, assetFingerprints);
+      final identity = _thumbnailInvalidation.revisionFor(page.id);
+      if (identity == null) continue;
       if (_thumbnailIdentity[page.id] == identity) continue;
       ui.Image image;
       try {
-        image = await _thumbnailRenderer.render(page, _editor.assetResolver);
+        image = await _thumbnailRenderer.render(
+          page,
+          _editor.assetResolver,
+          shouldCancel: () =>
+              !mounted ||
+              generation != _thumbnailGeneration ||
+              _pageSheetOpen ||
+              _inkInputIsLatencySensitive,
+        );
+      } on PageThumbnailRenderCancelled {
+        discardPending();
+        if (!mounted) return;
+        if (_pageSheetOpen) {
+          _thumbnailRefreshQueued = true;
+        } else if (_inkInputIsLatencySensitive) {
+          _scheduleThumbnailRefresh();
+        }
+        return;
       } catch (error, stack) {
         FlutterError.reportError(
           FlutterErrorDetails(
@@ -1049,65 +1274,64 @@ class _EditorScreenState extends State<EditorScreen>
         );
         continue;
       }
-      if (!mounted || generation != _thumbnailGeneration || _pageSheetOpen) {
+      if (!mounted ||
+          generation != _thumbnailGeneration ||
+          _pageSheetOpen ||
+          _inkInputIsLatencySensitive ||
+          _thumbnailInvalidation.revisionFor(page.id) != identity) {
         image.dispose();
-        if (_pageSheetOpen) _thumbnailRefreshQueued = true;
+        discardPending();
+        if (_pageSheetOpen) {
+          _thumbnailRefreshQueued = true;
+        } else if (_inkInputIsLatencySensitive) {
+          _scheduleThumbnailRefresh();
+        }
         return;
       }
-      final oldImage = _thumbnails[page.id];
-      _thumbnails[page.id] = image;
-      if (oldImage != null && !identical(oldImage, image)) {
-        _disposeThumbnailAfterFrame(oldImage);
+      pending.add((pageId: page.id, identity: identity, image: image));
+      if (order == 0 || pending.length >= 8) {
+        await publishPending();
       }
-      _thumbnailIdentity[page.id] = identity;
-      setState(() {});
-      await SchedulerBinding.instance.endOfFrame;
     }
+    await publishPending();
   }
+
+  static const Duration _thumbnailInkQuietPeriod = Duration(milliseconds: 2200);
+
+  bool get _inkInputIsLatencySensitive =>
+      _editor.inkSessions.isWriting ||
+      _editor.inkSessions.wasActiveWithin(_thumbnailInkQuietPeriod) ||
+      (_participantMode == EditorParticipantMode.twoPeople &&
+          (_secondaryEditor.inkSessions.isWriting ||
+              _secondaryEditor.inkSessions.wasActiveWithin(
+                _thumbnailInkQuietPeriod,
+              )));
 
   void _disposeThumbnailAfterFrame(ui.Image image) {
     SchedulerBinding.instance.addPostFrameCallback((_) => image.dispose());
   }
 
-  static Map<String, int> _thumbnailAssetFingerprints(
-    WhiteboardDocument document,
-  ) => <String, int>{
-    for (final asset in document.assets)
-      asset.id: Object.hash(
-        identityHashCode(asset),
-        asset.relativePath,
-        asset.byteLength,
-        asset.sha256,
-      ),
-  };
-
-  static int _pageThumbnailFingerprint(
-    BoardPage page,
-    Map<String, int> assetFingerprints,
-  ) => Object.hash(
-    page.id,
-    page.name,
-    identityHashCode(page.strokes),
-    identityHashCode(page.objects),
-    identityHashCode(page.annotationLayers),
-    identityHashCode(page.template),
-    Object.hashAll(
-      page.objects.map(
-        (object) => switch (object) {
-          ImageObject(:final assetId) || PdfObject(:final assetId) =>
-            assetFingerprints[assetId] ?? assetId.hashCode,
-          _ => 0,
-        },
-      ),
-    ),
-  );
-
   Future<void> _leave() async {
+    if (_countdownTimer.isAlarmActive) {
+      // Back navigation must not silently dispose the controller and thereby
+      // stop an unacknowledged alarm. Bring its explicit confirmation back to
+      // the foreground instead.
+      _showLargeTimer();
+      return;
+    }
     if (_leaving) return;
     _leaving = true;
     try {
       await _editor.flush();
-      if (mounted) Navigator.of(context).pop(true);
+      if (!mounted) return;
+      if (_countdownTimer.isAlarmActive) {
+        // The timer may have expired while the asynchronous flush was in
+        // progress. Never dispose its repeating alarm without the explicit
+        // acknowledgement in the large panel.
+        _showLargeTimer();
+        return;
+      }
+      Navigator.of(context).pop(true);
     } catch (error) {
       if (mounted) {
         _showError(
@@ -1389,6 +1613,59 @@ class _EditorScreenState extends State<EditorScreen>
     final radial = source ?? _radial;
     radial.setOpen(true);
     radial.setBranch(RadialMenuBranch.pages);
+  }
+
+  Future<void> _confirmAndDeletePage(
+    EditorController targetEditor,
+    String pageId,
+  ) async {
+    if (_pageDeleteDialogOpen || !mounted) return;
+    var pageIndex = targetEditor.document.pageIndexById(pageId);
+    if (pageIndex == null) return;
+    if (targetEditor.document.pages.length <= 1) {
+      _showError('Die letzte verbleibende Seite kann nicht gelöscht werden.');
+      return;
+    }
+    final pageNumber = pageIndex + 1;
+    _pageDeleteDialogOpen = true;
+    bool? confirmed;
+    try {
+      confirmed = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: Text('Seite $pageNumber löschen?'),
+          content: const Text(
+            'Die Seite und ihr gesamter Inhalt werden entfernt. '
+            'Die Aktion kann anschließend rückgängig gemacht werden.',
+          ),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('Abbrechen'),
+            ),
+            FilledButton.tonalIcon(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              icon: const Icon(Icons.delete_outline_rounded),
+              label: const Text('Seite löschen'),
+            ),
+          ],
+        ),
+      );
+    } finally {
+      _pageDeleteDialogOpen = false;
+    }
+    if (confirmed != true || !mounted) return;
+
+    // A second participant may have added, removed or reordered pages while
+    // the confirmation was visible. Revalidate the stable id and the final
+    // page invariant immediately before executing the command.
+    pageIndex = targetEditor.document.pageIndexById(pageId);
+    if (pageIndex == null) return;
+    if (targetEditor.document.pages.length <= 1) {
+      _showError('Die letzte verbleibende Seite kann nicht gelöscht werden.');
+      return;
+    }
+    targetEditor.deletePage(pageId);
   }
 
   Future<void> _showPagesSheet() async {
@@ -2050,11 +2327,67 @@ class _EditorScreenState extends State<EditorScreen>
   };
 }
 
+class _ParticipantPenQuickControls extends StatelessWidget {
+  const _ParticipantPenQuickControls({
+    required this.controlId,
+    required this.participantLabel,
+    required this.controller,
+    required this.onColorChanged,
+    required this.onCustomColorRequested,
+    required this.onTypeChanged,
+  });
+
+  final String controlId;
+  final String? participantLabel;
+  final EditorController controller;
+  final void Function(EditorController editor, Color color) onColorChanged;
+  final ValueChanged<EditorController> onCustomColorRequested;
+  final void Function(EditorController editor, InkToolType type) onTypeChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final label = participantLabel;
+    return Semantics(
+      key: ValueKey('editor-pen-quick-controls-$controlId'),
+      container: true,
+      label: label == null ? 'Stifteinstellungen' : 'Stifteinstellungen $label',
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (label != null)
+            Padding(
+              padding: const EdgeInsets.only(left: 5, right: 1),
+              child: Text(
+                label,
+                style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                  color: FlowboardColors.mint,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+          EditorPenColorQuickButton(
+            controlId: controlId,
+            color: Color(controller.penStyle.colorArgb),
+            onColorSelected: (color) => onColorChanged(controller, color),
+            onCustomColorRequested: () => onCustomColorRequested(controller),
+          ),
+          EditorPenTypeQuickButton(
+            controlId: controlId,
+            type: controller.penStyle.type,
+            onTypeSelected: (type) => onTypeChanged(controller, type),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _EditorTopBar extends StatelessWidget {
   const _EditorTopBar({
     required this.width,
     required this.collapsed,
     required this.controller,
+    required this.secondaryController,
     required this.onBack,
     required this.onRename,
     required this.onPages,
@@ -2067,12 +2400,18 @@ class _EditorTopBar extends StatelessWidget {
     required this.onFingerDrawingChanged,
     required this.countdownTimer,
     required this.onShowLargeTimer,
+    required this.onPenColorChanged,
+    required this.onCustomPenColorRequested,
+    required this.onPenTypeChanged,
+    required this.onAddPage,
+    required this.onDeletePage,
     required this.onToggleCollapsed,
   });
 
   final double width;
   final bool collapsed;
   final EditorController controller;
+  final EditorController secondaryController;
   final Future<void> Function() onBack;
   final VoidCallback onRename;
   final VoidCallback? onPages;
@@ -2085,18 +2424,28 @@ class _EditorTopBar extends StatelessWidget {
   final ValueChanged<bool> onFingerDrawingChanged;
   final CountdownTimerController countdownTimer;
   final VoidCallback onShowLargeTimer;
+  final void Function(EditorController editor, Color color) onPenColorChanged;
+  final ValueChanged<EditorController> onCustomPenColorRequested;
+  final void Function(EditorController editor, InkToolType type)
+  onPenTypeChanged;
+  final ValueChanged<EditorController> onAddPage;
+  final Future<void> Function(EditorController, String) onDeletePage;
   final VoidCallback onToggleCollapsed;
 
   @override
   Widget build(BuildContext context) {
     final textScaler = MediaQuery.textScalerOf(context);
     final compactSystemText = textScaler.scale(14) <= 18;
-    final showResetLabel = width >= 1450 && compactSystemText;
-    final showAuxiliaryActions = width >= 760;
-    final showTitle = width >= 620;
+    final split = participantMode == EditorParticipantMode.twoPeople;
+    final showPageControls = compactSystemText && width >= (split ? 1040 : 820);
+    final showResetLabel = width >= 1800 && compactSystemText;
+    final showAuxiliaryActions =
+        width >= (split && showPageControls ? 2200 : 1180);
+    final showTitle = width >= (split ? 1500 : 900);
     final showInteractionControls = width >= 620;
-    final showHistoryActions = width >= 430;
-    final showPageCounter = width >= 820 && compactSystemText;
+    final showPenQuickActions = width >= (split ? 1280 : 720);
+    final showHistoryActions =
+        width >= (split && showPageControls ? 2200 : 1050);
     return AnimatedContainer(
       duration: const Duration(milliseconds: 190),
       curve: Curves.easeOutCubic,
@@ -2154,6 +2503,28 @@ class _EditorTopBar extends StatelessWidget {
                     const SizedBox(width: 12),
                   ] else
                     const SizedBox(width: 8),
+                  if (showPenQuickActions) ...[
+                    _ParticipantPenQuickControls(
+                      controlId: 'primary',
+                      participantLabel: split ? 'Links' : null,
+                      controller: controller,
+                      onColorChanged: onPenColorChanged,
+                      onCustomColorRequested: onCustomPenColorRequested,
+                      onTypeChanged: onPenTypeChanged,
+                    ),
+                    if (split) ...[
+                      const SizedBox(width: 4),
+                      _ParticipantPenQuickControls(
+                        controlId: 'secondary',
+                        participantLabel: 'Rechts',
+                        controller: secondaryController,
+                        onColorChanged: onPenColorChanged,
+                        onCustomColorRequested: onCustomPenColorRequested,
+                        onTypeChanged: onPenTypeChanged,
+                      ),
+                    ],
+                    const SizedBox(width: 2),
+                  ],
                   if (showInteractionControls) ...[
                     ParticipantModeToggle(
                       mode: participantMode,
@@ -2236,14 +2607,140 @@ class _EditorTopBar extends StatelessWidget {
                           case _EditorTopBarAction.toggleFingerDrawing:
                             onFingerDrawingChanged(!fingerDrawingEnabled);
                           case _EditorTopBarAction.timer:
-                            showCountdownTimerSetup(
-                              context,
-                              controller: countdownTimer,
-                              onShowLarge: onShowLargeTimer,
+                            if (countdownTimer.isAlarmActive) {
+                              onShowLargeTimer();
+                            } else {
+                              showCountdownTimerSetup(
+                                context,
+                                controller: countdownTimer,
+                                onShowLarge: onShowLargeTimer,
+                              );
+                            }
+                          case _EditorTopBarAction.penColor:
+                            onCustomPenColorRequested(controller);
+                          case _EditorTopBarAction.penNormal:
+                            onPenTypeChanged(controller, InkToolType.normal);
+                          case _EditorTopBarAction.penDashed:
+                            onPenTypeChanged(controller, InkToolType.dashed);
+                          case _EditorTopBarAction.penStraight:
+                            onPenTypeChanged(
+                              controller,
+                              InkToolType.straightLine,
+                            );
+                          case _EditorTopBarAction.secondaryPenColor:
+                            onCustomPenColorRequested(secondaryController);
+                          case _EditorTopBarAction.secondaryPenNormal:
+                            onPenTypeChanged(
+                              secondaryController,
+                              InkToolType.normal,
+                            );
+                          case _EditorTopBarAction.secondaryPenDashed:
+                            onPenTypeChanged(
+                              secondaryController,
+                              InkToolType.dashed,
+                            );
+                          case _EditorTopBarAction.secondaryPenStraight:
+                            onPenTypeChanged(
+                              secondaryController,
+                              InkToolType.straightLine,
+                            );
+                          case _EditorTopBarAction.previousPrimaryPage:
+                            controller.previousPage();
+                          case _EditorTopBarAction.nextPrimaryPage:
+                            controller.nextPage();
+                          case _EditorTopBarAction.addPrimaryPage:
+                            onAddPage(controller);
+                          case _EditorTopBarAction.deletePrimaryPage:
+                            unawaited(
+                              onDeletePage(controller, controller.page.id),
+                            );
+                          case _EditorTopBarAction.previousSecondaryPage:
+                            secondaryController.previousPage();
+                          case _EditorTopBarAction.nextSecondaryPage:
+                            secondaryController.nextPage();
+                          case _EditorTopBarAction.addSecondaryPage:
+                            onAddPage(secondaryController);
+                          case _EditorTopBarAction.deleteSecondaryPage:
+                            unawaited(
+                              onDeletePage(
+                                secondaryController,
+                                secondaryController.page.id,
+                              ),
                             );
                         }
                       },
                       itemBuilder: (_) => <PopupMenuEntry<_EditorTopBarAction>>[
+                        if (!showPenQuickActions) ...[
+                          if (split)
+                            const PopupMenuItem(
+                              enabled: false,
+                              child: Text('Stift links'),
+                            ),
+                          const PopupMenuItem(
+                            value: _EditorTopBarAction.penColor,
+                            child: ListTile(
+                              leading: Icon(Icons.palette_outlined),
+                              title: Text('Stiftfarbe'),
+                            ),
+                          ),
+                          const PopupMenuItem(
+                            value: _EditorTopBarAction.penNormal,
+                            child: ListTile(
+                              leading: Icon(Icons.edit_rounded),
+                              title: Text('Stift: Normal'),
+                            ),
+                          ),
+                          const PopupMenuItem(
+                            value: _EditorTopBarAction.penDashed,
+                            child: ListTile(
+                              leading: Icon(Icons.more_horiz_rounded),
+                              title: Text('Stift: Gestrichelt'),
+                            ),
+                          ),
+                          const PopupMenuItem(
+                            value: _EditorTopBarAction.penStraight,
+                            child: ListTile(
+                              leading: Icon(Icons.show_chart_rounded),
+                              title: Text('Stift: Gerade Linie'),
+                            ),
+                          ),
+                          if (split) ...[
+                            const PopupMenuDivider(),
+                            const PopupMenuItem(
+                              enabled: false,
+                              child: Text('Stift rechts'),
+                            ),
+                            const PopupMenuItem(
+                              value: _EditorTopBarAction.secondaryPenColor,
+                              child: ListTile(
+                                leading: Icon(Icons.palette_outlined),
+                                title: Text('Stiftfarbe'),
+                              ),
+                            ),
+                            const PopupMenuItem(
+                              value: _EditorTopBarAction.secondaryPenNormal,
+                              child: ListTile(
+                                leading: Icon(Icons.edit_rounded),
+                                title: Text('Stift: Normal'),
+                              ),
+                            ),
+                            const PopupMenuItem(
+                              value: _EditorTopBarAction.secondaryPenDashed,
+                              child: ListTile(
+                                leading: Icon(Icons.more_horiz_rounded),
+                                title: Text('Stift: Gestrichelt'),
+                              ),
+                            ),
+                            const PopupMenuItem(
+                              value: _EditorTopBarAction.secondaryPenStraight,
+                              child: ListTile(
+                                leading: Icon(Icons.show_chart_rounded),
+                                title: Text('Stift: Gerade Linie'),
+                              ),
+                            ),
+                          ],
+                          const PopupMenuDivider(),
+                        ],
                         if (!showInteractionControls) ...[
                           PopupMenuItem(
                             value: _EditorTopBarAction.toggleParticipantMode,
@@ -2282,14 +2779,24 @@ class _EditorTopBar extends StatelessWidget {
                             value: _EditorTopBarAction.timer,
                             child: ListTile(
                               leading: Icon(
-                                countdownTimer.isRunning
+                                countdownTimer.isAlarmActive
+                                    ? Icons.notifications_active_rounded
+                                    : countdownTimer.isRunning
                                     ? Icons.timer_rounded
                                     : Icons.timer_outlined,
+                                color: countdownTimer.isAlarmActive
+                                    ? FlowboardColors.warning
+                                    : null,
                               ),
-                              title: const Text('Timer'),
-                              subtitle:
-                                  countdownTimer.status ==
-                                      CountdownTimerStatus.idle
+                              title: Text(
+                                countdownTimer.isAlarmActive
+                                    ? 'Alarm bestätigen'
+                                    : 'Timer',
+                              ),
+                              subtitle: countdownTimer.isAlarmActive
+                                  ? const Text('Im großen Timerfenster')
+                                  : countdownTimer.status ==
+                                        CountdownTimerStatus.idle
                                   ? const Text('Zeit einstellen')
                                   : Text(
                                       formatCountdown(countdownTimer.remaining),
@@ -2344,19 +2851,131 @@ class _EditorTopBar extends StatelessWidget {
                             ),
                           ),
                         ],
+                        if (!showPageControls) ...[
+                          if (split)
+                            const PopupMenuItem(
+                              enabled: false,
+                              child: Text('Seitennavigation links'),
+                            ),
+                          PopupMenuItem(
+                            value: _EditorTopBarAction.previousPrimaryPage,
+                            enabled: controller.document.pages.length > 1,
+                            child: const ListTile(
+                              leading: Icon(Icons.chevron_left_rounded),
+                              title: Text('Vorherige Seite'),
+                            ),
+                          ),
+                          PopupMenuItem(
+                            value: _EditorTopBarAction.nextPrimaryPage,
+                            enabled: controller.document.pages.length > 1,
+                            child: const ListTile(
+                              leading: Icon(Icons.chevron_right_rounded),
+                              title: Text('Nächste Seite'),
+                            ),
+                          ),
+                          PopupMenuItem(
+                            value: _EditorTopBarAction.addPrimaryPage,
+                            enabled:
+                                controller.document.pages.length <
+                                WhiteboardDocument.maxPageCount,
+                            child: const ListTile(
+                              leading: Icon(Icons.note_add_outlined),
+                              title: Text('Neue Seite'),
+                            ),
+                          ),
+                          PopupMenuItem(
+                            value: _EditorTopBarAction.deletePrimaryPage,
+                            enabled: controller.document.pages.length > 1,
+                            child: const ListTile(
+                              leading: Icon(Icons.delete_outline_rounded),
+                              title: Text('Aktuelle Seite löschen'),
+                            ),
+                          ),
+                          if (split) ...[
+                            const PopupMenuItem(
+                              enabled: false,
+                              child: Text('Seitennavigation rechts'),
+                            ),
+                            PopupMenuItem(
+                              value: _EditorTopBarAction.previousSecondaryPage,
+                              enabled:
+                                  secondaryController.document.pages.length > 1,
+                              child: const ListTile(
+                                leading: Icon(Icons.chevron_left_rounded),
+                                title: Text('Vorherige Seite'),
+                              ),
+                            ),
+                            PopupMenuItem(
+                              value: _EditorTopBarAction.nextSecondaryPage,
+                              enabled:
+                                  secondaryController.document.pages.length > 1,
+                              child: const ListTile(
+                                leading: Icon(Icons.chevron_right_rounded),
+                                title: Text('Nächste Seite'),
+                              ),
+                            ),
+                            PopupMenuItem(
+                              value: _EditorTopBarAction.addSecondaryPage,
+                              enabled:
+                                  secondaryController.document.pages.length <
+                                  WhiteboardDocument.maxPageCount,
+                              child: const ListTile(
+                                leading: Icon(Icons.note_add_outlined),
+                                title: Text('Neue Seite'),
+                              ),
+                            ),
+                            PopupMenuItem(
+                              value: _EditorTopBarAction.deleteSecondaryPage,
+                              enabled:
+                                  secondaryController.document.pages.length > 1,
+                              child: const ListTile(
+                                leading: Icon(Icons.delete_outline_rounded),
+                                title: Text('Aktuelle Seite löschen'),
+                              ),
+                            ),
+                          ],
+                        ],
                       ],
                     ),
-                  if (showPageCounter)
-                    Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 12),
-                      child: Text(
-                        '${controller.document.currentPageIndex + 1} / ${controller.document.pages.length}',
-                        style: const TextStyle(
-                          color: FlowboardColors.textSecondary,
-                          fontWeight: FontWeight.w600,
-                        ),
+                  if (showPageControls) ...[
+                    const SizedBox(width: 6),
+                    EditorPageControls(
+                      controlId: 'primary',
+                      participantLabel: split ? 'Links' : null,
+                      currentPageIndex: controller.currentPageIndex,
+                      pageCount: controller.document.pages.length,
+                      canAdd:
+                          controller.document.pages.length <
+                          WhiteboardDocument.maxPageCount,
+                      onPrevious: controller.previousPage,
+                      onNext: controller.nextPage,
+                      onAdd: () => onAddPage(controller),
+                      onDelete: () => unawaited(
+                        onDeletePage(controller, controller.page.id),
                       ),
                     ),
+                    if (split) ...[
+                      const SizedBox(width: 6),
+                      EditorPageControls(
+                        controlId: 'secondary',
+                        participantLabel: 'Rechts',
+                        currentPageIndex: secondaryController.currentPageIndex,
+                        pageCount: secondaryController.document.pages.length,
+                        canAdd:
+                            secondaryController.document.pages.length <
+                            WhiteboardDocument.maxPageCount,
+                        onPrevious: secondaryController.previousPage,
+                        onNext: secondaryController.nextPage,
+                        onAdd: () => onAddPage(secondaryController),
+                        onDelete: () => unawaited(
+                          onDeletePage(
+                            secondaryController,
+                            secondaryController.page.id,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
                   if (showHistoryActions) ...[
                     IconButton(
                       tooltip: 'Undo',
@@ -2383,6 +3002,14 @@ class _EditorTopBar extends StatelessWidget {
 }
 
 enum _EditorTopBarAction {
+  penColor,
+  penNormal,
+  penDashed,
+  penStraight,
+  secondaryPenColor,
+  secondaryPenNormal,
+  secondaryPenDashed,
+  secondaryPenStraight,
   pages,
   saveTemplate,
   resetMenu,
@@ -2392,6 +3019,14 @@ enum _EditorTopBarAction {
   toggleParticipantMode,
   toggleFingerDrawing,
   timer,
+  previousPrimaryPage,
+  nextPrimaryPage,
+  addPrimaryPage,
+  deletePrimaryPage,
+  previousSecondaryPage,
+  nextSecondaryPage,
+  addSecondaryPage,
+  deleteSecondaryPage,
 }
 
 /// Owns the page tray's scroll controller for the complete route lifetime.

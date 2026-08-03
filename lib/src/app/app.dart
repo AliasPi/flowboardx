@@ -16,11 +16,15 @@ class FlowboardApp extends StatelessWidget {
   const FlowboardApp({
     required this.repository,
     this.smartBoardCompatibility,
+    this.clock,
+    this.androidWidgetBridge,
     super.key,
   });
 
   final DocumentRepository repository;
   final SmartBoardCompatibility? smartBoardCompatibility;
+  final DocumentLibraryClock? clock;
+  final AndroidWidgetBridge? androidWidgetBridge;
 
   @override
   Widget build(BuildContext context) {
@@ -31,6 +35,8 @@ class FlowboardApp extends StatelessWidget {
       home: FlowboardHome(
         repository: repository,
         smartBoardCompatibility: smartBoardCompatibility,
+        clock: clock,
+        androidWidgetBridge: androidWidgetBridge,
       ),
     );
   }
@@ -40,11 +46,15 @@ class FlowboardHome extends StatefulWidget {
   const FlowboardHome({
     required this.repository,
     this.smartBoardCompatibility,
+    this.clock,
+    this.androidWidgetBridge,
     super.key,
   });
 
   final DocumentRepository repository;
   final SmartBoardCompatibility? smartBoardCompatibility;
+  final DocumentLibraryClock? clock;
+  final AndroidWidgetBridge? androidWidgetBridge;
 
   @override
   State<FlowboardHome> createState() => _FlowboardHomeState();
@@ -61,11 +71,14 @@ class _FlowboardHomeState extends State<FlowboardHome>
   SmartBoardCompatibility get _smartBoardCompatibility =>
       widget.smartBoardCompatibility ?? SmartBoardCompatibilityBridge.instance;
 
+  AndroidWidgetBridge get _androidWidgetBridge =>
+      widget.androidWidgetBridge ?? AndroidWidgetBridge.instance;
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _widgetActions = AndroidWidgetBridge.instance.launchActions.listen(
+    _widgetActions = _androidWidgetBridge.launchActions.listen(
       (_) => unawaited(_drainWidgetActions()),
     );
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -101,6 +114,7 @@ class _FlowboardHomeState extends State<FlowboardHome>
       key: ValueKey(_libraryGeneration),
       repository: widget.repository,
       title: 'Flowboard X',
+      clock: widget.clock,
       onOpen: _openEditor,
       onDocumentsChanged: _syncAndroidWidget,
     );
@@ -129,8 +143,7 @@ class _FlowboardHomeState extends State<FlowboardHome>
     _drainingWidgetActions = true;
     try {
       while (mounted) {
-        final action = AndroidWidgetBridge.instance
-            .consumePendingLaunchAction();
+        final action = _androidWidgetBridge.consumePendingLaunchAction();
         if (action == null) break;
         await _handleWidgetAction(action);
       }
@@ -144,7 +157,10 @@ class _FlowboardHomeState extends State<FlowboardHome>
       WhiteboardDocument? document;
       switch (action.type) {
         case WidgetLaunchActionType.newWhiteboard:
-          document = WhiteboardDocument.create(id: const Uuid().v4());
+          document = WhiteboardDocument.create(
+            id: const Uuid().v4(),
+            now: widget.clock?.call(),
+          );
           await widget.repository.save(document);
         case WidgetLaunchActionType.openDocument:
           final id = action.documentId;
@@ -171,7 +187,7 @@ class _FlowboardHomeState extends State<FlowboardHome>
   Future<void> _syncAndroidWidget() async {
     try {
       final summaries = await widget.repository.list();
-      await AndroidWidgetBridge.instance.updateRecentDocuments(
+      await _androidWidgetBridge.updateRecentDocuments(
         summaries.map(
           (summary) => WidgetDocument(
             id: summary.id,

@@ -119,6 +119,37 @@ void main() {
     expect(openChanges, <bool>[true, false]);
   });
 
+  testWidgets('menu animation invalidates semantics only at visibility gates', (
+    tester,
+  ) async {
+    final controller = RadialMenuController();
+    addTearDown(controller.dispose);
+    await tester.pumpWidget(host(controller: controller));
+    final surface = find.byKey(const ValueKey<String>('radial-menu-surface'));
+
+    await tester.tapAt(tester.getCenter(surface));
+    await tester.pump(const Duration(milliseconds: 20));
+    final early =
+        tester.widget<CustomPaint>(surface).painter! as RadialMenuPainter;
+    await tester.pump(const Duration(milliseconds: 20));
+    final stillEarly =
+        tester.widget<CustomPaint>(surface).painter! as RadialMenuPainter;
+
+    expect(early.openProgress, lessThan(.72));
+    expect(stillEarly.openProgress, lessThan(.72));
+    expect(
+      stillEarly.shouldRebuildSemantics(early),
+      isFalse,
+      reason: 'Pure opacity/scale frames expose the same semantic controls.',
+    );
+
+    await tester.pump(const Duration(milliseconds: 180));
+    final visible =
+        tester.widget<CustomPaint>(surface).painter! as RadialMenuPainter;
+    expect(visible.openProgress, greaterThanOrEqualTo(.72));
+    expect(visible.shouldRebuildSemantics(stillEarly), isTrue);
+  });
+
   testWidgets('pen opens rings two and three and updates real settings', (
     tester,
   ) async {
@@ -174,6 +205,60 @@ void main() {
     expect(controller.penSettings.type, RadialPenType.straight);
     expect(changes, hasLength(2));
   });
+
+  testWidgets(
+    'eraser uses automatic size and removes the ink thickness slider',
+    (tester) async {
+      final controller = RadialMenuController(isOpen: true);
+      addTearDown(controller.dispose);
+      final changes = <RadialPenSettings>[];
+      await tester.pumpWidget(
+        host(
+          controller: controller,
+          callbacks: RadialMenuCallbacks(onPenSettingsChanged: changes.add),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final pen = segmentGlobalPoint(
+        tester,
+        index: RadialMenuAction.pen.index,
+        count: RadialMenuAction.values.length,
+        radius: 125,
+        startAngle: -math.pi / RadialMenuAction.values.length,
+      );
+      await tester.tapAt(pen);
+      await tester.pumpAndSettle();
+
+      const geometry = RadialMenuGeometry(Size.square(600));
+      final eraser = segmentGlobalPoint(
+        tester,
+        index: RadialPenType.eraser.index,
+        count: RadialPenType.values.length,
+        radius: 256,
+        startAngle: geometry.penTypesStartAngle,
+        span: geometry.penTypesSpan,
+      );
+      await tester.tapAt(eraser);
+      await tester.pumpAndSettle();
+
+      final surface = find.byKey(const ValueKey<String>('radial-menu-surface'));
+      final size = tester.getSize(surface);
+      final painter =
+          tester.widget<CustomPaint>(surface).painter! as RadialMenuPainter;
+      expect(controller.penSettings.type, RadialPenType.eraser);
+      expect(controller.penSettings.thickness, 8);
+      expect(painter.hasThicknessSlider, isFalse);
+      expect(
+        painter
+            .semanticsBuilder(size)
+            .map((entry) => entry.properties.label)
+            .whereType<String>(),
+        contains('Radiergummi, automatische Größe'),
+      );
+      expect(changes.last.type, RadialPenType.eraser);
+    },
+  );
 
   testWidgets(
     'pen colors and types are single panels with independent inner targets',
@@ -307,14 +392,21 @@ void main() {
     final before = tester.getCenter(surface);
 
     final gesture = await tester.startGesture(before);
-    await gesture.moveBy(const Offset(60, 10));
+    for (var index = 0; index < 24; index++) {
+      await gesture.moveBy(const Offset(2.5, 10 / 24));
+    }
+    expect(
+      positions,
+      isEmpty,
+      reason: 'Intermediate drag packets must not start persistence timers.',
+    );
     await gesture.up();
     await tester.pumpAndSettle();
 
     final after = tester.getCenter(surface);
     expect(after.dx, closeTo(before.dx + 60, 1));
     expect(after.dy, closeTo(before.dy + 10, 1));
-    expect(positions, isNotEmpty);
+    expect(positions, hasLength(1));
     expect(positions.last, closeToOffset(after));
   });
 
@@ -558,6 +650,53 @@ void main() {
     expect(selected, contains(3));
   });
 
+  testWidgets('long press on a page preview requests its confirmed deletion', (
+    tester,
+  ) async {
+    final controller = RadialMenuController(
+      isOpen: true,
+      activeBranch: RadialMenuBranch.pages,
+    );
+    addTearDown(controller.dispose);
+    const pages = <RadialPagePreview>[
+      RadialPagePreview(pageId: 'page-1', pageIndex: 0, pageNumber: 1),
+      RadialPagePreview(pageId: 'page-2', pageIndex: 1, pageNumber: 2),
+      RadialPagePreview(pageId: 'page-3', pageIndex: 2, pageNumber: 3),
+    ];
+    final selected = <int>[];
+    final deleteRequests = <RadialPagePreview>[];
+    await tester.pumpWidget(
+      host(
+        controller: controller,
+        pages: pages,
+        callbacks: RadialMenuCallbacks(
+          onPageSelected: selected.add,
+          onPageDeleteRequested: deleteRequests.add,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final firstPreview = segmentGlobalPoint(
+      tester,
+      index: 0,
+      count: pages.length,
+      radius: 192,
+      startAngle: -math.pi / pages.length,
+    );
+    await tester.longPressAt(firstPreview);
+    await tester.pump();
+
+    expect(deleteRequests, hasLength(1));
+    expect(deleteRequests.single.pageId, pages.first.pageId);
+    expect(deleteRequests.single.pageIndex, pages.first.pageIndex);
+    expect(
+      selected,
+      isEmpty,
+      reason: 'a delete long press must not also navigate to the page',
+    );
+  });
+
   testWidgets('page click-wheel stays continuous across twelve o clock', (
     tester,
   ) async {
@@ -757,6 +896,357 @@ void main() {
       expect(gestureChanges, <bool>[true, false]);
       expect(primaryActions, isEmpty);
       expect(backgroundTaps, 0);
+    },
+  );
+
+  testWidgets(
+    'four-finger wheel previews a cyclic page and commits only on release',
+    (tester) async {
+      final firstThumbnail = await createThumbnail(Colors.red);
+      final lastThumbnail = await createThumbnail(Colors.blue);
+      addTearDown(firstThumbnail.dispose);
+      addTearDown(lastThumbnail.dispose);
+      final controller = RadialMenuController();
+      addTearDown(controller.dispose);
+      final selected = <int>[];
+      final gestureChanges = <bool>[];
+      await tester.pumpWidget(
+        host(
+          controller: controller,
+          currentPageIndex: 3,
+          pages: <RadialPagePreview>[
+            RadialPagePreview(
+              pageIndex: 0,
+              pageNumber: 1,
+              thumbnail: firstThumbnail,
+            ),
+            const RadialPagePreview(pageIndex: 1, pageNumber: 2),
+            const RadialPagePreview(pageIndex: 2, pageNumber: 3),
+            RadialPagePreview(
+              pageIndex: 3,
+              pageNumber: 4,
+              thumbnail: lastThumbnail,
+            ),
+          ],
+          callbacks: RadialMenuCallbacks(
+            onPageSelected: selected.add,
+            onFiveFingerPageGestureChanged: gestureChanges.add,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final surface = find.byKey(const ValueKey<String>('radial-menu-surface'));
+      final topLeft = tester.getTopLeft(surface);
+      final geometry = RadialMenuGeometry(tester.getSize(surface));
+      Offset point(int index, double rotation) =>
+          topLeft +
+          geometry.polarPoint(
+            125 * geometry.scale,
+            .08 + index * math.pi * 2 / 4 + rotation,
+          );
+      final gestures = <TestGesture>[];
+      for (var index = 0; index < 4; index++) {
+        final gesture = await tester.createGesture(pointer: 401 + index);
+        gestures.add(gesture);
+        await gesture.down(point(index, 0));
+      }
+      await tester.pump();
+
+      expect(controller.isOpen, isFalse);
+      expect(gestureChanges, <bool>[true]);
+      expect(
+        find.byKey(const ValueKey<String>('five-finger-page-preview-3')),
+        findsOneWidget,
+      );
+      expect(selected, isEmpty);
+
+      for (var index = 0; index < gestures.length; index++) {
+        await gestures[index].moveTo(point(index, .24));
+      }
+      await tester.pumpAndSettle();
+
+      expect(selected, isEmpty, reason: 'page selection is still provisional');
+      expect(
+        find.byKey(const ValueKey<String>('five-finger-page-preview-0')),
+        findsOneWidget,
+      );
+      expect(
+        tester
+            .widget<RawImage>(
+              find.byKey(const ValueKey<String>('five-finger-page-thumbnail')),
+            )
+            .image,
+        same(firstThumbnail),
+      );
+
+      await gestures.first.up();
+      await tester.pumpAndSettle();
+      expect(selected, <int>[0], reason: 'last page must loop to first');
+      expect(
+        find.byKey(const ValueKey<String>('five-finger-page-preview-0')),
+        findsNothing,
+      );
+      for (final gesture in gestures.skip(1)) {
+        await gesture.up();
+      }
+      await tester.pump();
+      expect(gestureChanges, <bool>[true, false]);
+    },
+  );
+
+  testWidgets(
+    'a released five-contact session cannot reclaim with its remaining fingers',
+    (tester) async {
+      final controller = RadialMenuController();
+      addTearDown(controller.dispose);
+      final selected = <int>[];
+      final gestureChanges = <bool>[];
+      await tester.pumpWidget(
+        host(
+          controller: controller,
+          pages: const <RadialPagePreview>[
+            RadialPagePreview(pageIndex: 0, pageNumber: 1),
+            RadialPagePreview(pageIndex: 1, pageNumber: 2),
+            RadialPagePreview(pageIndex: 2, pageNumber: 3),
+          ],
+          callbacks: RadialMenuCallbacks(
+            onPageSelected: selected.add,
+            onFiveFingerPageGestureChanged: gestureChanges.add,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final surface = find.byKey(const ValueKey<String>('radial-menu-surface'));
+      final topLeft = tester.getTopLeft(surface);
+      final geometry = RadialMenuGeometry(tester.getSize(surface));
+      const initialAngles = <double>[0, .15, .30, .45, 1.75];
+      Offset point(int index, double rotation) =>
+          topLeft +
+          geometry.polarPoint(
+            125 * geometry.scale,
+            initialAngles[index] + rotation,
+          );
+      final gestures = <TestGesture>[];
+      for (var index = 0; index < initialAngles.length; index++) {
+        final gesture = await tester.createGesture(pointer: 451 + index);
+        gestures.add(gesture);
+        await gesture.down(point(index, 0));
+        if (index == 3) {
+          expect(
+            gestureChanges,
+            isEmpty,
+            reason: 'the deliberately clustered first four cannot claim',
+          );
+        }
+      }
+      expect(gestureChanges, <bool>[true]);
+
+      for (var index = 0; index < gestures.length; index++) {
+        await gestures[index].moveTo(point(index, .24));
+      }
+      await tester.pump();
+      expect(selected, isEmpty);
+
+      await gestures.first.up();
+      await tester.pump();
+      expect(selected, <int>[1]);
+      expect(gestureChanges, <bool>[true]);
+
+      // Pointer-up completes the claimed physical session. The remaining
+      // four contacts are still suppressed until lift and must not be able to
+      // claim a second page gesture merely because one of them moves.
+      await gestures[1].moveTo(point(1, .28));
+      await tester.pump();
+      expect(gestureChanges, <bool>[true]);
+      expect(selected, <int>[1]);
+
+      for (final gesture in gestures.skip(1)) {
+        await gesture.up();
+      }
+      await tester.pump();
+      expect(gestureChanges, <bool>[true, false]);
+      expect(selected, <int>[1]);
+    },
+  );
+
+  testWidgets(
+    'confined participant menus claim touches only inside their own region',
+    (tester) async {
+      final leftController = RadialMenuController();
+      final rightController = RadialMenuController();
+      addTearDown(leftController.dispose);
+      addTearDown(rightController.dispose);
+      final leftSelected = <int>[];
+      final rightSelected = <int>[];
+      final leftGestureChanges = <bool>[];
+      final rightGestureChanges = <bool>[];
+      const pages = <RadialPagePreview>[
+        RadialPagePreview(pageIndex: 0, pageNumber: 1),
+        RadialPagePreview(pageIndex: 1, pageNumber: 2),
+        RadialPagePreview(pageIndex: 2, pageNumber: 3),
+      ];
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SizedBox(
+              width: 800,
+              height: 600,
+              child: Row(
+                children: <Widget>[
+                  SizedBox(
+                    width: 400,
+                    height: 600,
+                    child: RadialMenu(
+                      controller: leftController,
+                      initialPosition: const Offset(400, 300),
+                      edgePadding: 0,
+                      confineToBounds: true,
+                      pagePreviews: pages,
+                      callbacks: RadialMenuCallbacks(
+                        onPageSelected: leftSelected.add,
+                        onFiveFingerPageGestureChanged: leftGestureChanges.add,
+                      ),
+                    ),
+                  ),
+                  SizedBox(
+                    width: 400,
+                    height: 600,
+                    child: RadialMenu(
+                      controller: rightController,
+                      initialPosition: const Offset(0, 300),
+                      edgePadding: 0,
+                      confineToBounds: true,
+                      pagePreviews: pages,
+                      callbacks: RadialMenuCallbacks(
+                        onPageSelected: rightSelected.add,
+                        onFiveFingerPageGestureChanged: rightGestureChanges.add,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final surfaces = find.byKey(
+        const ValueKey<String>('radial-menu-surface'),
+      );
+      expect(surfaces, findsNWidgets(2));
+      final leftSurface = surfaces.at(0);
+      final topLeft = tester.getTopLeft(leftSurface);
+      final geometry = RadialMenuGeometry(tester.getSize(leftSurface));
+      const initialAngles = <double>[
+        math.pi,
+        math.pi * 4 / 3,
+        math.pi * 5 / 3,
+        math.pi * 2,
+      ];
+      Offset point(int index, double rotation) =>
+          topLeft +
+          geometry.polarPoint(
+            120 * geometry.scale,
+            initialAngles[index] + rotation,
+          );
+      final gestures = <TestGesture>[];
+      for (var index = 0; index < initialAngles.length; index++) {
+        final gesture = await tester.createGesture(pointer: 471 + index);
+        gestures.add(gesture);
+        await gesture.down(point(index, 0));
+      }
+
+      expect(leftGestureChanges, <bool>[true]);
+      expect(
+        rightGestureChanges,
+        isEmpty,
+        reason: 'the right global route must reject left-half contacts',
+      );
+      for (var index = 0; index < gestures.length; index++) {
+        await gestures[index].moveTo(point(index, .24));
+      }
+      expect(leftSelected, isEmpty);
+      expect(rightSelected, isEmpty);
+
+      await gestures.first.up();
+      await tester.pump();
+      expect(leftSelected, <int>[1]);
+      expect(rightSelected, isEmpty);
+      for (final gesture in gestures.skip(1)) {
+        await gesture.up();
+      }
+      await tester.pump();
+      expect(leftGestureChanges, <bool>[true, false]);
+      expect(rightGestureChanges, isEmpty);
+    },
+  );
+
+  testWidgets(
+    'an unclaimed participant pointer cannot cross the divider to form a gesture',
+    (tester) async {
+      final controller = RadialMenuController();
+      addTearDown(controller.dispose);
+      final gestureChanges = <bool>[];
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SizedBox(
+              width: 800,
+              height: 600,
+              child: Row(
+                children: <Widget>[
+                  SizedBox(
+                    width: 400,
+                    height: 600,
+                    child: RadialMenu(
+                      controller: controller,
+                      initialPosition: const Offset(400, 300),
+                      edgePadding: 0,
+                      confineToBounds: true,
+                      pagePreviews: const <RadialPagePreview>[
+                        RadialPagePreview(pageIndex: 0, pageNumber: 1),
+                        RadialPagePreview(pageIndex: 1, pageNumber: 2),
+                      ],
+                      callbacks: RadialMenuCallbacks(
+                        onFiveFingerPageGestureChanged: gestureChanges.add,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 400, height: 600),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final surface = find.byKey(const ValueKey<String>('radial-menu-surface'));
+      final topLeft = tester.getTopLeft(surface);
+      final geometry = RadialMenuGeometry(tester.getSize(surface));
+      Offset point(double angle) =>
+          topLeft + geometry.polarPoint(120 * geometry.scale, angle);
+      final gestures = <TestGesture>[];
+      for (var index = 0; index < 4; index++) {
+        final gesture = await tester.createGesture(pointer: 491 + index);
+        gestures.add(gesture);
+        await gesture.down(point(math.pi + index * .05));
+      }
+      expect(gestureChanges, isEmpty);
+
+      // This point remains in the radial annulus, but lies across x=400 in
+      // the other participant's half. It must be dropped before the relaxed
+      // four-contact coverage check can claim the session.
+      await gestures.last.moveTo(point(math.pi / 2));
+      await tester.pump();
+      expect(gestureChanges, isEmpty);
+
+      for (final gesture in gestures) {
+        await gesture.up();
+      }
     },
   );
 

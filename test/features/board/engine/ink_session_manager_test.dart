@@ -6,6 +6,72 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  testWidgets('coalesces accepted MOVE notifications to one per frame', (
+    tester,
+  ) async {
+    final manager = InkSessionManager();
+    addTearDown(manager.dispose);
+    var notifications = 0;
+    manager.addListener(() => notifications++);
+
+    expect(
+      manager.begin(
+        event: const PointerDownEvent(pointer: 90, position: Offset.zero),
+        worldPosition: Offset.zero,
+        style: const ActivePenStyle(),
+        authorId: 'frame-coalescing',
+      ),
+      isTrue,
+    );
+    expect(notifications, 1, reason: 'DOWN remains synchronous.');
+
+    _appendHorizontalLine(manager, pointer: 90, from: 1, through: 200);
+    expect(
+      notifications,
+      1,
+      reason: 'MOVE packets wait for the next paintable frame.',
+    );
+    await tester.pump();
+    expect(notifications, 2);
+
+    _appendHorizontalLine(manager, pointer: 90, from: 201, through: 400);
+    manager.end(
+      const PointerUpEvent(pointer: 90, position: Offset(800, 0)),
+      const Offset(800, 0),
+      samplingPosition: const Offset(800, 0),
+    );
+    expect(
+      notifications,
+      3,
+      reason: 'UP supersedes the queued MOVE and remains synchronous.',
+    );
+    await tester.pump();
+    expect(notifications, 3, reason: 'No stale frame callback may survive UP.');
+  });
+
+  test('tracks a short quiet period after the stylus is lifted', () async {
+    final manager = InkSessionManager();
+    addTearDown(manager.dispose);
+    expect(manager.wasActiveWithin(const Duration(seconds: 1)), isFalse);
+
+    expect(
+      manager.begin(
+        event: const PointerDownEvent(pointer: 91, position: Offset.zero),
+        worldPosition: Offset.zero,
+        style: const ActivePenStyle(),
+        authorId: 'quiet-period',
+      ),
+      isTrue,
+    );
+    manager.end(
+      const PointerUpEvent(pointer: 91, position: Offset(1, 1)),
+      const Offset(1, 1),
+    );
+
+    expect(manager.isWriting, isFalse);
+    expect(manager.wasActiveWithin(const Duration(seconds: 1)), isTrue);
+  });
+
   test('tracks stylus sessions independently from other active pointers', () {
     final manager = InkSessionManager();
     addTearDown(manager.dispose);
@@ -100,7 +166,7 @@ void main() {
     _expectBoundedChunks(
       previews,
       sampledPointCount: sampledPointCount,
-      maximumPointsPerChunk: 192,
+      maximumPointsPerChunk: InkSessionManager.markerActivePreviewPointLimit,
     );
   });
 
@@ -126,8 +192,81 @@ void main() {
     _expectBoundedChunks(
       previews,
       sampledPointCount: sampledPointCount,
-      maximumPointsPerChunk: 192,
+      maximumPointsPerChunk: InkSessionManager.normalActivePreviewPointLimit,
     );
+  });
+
+  test('keeps long circular repaint batches bounded and identity-stable', () {
+    final manager = InkSessionManager();
+    addTearDown(manager.dispose);
+    manager.begin(
+      event: const PointerDownEvent(pointer: 18, position: Offset.zero),
+      worldPosition: Offset.zero,
+      style: const ActivePenStyle(type: InkToolType.normal, width: 8),
+      authorId: 'bounded-batches',
+    );
+    _appendSpiral(manager, pointer: 18, from: 1, through: 18000);
+
+    final frozenSegments = manager.buildFrozenPreviewStrokes();
+    final before = manager.buildFrozenPreviewBatches();
+    expect(frozenSegments.length, greaterThan(20));
+    expect(
+      before.length,
+      (frozenSegments.length / InkSessionManager.maxFrozenPreviewBatchSegments)
+          .ceil(),
+      reason: 'A circular stroke should pack several chunks into each layer.',
+    );
+    _expectBoundedBatches(before, frozenSegments);
+
+    final unchangedSnapshot = manager.buildFrozenPreviewBatches();
+    _movePendingEndpointNearAnchor(manager, pointer: 18);
+    expect(
+      identical(manager.buildFrozenPreviewBatches(), unchangedSnapshot),
+      isTrue,
+      reason: 'An ordinary MOVE must not rebuild any frozen batch list.',
+    );
+
+    final sealedBefore = before.take(before.length - 1).toList();
+    final frozenCount = frozenSegments.length;
+    var nextPoint = 18001;
+    while (manager.buildFrozenPreviewStrokes().length == frozenCount) {
+      _appendSpiral(manager, pointer: 18, from: nextPoint, through: nextPoint);
+      nextPoint++;
+      expect(nextPoint, lessThan(19000));
+    }
+    final after = manager.buildFrozenPreviewBatches();
+    for (var index = 0; index < sealedBefore.length; index++) {
+      expect(
+        identical(after[index], sealedBefore[index]),
+        isTrue,
+        reason: 'Sealed batch $index must retain its cache identity.',
+      );
+    }
+    _expectBoundedBatches(after, manager.buildFrozenPreviewStrokes());
+  });
+
+  test('preserves every horizontal chunk in its batch bounds', () {
+    final manager = InkSessionManager();
+    addTearDown(manager.dispose);
+    manager.begin(
+      event: const PointerDownEvent(pointer: 19, position: Offset.zero),
+      worldPosition: Offset.zero,
+      style: const ActivePenStyle(type: InkToolType.normal, width: 8),
+      authorId: 'horizontal-bounds',
+    );
+    _appendHorizontalLine(manager, pointer: 19, from: 1, through: 2400);
+
+    final frozen = manager.buildFrozenPreviewStrokes();
+    final batches = manager.buildFrozenPreviewBatches();
+    expect(frozen, isNotEmpty);
+    expect(batches, isNotEmpty);
+    expect(batches.first.worldBounds.left, frozen.first.bounds.left);
+    expect(
+      batches.first.worldBounds.right,
+      batches.first.strokes.last.bounds.right,
+    );
+    expect(batches.first.worldBounds.height, greaterThanOrEqualTo(0));
+    _expectBoundedBatches(batches, frozen);
   });
 
   test('retains frozen chunk identity while only the live tail changes', () {
@@ -160,8 +299,41 @@ void main() {
     _expectBoundedChunks(
       after,
       sampledPointCount: manager.sessions[9]!.sampler.samples.length,
-      maximumPointsPerChunk: 192,
+      maximumPointsPerChunk: InkSessionManager.normalActivePreviewPointLimit,
     );
+  });
+
+  test('reuses stable active InkPoints while only the endpoint moves', () {
+    final manager = InkSessionManager();
+    addTearDown(manager.dispose);
+    manager.begin(
+      event: const PointerDownEvent(pointer: 29, position: Offset.zero),
+      worldPosition: Offset.zero,
+      style: const ActivePenStyle(type: InkToolType.normal),
+      authorId: 'active-point-cache',
+    );
+    _appendLine(manager, pointer: 29, from: 1, through: 24);
+
+    final before = manager.buildActivePreviewStrokes().single;
+    expect(before.points.length, greaterThan(2));
+    expect(
+      identical(manager.buildActivePreviewStrokes().single, before),
+      isTrue,
+      reason: 'A parent rebuild without new input must reuse the snapshot.',
+    );
+
+    _movePendingEndpointNearAnchor(manager, pointer: 29);
+    final after = manager.buildActivePreviewStrokes().single;
+    expect(after.points, hasLength(before.points.length));
+    expect(identical(after, before), isFalse);
+    for (var index = 0; index < before.points.length - 1; index++) {
+      expect(
+        identical(after.points[index], before.points[index]),
+        isTrue,
+        reason: 'Stable point $index was allocated again.',
+      );
+    }
+    expect(identical(after.points.last, before.points.last), isFalse);
   });
 
   test('keeps simultaneous dashed previews finite and pointer-isolated', () {
@@ -242,12 +414,10 @@ void main() {
     }
 
     final previews = manager.buildPreviewStrokes();
-
-    expect(previews, hasLength(3));
-    expect(
-      previews.fold<int>(0, (total, stroke) => total + stroke.points.length),
-      // Adjacent immutable chunks intentionally share one endpoint.
-      1203,
+    _expectBoundedChunks(
+      previews,
+      sampledPointCount: manager.sessions[17]!.sampler.samples.length,
+      maximumPointsPerChunk: InkSessionManager.dashedActivePreviewPointLimit,
     );
   });
 }
@@ -286,6 +456,22 @@ void _appendLine(
   }
 }
 
+void _appendHorizontalLine(
+  InkSessionManager manager, {
+  required int pointer,
+  required int from,
+  required int through,
+}) {
+  for (var index = from; index <= through; index++) {
+    final point = Offset(index * 2, 0);
+    manager.update(
+      PointerMoveEvent(pointer: pointer, position: point),
+      point,
+      samplingPosition: point,
+    );
+  }
+}
+
 void _expectBoundedChunks(
   List<InkStroke> previews, {
   required int sampledPointCount,
@@ -304,5 +490,46 @@ void _expectBoundedChunks(
     previews.fold<int>(0, (total, stroke) => total + stroke.points.length),
     sampledPointCount + previews.length - 1,
     reason: 'Adjacent chunks share exactly one seam endpoint.',
+  );
+}
+
+void _expectBoundedBatches(
+  List<FrozenInkPreviewBatch> batches,
+  List<InkStroke> frozenSegments,
+) {
+  expect(batches, isNotEmpty);
+  expect(
+    batches.every(
+      (batch) =>
+          batch.strokes.isNotEmpty &&
+          batch.strokes.length <=
+              InkSessionManager.maxFrozenPreviewBatchSegments &&
+          batch.pointCount <= InkSessionManager.maxFrozenPreviewBatchPoints &&
+          batch.pointCount ==
+              batch.strokes.fold<int>(
+                0,
+                (total, stroke) => total + stroke.points.length,
+              ),
+    ),
+    isTrue,
+  );
+  final flattened = batches.expand((batch) => batch.strokes).toList();
+  expect(flattened.length, frozenSegments.length);
+  for (var index = 0; index < frozenSegments.length; index++) {
+    expect(identical(flattened[index], frozenSegments[index]), isTrue);
+  }
+}
+
+void _movePendingEndpointNearAnchor(
+  InkSessionManager manager, {
+  required int pointer,
+}) {
+  final samples = manager.sessions[pointer]!.sampler.samples;
+  final anchor = samples[samples.length - 2].position;
+  final next = anchor + const Offset(.1, 0);
+  manager.update(
+    PointerMoveEvent(pointer: pointer, position: next),
+    next,
+    samplingPosition: next,
   );
 }

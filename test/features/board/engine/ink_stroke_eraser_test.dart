@@ -167,4 +167,25 @@ void main() {
     expect(second.fragments.first.points.last.x, closeTo(65, 1e-7));
     expect(second.fragments.last.points.first.x, closeTo(75, 1e-7));
   });
+
+  test('horizontal partition clips the destructive half of the capsule', () {
+    final stroke = InkStroke(
+      id: 'cross-divider',
+      points: const <InkPoint>[InkPoint(x: 900, y: 0), InkPoint(x: 1020, y: 0)],
+    );
+
+    final result = InkStrokeEraser.eraseCapsule(
+      stroke: stroke,
+      eraserStart: const Vec2(950, 0),
+      eraserEnd: const Vec2(970, 0),
+      radius: 80,
+      eraseMaximumX: 960,
+      idFactory: fragmentId,
+    );
+
+    expect(result.changed, isTrue);
+    expect(result.fragments, hasLength(1));
+    expect(result.fragments.single.points.first.x, closeTo(960, 1e-7));
+    expect(result.fragments.single.points.last.x, 1020);
+  });
 }

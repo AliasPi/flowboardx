@@ -3,30 +3,40 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  PointerDownEvent down(int pointer, Offset position, int milliseconds) =>
-      PointerDownEvent(
-        pointer: pointer,
-        device: pointer,
-        kind: PointerDeviceKind.touch,
-        position: position,
-        timeStamp: Duration(milliseconds: milliseconds),
-        radiusMajor: 7,
-        radiusMinor: 5,
-        size: .1,
-      );
+  PointerDownEvent down(
+    int pointer,
+    Offset position,
+    int milliseconds, {
+    double radiusMajor = 7,
+    double radiusMinor = 5,
+  }) => PointerDownEvent(
+    pointer: pointer,
+    device: pointer,
+    kind: PointerDeviceKind.touch,
+    position: position,
+    timeStamp: Duration(milliseconds: milliseconds),
+    radiusMajor: radiusMajor,
+    radiusMinor: radiusMinor,
+    size: .1,
+  );
 
-  PointerMoveEvent move(int pointer, Offset position, int milliseconds) =>
-      PointerMoveEvent(
-        pointer: pointer,
-        device: pointer,
-        kind: PointerDeviceKind.touch,
-        position: position,
-        timeStamp: Duration(milliseconds: milliseconds),
-        buttons: kPrimaryButton,
-        radiusMajor: 7,
-        radiusMinor: 5,
-        size: .1,
-      );
+  PointerMoveEvent move(
+    int pointer,
+    Offset position,
+    int milliseconds, {
+    double radiusMajor = 7,
+    double radiusMinor = 5,
+  }) => PointerMoveEvent(
+    pointer: pointer,
+    device: pointer,
+    kind: PointerDeviceKind.touch,
+    position: position,
+    timeStamp: Duration(milliseconds: milliseconds),
+    buttons: kPrimaryButton,
+    radiusMajor: radiusMajor,
+    radiusMinor: radiusMinor,
+    size: .1,
+  );
 
   test('two close fingers never become a clustered eraser', () {
     final tracker = ClusteredTouchEraserTracker();
@@ -71,7 +81,51 @@ void main() {
 
     expect(match, isNotNull);
     expect(match!.positions.keys, unorderedEquals(<int>[1, 2, 3]));
-    expect(match.brushRadius, inInclusiveRange(24, 44));
+    expect(match.center.dx, closeTo(240, 1e-9));
+    expect(match.center.dy, closeTo(209.33333333333334, 1e-9));
+    expect(match.brushRadius, inInclusiveRange(44, 60));
+  });
+
+  test('larger current cluster envelope produces a broader fist brush', () {
+    final compactTracker = ClusteredTouchEraserTracker();
+    compactTracker
+      ..add(down(1, const Offset(200, 200), 0), const Offset(200, 200))
+      ..add(down(2, const Offset(228, 212), 14), const Offset(228, 212))
+      ..add(down(3, const Offset(252, 196), 27), const Offset(252, 196));
+    compactTracker.update(
+      move(1, const Offset(220, 210), 50),
+      const Offset(220, 210),
+    );
+    final compact = compactTracker.update(
+      move(2, const Offset(248, 222), 58),
+      const Offset(248, 222),
+    )!;
+
+    final broadTracker = ClusteredTouchEraserTracker();
+    broadTracker
+      ..add(
+        down(11, const Offset(200, 200), 0, radiusMajor: 20, radiusMinor: 14),
+        const Offset(200, 200),
+      )
+      ..add(
+        down(12, const Offset(250, 210), 14, radiusMajor: 20, radiusMinor: 14),
+        const Offset(250, 210),
+      )
+      ..add(
+        down(13, const Offset(285, 195), 27, radiusMajor: 20, radiusMinor: 14),
+        const Offset(285, 195),
+      );
+    broadTracker.update(
+      move(11, const Offset(220, 210), 50, radiusMajor: 20, radiusMinor: 14),
+      const Offset(220, 210),
+    );
+    final broad = broadTracker.update(
+      move(12, const Offset(270, 220), 58, radiusMajor: 20, radiusMinor: 14),
+      const Offset(270, 220),
+    )!;
+
+    expect(broad.brushRadius, greaterThan(compact.brushRadius + 20));
+    expect(broad.brushRadius, lessThanOrEqualTo(100));
   });
 
   test('distributed five-finger wheel contacts are never a fist cluster', () {

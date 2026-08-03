@@ -259,7 +259,7 @@ void main() {
           ),
         ],
       );
-      const engine = SelectionEngine();
+      final engine = SelectionEngine();
       final bounds = page.objects.single.transform.bounds;
 
       expect(

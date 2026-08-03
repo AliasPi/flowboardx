@@ -89,6 +89,110 @@ class StylusPalmGuardTest {
     }
 
     @Test
+    fun continuationDoesNotReadOrReevaluateContactGeometry() {
+        val guard = StylusPalmGuard(protectionRadiusDp = 300.0)
+        guard.stylusDown(stylus, point(500.0, 500.0), 100L)
+        assertTrue(
+            guard.shouldSuppressTouch(
+                touch,
+                StylusPalmGuard.TouchPhase.START,
+                listOf(palm(530.0, 520.0)),
+                120L,
+            ),
+        )
+        val contactsThatMustNotBeRead =
+            object : Iterable<StylusPalmGuard.TouchContact> {
+                override fun iterator(): Iterator<StylusPalmGuard.TouchContact> =
+                    throw AssertionError("MOVE must use the latched decision")
+            }
+
+        assertTrue(
+            guard.shouldSuppressTouch(
+                touch,
+                StylusPalmGuard.TouchPhase.CONTINUE,
+                contactsThatMustNotBeRead,
+                130L,
+            ),
+        )
+        assertTrue(
+            guard.shouldSuppressTouch(
+                touch,
+                StylusPalmGuard.TouchPhase.END,
+                contactsThatMustNotBeRead,
+                140L,
+            ),
+        )
+        assertFalse(
+            guard.shouldSuppressTouch(
+                touch,
+                StylusPalmGuard.TouchPhase.CONTINUE,
+                contactsThatMustNotBeRead,
+                150L,
+            ),
+        )
+    }
+
+    @Test
+    fun inPlaceStylusMoveUsesLatestProtectionPosition() {
+        val guard = StylusPalmGuard(protectionRadiusDp = 300.0)
+        guard.stylusDown(stylus, 100.0, 100.0, 100L)
+        guard.stylusMove(stylus, 1_000.0, 700.0, 110L)
+
+        assertFalse(
+            guard.shouldSuppressTouch(
+                touch,
+                StylusPalmGuard.TouchPhase.START,
+                listOf(palm(120.0, 120.0)),
+                120L,
+            ),
+        )
+        assertTrue(
+            guard.shouldSuppressTouch(
+                touch.copy(downTimeMillis = 121L),
+                StylusPalmGuard.TouchPhase.START,
+                listOf(palm(1_020.0, 720.0)),
+                121L,
+            ),
+        )
+    }
+
+    @Test
+    fun malformedStreamsCannotGrowSuppressionLatchWithoutBound() {
+        val guard = StylusPalmGuard(protectionRadiusDp = 300.0)
+        guard.stylusDown(stylus, point(500.0, 500.0), 100L)
+        val streams = List(40) { index ->
+            touch.copy(downTimeMillis = 200L + index)
+        }
+        for ((index, stream) in streams.withIndex()) {
+            assertTrue(
+                guard.shouldSuppressTouch(
+                    stream,
+                    StylusPalmGuard.TouchPhase.START,
+                    listOf(palm(530.0, 520.0)),
+                    200L + index,
+                ),
+            )
+        }
+
+        assertFalse(
+            guard.shouldSuppressTouch(
+                streams.first(),
+                StylusPalmGuard.TouchPhase.CONTINUE,
+                emptyList(),
+                300L,
+            ),
+        )
+        assertTrue(
+            guard.shouldSuppressTouch(
+                streams.last(),
+                StylusPalmGuard.TouchPhase.CONTINUE,
+                emptyList(),
+                300L,
+            ),
+        )
+    }
+
+    @Test
     fun palmBeforeStylusIsNotConsumedMidStreamButCannotBecomeEraser() {
         val guard = StylusPalmGuard(protectionRadiusDp = 300.0)
         assertFalse(
@@ -187,6 +291,50 @@ class StylusPalmGuardTest {
                 touch,
                 StylusPalmGuard.TouchPhase.START,
                 listOf(finger(610.0, 550.0)),
+                120L,
+            ),
+        )
+    }
+
+    @Test
+    fun narrowSmartboardFingerNeverBecomesPalmEvidence() {
+        val guard = StylusPalmGuard(protectionRadiusDp = 300.0)
+        guard.stylusDown(stylus, point(500.0, 500.0), 100L)
+
+        assertFalse(
+            guard.shouldSuppressTouch(
+                touch,
+                StylusPalmGuard.TouchPhase.START,
+                listOf(
+                    StylusPalmGuard.TouchContact(
+                        position = point(650.0, 520.0),
+                        radiusMajorDp = 7.0,
+                        radiusMinorDp = 5.0,
+                        normalizedSize = 0.08,
+                    ),
+                ),
+                120L,
+            ),
+        )
+    }
+
+    @Test
+    fun borderlineFingerContactStaysBelowConservativePalmThreshold() {
+        val guard = StylusPalmGuard(protectionRadiusDp = 300.0)
+        guard.stylusDown(stylus, point(500.0, 500.0), 100L)
+
+        assertFalse(
+            guard.shouldSuppressTouch(
+                touch,
+                StylusPalmGuard.TouchPhase.START,
+                listOf(
+                    StylusPalmGuard.TouchContact(
+                        position = point(650.0, 520.0),
+                        radiusMajorDp = 11.5,
+                        radiusMinorDp = 7.0,
+                        normalizedSize = 0.19,
+                    ),
+                ),
                 120L,
             ),
         )

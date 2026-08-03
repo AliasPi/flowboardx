@@ -152,6 +152,40 @@ void main() {
       expect(history.document.currentPage.objectById('shape')!.transform.x, 0);
     });
 
+    test('participant undo preserves ink claimed by a foreign group', () {
+      var initial = WhiteboardDocument.create(id: 'shared-group', now: now);
+      final pageId = initial.currentPage.id;
+      initial = AddObjectCommand(
+        pageId,
+        ShapeObject(
+          id: 'shared-shape',
+          transform: const ObjectTransform(x: 80, y: 0, width: 40, height: 40),
+          createdAt: now,
+        ),
+        now: now,
+      ).apply(initial);
+      final history = CommandHistory(initial);
+      history.execute(
+        AddStrokeCommand(pageId, stroke('claimed-ink', 0), now: now),
+        ownerId: 'left',
+      );
+      history.execute(
+        GroupItemsCommand(pageId, 'right-group', const <String>[
+          'claimed-ink',
+          'shared-shape',
+        ], now: now),
+        ownerId: 'right',
+      );
+
+      history.undo(ownerId: 'left');
+
+      expect(history.document.currentPage.strokeById('claimed-ink'), isNotNull);
+      expect(
+        history.document.currentPage.contentGroups.single.memberIds,
+        contains('claimed-ink'),
+      );
+    });
+
     test('undoes and redoes stroke changes and clears redo branches', () {
       final history = CommandHistory(
         WhiteboardDocument.create(id: 'doc', now: now),
@@ -447,6 +481,147 @@ void main() {
       history.redo();
       expect(history.document.metadata.custom['radialMenuX'], '.27');
       expect(history.document.metadata.custom['radialMenuY'], '.73');
+    });
+
+    test('bounded history trims oldest entries without losing stack order', () {
+      final initial = WhiteboardDocument.create(id: 'bounded', now: now);
+      final pageId = initial.currentPage.id;
+      final history = CommandHistory(initial, maxDepth: 32);
+
+      for (var index = 0; index < 256; index++) {
+        history.execute(
+          AddStrokeCommand(
+            pageId,
+            stroke('bounded-$index', index.toDouble()),
+            now: now,
+          ),
+        );
+      }
+
+      expect(history.undoDepth, 32);
+      for (var index = 0; index < 32; index++) {
+        history.undo();
+      }
+      expect(history.canUndo, isFalse);
+      expect(history.document.currentPage.strokes, hasLength(224));
+      expect(history.document.currentPage.strokes.last.id, 'bounded-223');
+    });
+
+    test('single-page undo work stays independent of document page count', () {
+      final pages = List<BoardPage>.generate(
+        WhiteboardDocument.maxPageCount,
+        (pageIndex) => BoardPage(
+          id: 'scale-page-$pageIndex',
+          name: 'Seite ${pageIndex + 1}',
+          strokes: List<InkStroke>.generate(
+            32,
+            (strokeIndex) =>
+                stroke('existing-$pageIndex-$strokeIndex', strokeIndex * 14),
+          ),
+        ),
+      );
+      final initial = WhiteboardDocument(
+        id: 'scale-history',
+        title: 'Scale',
+        createdAt: now,
+        updatedAt: now,
+        pages: pages,
+      );
+      final diagnostics = CommandHistoryDiagnostics();
+      final history = CommandHistory(initial, diagnostics: diagnostics);
+
+      history.execute(
+        AddStrokeCommand(
+          pages[73].id,
+          stroke('new-scale-stroke', 900),
+          now: now,
+        ),
+      );
+      diagnostics.reset();
+      history.undo();
+
+      expect(diagnostics.singlePageTransitions, 1);
+      expect(diagnostics.deepPageMerges, 0);
+      expect(diagnostics.genericPageMerges, 0);
+      expect(diagnostics.referencedAssetPageScans, 0);
+      expect(history.document.pageById(pages[73].id)!.strokes, hasLength(32));
+      expect(
+        history.document.pages[12],
+        same(initial.pages[12]),
+        reason: 'unrelated pages must retain their immutable snapshots',
+      );
+    });
+
+    test('participant undo deeply merges only its changed page', () {
+      final pages = List<BoardPage>.generate(
+        WhiteboardDocument.maxPageCount,
+        (index) => BoardPage.empty(id: 'participant-page-$index'),
+      );
+      final initial = WhiteboardDocument(
+        id: 'participant-scale',
+        title: 'Scale',
+        createdAt: now,
+        updatedAt: now,
+        pages: pages,
+      );
+      final diagnostics = CommandHistoryDiagnostics();
+      final history = CommandHistory(initial, diagnostics: diagnostics);
+      final pageId = pages[63].id;
+      history.execute(
+        AddStrokeCommand(pageId, stroke('left-scale', 0), now: now),
+        ownerId: 'left',
+      );
+      history.execute(
+        AddStrokeCommand(pageId, stroke('right-scale', 40), now: now),
+        ownerId: 'right',
+      );
+
+      diagnostics.reset();
+      history.undo(ownerId: 'left');
+
+      expect(diagnostics.singlePageTransitions, 1);
+      expect(diagnostics.deepPageMerges, 1);
+      expect(diagnostics.genericPageMerges, 0);
+      expect(diagnostics.referencedAssetPageScans, 0);
+      expect(
+        history.document.pageById(pageId)!.strokes.map((item) => item.id),
+        ['right-scale'],
+      );
+    });
+
+    test('transform retains distant grouping snapshots at scale', () {
+      final initial = WhiteboardDocument.create(
+        id: 'transform-scale',
+        now: now,
+      );
+      final moving = stroke('moving', 0);
+      final stationary = stroke('stationary', 500);
+      final groups = List<InkGroup>.generate(
+        1800,
+        (index) => InkGroup(
+          id: 'distant-group-$index',
+          kind: InkGroupKind.manual,
+          strokeIds: const ['stationary'],
+          bounds: stationary.bounds,
+        ),
+        growable: false,
+      );
+      final page = initial.currentPage.copyWith(
+        strokes: <InkStroke>[moving, stationary],
+        groups: groups,
+      );
+
+      final transformed = TransformItemsCommand(
+        page.id,
+        const <String>['moving'],
+        const TransformDelta(dx: 40, dy: 20),
+        now: now,
+      ).apply(initial.copyWith(pages: <BoardPage>[page]));
+
+      for (var index = 0; index < groups.length; index++) {
+        expect(transformed.currentPage.groups[index], same(groups[index]));
+      }
+      expect(transformed.currentPage.strokeById('moving')!.points.first.x, 40);
     });
   });
 }

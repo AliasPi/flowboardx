@@ -197,4 +197,70 @@ void main() {
       <String>['source', 'source.fragment'],
     );
   });
+
+  test(
+    'large erases retain every unaffected group and annotation snapshot',
+    () {
+      final base = WhiteboardDocument.create(id: 'erase-scale');
+      final source = stroke('source', 0, 100);
+      final untouched = stroke('untouched', 200, 300);
+      final objects = List<BoardObject>.generate(
+        96,
+        (index) => ImageObject(
+          id: 'image-$index',
+          assetId: 'asset',
+          transform: ObjectTransform(
+            x: index * 10,
+            y: 400,
+            width: 80,
+            height: 60,
+          ),
+        ),
+        growable: false,
+      );
+      final layers = List<ObjectInkLayer>.generate(
+        objects.length,
+        (index) => ObjectInkLayer(
+          id: 'layer-$index',
+          objectId: objects[index].id,
+          strokes: <InkStroke>[stroke('annotation-$index', 0, 10)],
+        ),
+        growable: false,
+      );
+      final groups = List<InkGroup>.generate(
+        1200,
+        (index) => InkGroup(
+          id: 'group-$index',
+          kind: InkGroupKind.manual,
+          strokeIds: const <String>['untouched'],
+          bounds: untouched.bounds,
+        ),
+        growable: false,
+      );
+      final page = base.currentPage.copyWith(
+        strokes: <InkStroke>[source, untouched],
+        objects: objects,
+        annotationLayers: layers,
+        groups: groups,
+      );
+
+      final result = ReplaceErasedStrokeSegmentsCommand(
+        pageId: page.id,
+        replacements: <String, List<InkStroke>>{
+          source.id: <InkStroke>[stroke('source', 0, 40)],
+          'annotation-95': const <InkStroke>[],
+        },
+      ).apply(base.copyWith(pages: <BoardPage>[page]));
+      final next = result.currentPage;
+
+      for (var index = 0; index < groups.length; index++) {
+        expect(next.groups[index], same(groups[index]));
+      }
+      for (var index = 0; index < layers.length - 1; index++) {
+        expect(next.annotationLayers[index], same(layers[index]));
+      }
+      expect(next.annotationLayers.last.strokes, isEmpty);
+      expect(next.selection, same(page.selection));
+    },
+  );
 }

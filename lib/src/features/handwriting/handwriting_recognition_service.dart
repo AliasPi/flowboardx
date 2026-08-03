@@ -291,7 +291,10 @@ final class PlatformHandwritingRecognitionService
 
   static const channelName = 'de.flowboardx/handwriting_recognition';
   static const defaultEnsureModelTimeout = Duration(seconds: 5);
-  static const defaultRecognitionTimeout = Duration(seconds: 35);
+  // Android serializes one native OCR session. Forty-five seconds leaves room
+  // for the second participant's queued request after a worst-case 18-second
+  // first request without timing out the MethodChannel future prematurely.
+  static const defaultRecognitionTimeout = Duration(seconds: 45);
   @visibleForTesting
   static const maximumRecognizedTextLength = 4096;
   final MethodChannel _channel;

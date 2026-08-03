@@ -33,26 +33,28 @@ final class ReplaceErasedStrokeSegmentsCommand implements DocumentCommand {
     if (page == null) throw StateError('Seite $pageId existiert nicht.');
     if (replacements.isEmpty) return document;
 
-    final sourceIds = <String>{
-      ...page.strokes.map((stroke) => stroke.id),
-      ...page.annotationLayers.expand(
-        (layer) => layer.strokes.map((stroke) => stroke.id),
-      ),
+    final locations = _locateReplacementSources(page);
+    final appliedSourceIds = <String>{
+      ...locations.topLevel,
+      for (final ids in locations.annotationByLayerId.values) ...ids,
     };
-    final appliedSourceIds = replacements.keys
-        .where(sourceIds.contains)
-        .toSet();
     if (appliedSourceIds.isEmpty) return document;
     _validateReplacementIds(page, appliedSourceIds);
 
-    final strokes = _replaceStrokes(page.strokes, appliedSourceIds);
-    final annotationLayers = page.annotationLayers
-        .map(
-          (layer) => layer.copyWith(
-            strokes: _replaceStrokes(layer.strokes, appliedSourceIds),
-          ),
-        )
-        .toList(growable: false);
+    final strokes = locations.topLevel.isEmpty
+        ? page.strokes
+        : _replaceStrokes(page.strokes, locations.topLevel);
+    final annotationLayers = locations.annotationByLayerId.isEmpty
+        ? page.annotationLayers
+        : <ObjectInkLayer>[
+            for (final layer in page.annotationLayers)
+              if (locations.annotationByLayerId[layer.id] case final sourceIds?)
+                layer.copyWith(
+                  strokes: _replaceStrokes(layer.strokes, sourceIds),
+                )
+              else
+                layer,
+          ];
 
     List<String> rebaseIds(Iterable<String> ids) => <String>[
       for (final id in ids)
@@ -67,6 +69,10 @@ final class ReplaceErasedStrokeSegmentsCommand implements DocumentCommand {
     };
     final groups = <InkGroup>[];
     for (final group in page.groups) {
+      if (!group.strokeIds.any(appliedSourceIds.contains)) {
+        groups.add(group);
+        continue;
+      }
       final members = rebaseIds(
         group.strokeIds,
       ).where(strokeById.containsKey).toSet().toList(growable: false);
@@ -85,6 +91,10 @@ final class ReplaceErasedStrokeSegmentsCommand implements DocumentCommand {
     final contentGroups = <ContentGroup>[];
     final dissolvedContentGroupMembers = <String, List<String>>{};
     for (final group in page.contentGroups) {
+      if (!group.memberIds.any(appliedSourceIds.contains)) {
+        contentGroups.add(group);
+        continue;
+      }
       final members = rebaseIds(group.memberIds)
           .where(
             (id) => strokeById.containsKey(id) || objectById.containsKey(id),
@@ -103,21 +113,25 @@ final class ReplaceErasedStrokeSegmentsCommand implements DocumentCommand {
       );
     }
 
-    final validSelectionIds = <String>{
-      ...strokeById.keys,
-      ...objectById.keys,
-      ...groups.map((group) => group.id),
-      ...contentGroups.map((group) => group.id),
-    };
-    final selected = <String>{};
-    for (final id in page.selection.selectedItemIds) {
-      if (dissolvedContentGroupMembers.containsKey(id)) {
-        selected.addAll(dissolvedContentGroupMembers[id]!);
-      } else if (appliedSourceIds.contains(id)) {
-        selected.addAll(replacements[id]!.map((stroke) => stroke.id));
-      } else if (validSelectionIds.contains(id)) {
-        selected.add(id);
+    var selection = page.selection;
+    if (selection.selectedItemIds.isNotEmpty) {
+      final validSelectionIds = <String>{
+        ...strokeById.keys,
+        ...objectById.keys,
+        ...groups.map((group) => group.id),
+        ...contentGroups.map((group) => group.id),
+      };
+      final selected = <String>{};
+      for (final id in selection.selectedItemIds) {
+        if (dissolvedContentGroupMembers.containsKey(id)) {
+          selected.addAll(dissolvedContentGroupMembers[id]!);
+        } else if (appliedSourceIds.contains(id)) {
+          selected.addAll(replacements[id]!.map((stroke) => stroke.id));
+        } else if (validSelectionIds.contains(id)) {
+          selected.add(id);
+        }
       }
+      selection = selection.copyWith(selectedItemIds: selected);
     }
 
     return document.replacePage(
@@ -126,16 +140,39 @@ final class ReplaceErasedStrokeSegmentsCommand implements DocumentCommand {
         annotationLayers: annotationLayers,
         groups: groups,
         contentGroups: contentGroups,
-        selection: page.selection.copyWith(
-          selectedItemIds: selected.where(validSelectionIds.contains),
-        ),
+        selection: selection,
       ),
       now: now,
     );
   }
 
+  ({Set<String> topLevel, Map<String, Set<String>> annotationByLayerId})
+  _locateReplacementSources(BoardPage page) {
+    final remaining = replacements.keys.toSet();
+    final topLevel = <String>{};
+    for (final id in replacements.keys) {
+      if (page.containsTopLevelStrokeId(id)) {
+        topLevel.add(id);
+        remaining.remove(id);
+      }
+    }
+    final annotationByLayerId = <String, Set<String>>{};
+    if (remaining.isNotEmpty) {
+      for (final layer in page.annotationLayers) {
+        Set<String>? matches;
+        for (final stroke in layer.strokes) {
+          if (!remaining.remove(stroke.id)) continue;
+          (matches ??= <String>{}).add(stroke.id);
+        }
+        if (matches != null) annotationByLayerId[layer.id] = matches;
+        if (remaining.isEmpty) break;
+      }
+    }
+    return (topLevel: topLevel, annotationByLayerId: annotationByLayerId);
+  }
+
   List<InkStroke> _replaceStrokes(
-    Iterable<InkStroke> source,
+    List<InkStroke> source,
     Set<String> appliedSourceIds,
   ) => <InkStroke>[
     for (final stroke in source)

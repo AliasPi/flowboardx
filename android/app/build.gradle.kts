@@ -198,10 +198,10 @@ val verifyBundledLatinRecognitionModel =
                     ).get().asFile
             val expectedHandwritingAssets =
                 mapOf(
-                    "latin_PP-OCRv5_mobile_rec.onnx" to
-                        "7888113072263CB471B93F66DD5E2AD70548DC526FA1ACE760D0D973DD121498",
-                    "latin_PP-OCRv5_mobile_rec.yml" to
-                        "0BBE984570F597AF3638E50BDF2E8276F3AB26A61966096538B3B0D1849F5C84",
+                    "PP-OCRv6_small_rec.onnx" to
+                        "5435FD747C9E0EFE15A96D0B378D5BD157E9492ED8FD80EDF08F30D02FA24634",
+                    "PP-OCRv6_small_rec.yml" to
+                        "AB078671BB49F06228EADCCD34F1BB501E157F7A047095FFB943BA81512C77D1",
                     "PADDLEOCR_APACHE_2_LICENSE.txt" to
                         "3840C5C0C61C294264D2DD77B8777BE6DDD90121EF4E0E64ABCD22EDEA581D6E",
                     "ONNXRUNTIME_MIT_LICENSE.txt" to

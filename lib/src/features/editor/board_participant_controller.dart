@@ -49,8 +49,9 @@ class BoardParticipantController extends ChangeNotifier {
       case BoardTool.straightLine:
         nextStyle = nextStyle.copyWith(type: InkToolType.straightLine);
       case BoardTool.eraser:
-      // The eraser shares the thickness value with the last ink style, but
-      // never changes the persisted stroke type.
+      // Erasing preserves the complete ink style. Its live brush size is
+      // derived from the physical contact instead of overwriting the width
+      // that should be restored when the participant returns to drawing.
       case BoardTool.selectRectangle ||
           BoardTool.selectLasso ||
           BoardTool.shape:
@@ -93,14 +94,7 @@ class BoardParticipantController extends ChangeNotifier {
     notifyListeners();
   }
 
-  void updateEraserWidth(double width) {
-    final safeWidth = width.isFinite ? width.clamp(.5, 80.0) : _penStyle.width;
-    final next = _penStyle.copyWith(width: safeWidth);
-    if (_tool == BoardTool.eraser && _samePenStyle(_penStyle, next)) return;
-    _tool = BoardTool.eraser;
-    _penStyle = next;
-    notifyListeners();
-  }
+  void selectEraser() => setTool(BoardTool.eraser);
 
   void armShape(ShapeKind value) {
     if (_tool == BoardTool.shape && _activeShape == value) return;

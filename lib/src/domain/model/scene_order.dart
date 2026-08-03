@@ -47,18 +47,80 @@ final class BoardSceneItem {
 
 enum SceneArrangement { oneForward, oneBackward, toFront, toBack }
 
+/// Describes a fixed-length, immutable sparse overlay over a scene list.
+///
+/// Live transforms usually replace only one or a handful of objects/strokes.
+/// Renderers can use this contract to update those entries directly instead
+/// of comparing or copying the complete page on every pointer packet.
+abstract interface class FixedSceneListOverlay<T> {
+  List<T> get sceneSource;
+  Map<int, T> get sceneReplacements;
+}
+
+/// An immutable list that can prove it was produced by appending exactly one
+/// item to another list.
+///
+/// Renderers may skip an otherwise linear prefix-identity check only when this
+/// contract returns true. Implementations must therefore compare immutable
+/// revision ancestry, not merely list lengths or value equality.
+abstract interface class SingleAppendSceneList<T> {
+  bool isSingleAppendOf(List<T> previous);
+}
+
 /// Returns a stable, back-to-front scene order shared by painting and hit
 /// testing. Equal z-indices intentionally retain the historic list order.
 List<BoardSceneItem> orderedBoardSceneItems({
   required Iterable<BoardObject> objects,
   required Iterable<InkStroke> strokes,
 }) {
+  final objectList = objects is List<BoardObject>
+      ? objects
+      : objects.toList(growable: false);
+  final strokeList = strokes is List<InkStroke>
+      ? strokes
+      : strokes.toList(growable: false);
+  if (_hasMonotonicZOrder(objectList, (object) => object.zIndex) &&
+      _hasMonotonicZOrder(strokeList, (stroke) => stroke.zIndex)) {
+    // Normal editing keeps each source list in z-order: appends use the next
+    // top index and layer commands rewrite both lists from the ordered scene.
+    // Merging those two runs is O(N); sorting the complete page for every tap,
+    // thumbnail and cold scene rebuild was O(N log N) despite that invariant.
+    final result = <BoardSceneItem>[];
+    var objectIndex = 0;
+    var strokeIndex = 0;
+    while (objectIndex < objectList.length || strokeIndex < strokeList.length) {
+      if (strokeIndex >= strokeList.length ||
+          (objectIndex < objectList.length &&
+              objectList[objectIndex].zIndex <=
+                  strokeList[strokeIndex].zIndex)) {
+        result.add(
+          BoardSceneItem.object(
+            objectList[objectIndex],
+            stableOrder: objectIndex,
+          ),
+        );
+        objectIndex++;
+      } else {
+        result.add(
+          BoardSceneItem.stroke(
+            strokeList[strokeIndex],
+            stableOrder: objectList.length + strokeIndex,
+          ),
+        );
+        strokeIndex++;
+      }
+    }
+    return result;
+  }
+
+  // Crafted/legacy documents can contain independently unsorted source lists.
+  // Retain the original stable-sort fallback for those inputs.
   final result = <BoardSceneItem>[];
   var stableOrder = 0;
-  for (final object in objects) {
+  for (final object in objectList) {
     result.add(BoardSceneItem.object(object, stableOrder: stableOrder++));
   }
-  for (final stroke in strokes) {
+  for (final stroke in strokeList) {
     result.add(BoardSceneItem.stroke(stroke, stableOrder: stableOrder++));
   }
   result.sort((first, second) {
@@ -68,6 +130,13 @@ List<BoardSceneItem> orderedBoardSceneItems({
         : first.stableOrder.compareTo(second.stableOrder);
   });
   return result;
+}
+
+bool _hasMonotonicZOrder<T>(List<T> values, int Function(T value) zIndexOf) {
+  for (var index = 1; index < values.length; index++) {
+    if (zIndexOf(values[index - 1]) > zIndexOf(values[index])) return false;
+  }
+  return true;
 }
 
 /// Finds the next free top-level z-index. Starting at zero keeps newly created

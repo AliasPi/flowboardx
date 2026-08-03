@@ -96,6 +96,7 @@ class RadialPagePreview {
   const RadialPagePreview({
     required this.pageIndex,
     required this.pageNumber,
+    this.pageId,
     this.thumbnail,
     this.backgroundColor = Colors.white,
     this.semanticLabel,
@@ -105,6 +106,10 @@ class RadialPagePreview {
   /// Stable zero-based page index passed back to [RadialMenuCallbacks.onPageSelected].
   final int pageIndex;
   final int pageNumber;
+
+  /// Stable document identity used by destructive page actions. Older hosts
+  /// may omit it and continue to use [pageIndex] for navigation only.
+  final String? pageId;
 
   /// A rendered page thumbnail. Ownership and disposal stay with the caller.
   final ui.Image? thumbnail;
@@ -174,6 +179,7 @@ class RadialMenuCallbacks {
     this.onCustomColorRequested,
     this.onSelectionToolChanged,
     this.onPageSelected,
+    this.onPageDeleteRequested,
     this.onTemplateSelected,
     this.onShapeRequested,
     this.onImageRequested,
@@ -197,6 +203,11 @@ class RadialMenuCallbacks {
   final Future<Color?> Function(Color currentColor)? onCustomColorRequested;
   final ValueChanged<RadialSelectionTool>? onSelectionToolChanged;
   final ValueChanged<int>? onPageSelected;
+
+  /// Invoked by a long press on a page in the click wheel. The host owns the
+  /// confirmation UI and must revalidate [RadialPagePreview.pageId] before
+  /// deleting because the shared document may have changed meanwhile.
+  final ValueChanged<RadialPagePreview>? onPageDeleteRequested;
   final ValueChanged<RadialTemplateEntry>? onTemplateSelected;
   final ValueChanged<RadialShapeKind>? onShapeRequested;
   final ValueChanged<RadialImageSource>? onImageRequested;

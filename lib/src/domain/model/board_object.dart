@@ -1,3 +1,4 @@
+import 'dart:collection';
 import 'dart:math' as math;
 
 import 'geometry.dart';
@@ -557,7 +558,17 @@ final class ObjectInkLayer {
     Iterable<InkStroke> strokes = const [],
     this.pdfPageIndex,
     this.visible = true,
-  }) : strokes = List.unmodifiable(strokes);
+  }) : strokes = _ChunkedAnnotationStrokeList<InkStroke>.from(strokes),
+       _maximumZIndexCache = null;
+
+  ObjectInkLayer._trusted({
+    required this.id,
+    required this.objectId,
+    required this.strokes,
+    required this.pdfPageIndex,
+    required this.visible,
+    required int? maximumZIndex,
+  }) : _maximumZIndexCache = maximumZIndex;
 
   final String id;
   final String objectId;
@@ -567,19 +578,74 @@ final class ObjectInkLayer {
   /// single/general annotation layer (images, tables and legacy documents).
   final int? pdfPageIndex;
   final bool visible;
+  int? _maximumZIndexCache;
+
+  int get _maximumZIndex => _maximumZIndexCache ??= strokes.fold<int>(
+    -1,
+    (maximum, stroke) => stroke.zIndex > maximum ? stroke.zIndex : maximum,
+  );
+
+  /// Adds object-local ink without copying all preceding annotations retained
+  /// by Undo/Redo. This is the annotation equivalent of the board's
+  /// append-heavy stroke storage and is especially relevant for bundled PDFs,
+  /// tables and images that receive many handwritten notes.
+  ObjectInkLayer appendStroke(InkStroke stroke, {int? pdfPageIndex}) {
+    final topmost = stroke.copyWith(zIndex: _maximumZIndex + 1);
+    return ObjectInkLayer._trusted(
+      id: id,
+      objectId: objectId,
+      strokes: _ChunkedAnnotationStrokeList<InkStroke>.from(
+        strokes,
+      ).appended(topmost),
+      pdfPageIndex: pdfPageIndex ?? this.pdfPageIndex,
+      visible: visible,
+      maximumZIndex: topmost.zIndex,
+    );
+  }
 
   ObjectInkLayer copyWith({
     Iterable<InkStroke>? strokes,
     int? pdfPageIndex,
     bool clearPdfPageIndex = false,
     bool? visible,
-  }) => ObjectInkLayer(
-    id: id,
-    objectId: objectId,
-    strokes: strokes ?? this.strokes,
-    pdfPageIndex: clearPdfPageIndex ? null : pdfPageIndex ?? this.pdfPageIndex,
-    visible: visible ?? this.visible,
-  );
+  }) {
+    final nextStrokes = strokes == null || identical(strokes, this.strokes)
+        ? this.strokes
+        : _ChunkedAnnotationStrokeList<InkStroke>.from(strokes);
+    return ObjectInkLayer._trusted(
+      id: id,
+      objectId: objectId,
+      strokes: nextStrokes,
+      pdfPageIndex: clearPdfPageIndex
+          ? null
+          : pdfPageIndex ?? this.pdfPageIndex,
+      visible: visible ?? this.visible,
+      maximumZIndex: identical(nextStrokes, this.strokes)
+          ? _maximumZIndexCache
+          : null,
+    );
+  }
+
+  /// Returns whether this layer was produced by appending exactly one stroke
+  /// to [previous].
+  ///
+  /// Presentation caches use this strict ancestry check to update only their
+  /// bounded tail picture. Length and value comparisons are deliberately not
+  /// sufficient: erasing one stroke and adding another can otherwise look
+  /// like an append and leave stale ink on screen.
+  bool isSingleStrokeAppendOf(ObjectInkLayer previous) {
+    if (id != previous.id ||
+        objectId != previous.objectId ||
+        pdfPageIndex != previous.pdfPageIndex ||
+        visible != previous.visible ||
+        strokes.length != previous.strokes.length + 1) {
+      return false;
+    }
+    return strokes is _ChunkedAnnotationStrokeList<InkStroke> &&
+        (strokes as _ChunkedAnnotationStrokeList<InkStroke>).isSingleAppendOf(
+          previous.strokes,
+        );
+  }
 
   Map<String, Object?> toJson() => {
     'id': id,
@@ -598,6 +664,99 @@ final class ObjectInkLayer {
     strokes: _mapList(json['strokes']).map(InkStroke.fromJson),
     visible: json['visible'] is bool ? json['visible']! as bool : true,
   );
+}
+
+/// Flat append-only immutable storage for annotation strokes.
+///
+/// It intentionally lives next to [ObjectInkLayer] so the model does not
+/// depend on editor or persistence code. Random access and chronological
+/// iteration stay constant-depth; an ordinary append copies at most 63
+/// references instead of the complete annotation history.
+final class _ChunkedAnnotationStrokeList<E> extends ListBase<E> {
+  factory _ChunkedAnnotationStrokeList.from(Iterable<E> values) {
+    if (values is _ChunkedAnnotationStrokeList<E>) return values;
+    final chunks = <List<E>>[];
+    var tail = <E>[];
+    var length = 0;
+    for (final value in values) {
+      tail.add(value);
+      length++;
+      if (tail.length == _chunkSize) {
+        chunks.add(List<E>.unmodifiable(tail));
+        tail = <E>[];
+      }
+    }
+    return _ChunkedAnnotationStrokeList<E>._(
+      List<List<E>>.unmodifiable(chunks),
+      List<E>.unmodifiable(tail),
+      length,
+      Object(),
+      null,
+    );
+  }
+
+  const _ChunkedAnnotationStrokeList._(
+    this._chunks,
+    this._tail,
+    this._length,
+    this._revision,
+    this._parentRevision,
+  );
+
+  static const int _chunkSize = 64;
+  final List<List<E>> _chunks;
+  final List<E> _tail;
+  final int _length;
+  final Object _revision;
+  final Object? _parentRevision;
+
+  _ChunkedAnnotationStrokeList<E> appended(E value) {
+    if (_tail.length < _chunkSize - 1) {
+      return _ChunkedAnnotationStrokeList<E>._(
+        _chunks,
+        List<E>.unmodifiable(_tail.followedBy(<E>[value])),
+        _length + 1,
+        Object(),
+        _revision,
+      );
+    }
+    final completedTail = List<E>.unmodifiable(_tail.followedBy(<E>[value]));
+    return _ChunkedAnnotationStrokeList<E>._(
+      List<List<E>>.unmodifiable(_chunks.followedBy(<List<E>>[completedTail])),
+      List<E>.empty(growable: false),
+      _length + 1,
+      Object(),
+      _revision,
+    );
+  }
+
+  bool isSingleAppendOf(List<E> previous) =>
+      _length == previous.length + 1 &&
+      previous is _ChunkedAnnotationStrokeList<E> &&
+      identical(_parentRevision, previous._revision);
+
+  @override
+  int get length => _length;
+
+  @override
+  set length(int value) {
+    throw UnsupportedError('Annotationen sind unveränderlich.');
+  }
+
+  @override
+  E operator [](int index) {
+    RangeError.checkValidIndex(index, this);
+    final chunkIndex = index ~/ _chunkSize;
+    if (chunkIndex < _chunks.length) {
+      return _chunks[chunkIndex][index % _chunkSize];
+    }
+    return _tail[index - _chunks.length * _chunkSize];
+  }
+
+  @override
+  void operator []=(int index, E value) {
+    throw UnsupportedError('Annotationen sind unveränderlich.');
+  }
 }
 
 /// Selects the annotation layer that belongs to the object's currently visible

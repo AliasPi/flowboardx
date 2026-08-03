@@ -47,6 +47,20 @@ void main() {
     ]);
   });
 
+  test('unsorted recovered source lists retain stable fallback ordering', () {
+    final scene = orderedBoardSceneItems(
+      objects: <BoardObject>[object('object-high', 8), object('object-low', 1)],
+      strokes: <InkStroke>[stroke('ink-high', 7), stroke('ink-low', 2)],
+    );
+
+    expect(scene.map((item) => item.id), <String>[
+      'object-low',
+      'ink-low',
+      'ink-high',
+      'object-high',
+    ]);
+  });
+
   test('moves a mixed selection one level and normalizes unique layers', () {
     final arranged = arrangeBoardSceneItems(
       objects: <BoardObject>[object('object', 1)],

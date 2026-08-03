@@ -52,36 +52,21 @@ final class AddStrokeAndRegroupCommand implements DocumentCommand {
                 : '${objectId!}.pdf.$pdfPageIndex.annotations',
             objectId: objectId!,
             pdfPageIndex: pdfPageIndex,
-            strokes: [stroke.copyWith(zIndex: 0)],
-          ),
+          ).appendStroke(stroke, pdfPageIndex: pdfPageIndex),
         );
       } else {
-        final layer = layers[index];
-        final maximum = layer.strokes.fold<int>(
-          -1,
-          (value, candidate) =>
-              candidate.zIndex > value ? candidate.zIndex : value,
-        );
-        layers[index] = layers[index].copyWith(
+        layers[index] = layers[index].appendStroke(
+          stroke,
           pdfPageIndex: pdfPageIndex,
-          strokes: [
-            ...layer.strokes,
-            stroke.copyWith(zIndex: maximum + 1),
-          ],
         );
       }
       return document.replacePage(page.copyWith(annotationLayers: layers));
     }
-    if (page.strokes.any((candidate) => candidate.id == stroke.id)) {
+    if (page.containsTopLevelStrokeId(stroke.id)) {
       throw StateError('Strich-ID ${stroke.id} existiert bereits.');
     }
-    final topmost = stroke.copyWith(
-      zIndex: nextBoardSceneZIndex(
-        objects: page.objects,
-        strokes: page.strokes,
-      ),
-    );
-    final withStroke = page.copyWith(strokes: [...page.strokes, topmost]);
+    final topmost = stroke.copyWith(zIndex: page.nextTopLevelSceneZIndex);
+    final withStroke = page.appendTopLevelStroke(topmost);
     final groups = grouping.regroupIncrementally(
       page: withStroke,
       changedStrokeIds: [topmost.id],
@@ -140,7 +125,7 @@ final class ImportObjectCommand implements DocumentCommand {
     );
     final topmost = copyBoardObjectWithZIndex(
       object,
-      nextBoardSceneZIndex(objects: page.objects, strokes: page.strokes),
+      page.nextTopLevelSceneZIndex,
     );
     return withAsset.replacePage(
       page.copyWith(objects: [...page.objects, topmost]),
@@ -209,10 +194,7 @@ final class ImportPdfContentCommand implements DocumentCommand {
 
     var next = document.copyWith(assets: [...document.assets, asset]);
     if (currentPageObjects.isNotEmpty) {
-      var z = nextBoardSceneZIndex(
-        objects: current.objects,
-        strokes: current.strokes,
-      );
+      var z = current.nextTopLevelSceneZIndex;
       final layered = currentPageObjects
           .map((object) => copyBoardObjectWithZIndex(object, z++))
           .toList(growable: false);

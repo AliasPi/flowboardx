@@ -42,12 +42,40 @@ final class DashedInkPathBuilder {
     required Iterable<Offset> points,
     required double dashLength,
     required double gapLength,
+  }) => buildMapped<Offset>(
+    points: points,
+    xOf: _offsetX,
+    yOf: _offsetY,
+    dashLength: dashLength,
+    gapLength: gapLength,
+  );
+
+  /// Builds a dashed path without first materialising an Offset per source
+  /// point.
+  ///
+  /// Live and persisted ink already store primitive x/y coordinates. The old
+  /// `points.map((p) => Offset(...))` path allocated once per sample, while its
+  /// vector arithmetic then allocated several more Offsets per generated dash.
+  /// Dashed strokes are often long, so those temporary objects caused frequent
+  /// GC pauses on the same frame budget as live handwriting.
+  static DashedInkPath buildMapped<P>({
+    required Iterable<P> points,
+    required double Function(P point) xOf,
+    required double Function(P point) yOf,
+    required double dashLength,
+    required double gapLength,
+    double xScale = 1,
+    double yScale = 1,
   }) {
     final path = Path();
     if (!dashLength.isFinite ||
         !gapLength.isFinite ||
+        !xScale.isFinite ||
+        !yScale.isFinite ||
         dashLength <= _progressEpsilon ||
-        gapLength <= _progressEpsilon) {
+        gapLength <= _progressEpsilon ||
+        xScale == 0 ||
+        yScale == 0) {
       return DashedInkPath(path: path, commandCount: 0, wasTruncated: false);
     }
 
@@ -56,32 +84,40 @@ final class DashedInkPathBuilder {
       return DashedInkPath(path: path, commandCount: 0, wasTruncated: false);
     }
 
-    Offset? previous;
+    double? previousX;
+    double? previousY;
     var patternOffset = 0.0;
     var drawing = true;
     var continuingDash = false;
     var commandCount = 0;
     var truncated = false;
 
-    for (final end in points) {
-      if (!_isRenderable(end)) {
+    for (final point in points) {
+      final endX = xOf(point) * xScale;
+      final endY = yOf(point) * yScale;
+      if (!_isRenderableCoordinates(endX, endY)) {
         // Do not bridge over a corrupt sample.  A later valid run starts with
         // a fresh dash, which is deterministic and visually unsurprising.
-        previous = null;
+        previousX = null;
+        previousY = null;
         patternOffset = 0;
         drawing = true;
         continuingDash = false;
         continue;
       }
-      final start = previous;
-      previous = end;
-      if (start == null) continue;
+      final startX = previousX;
+      final startY = previousY;
+      previousX = endX;
+      previousY = endY;
+      if (startX == null || startY == null) continue;
 
-      final vector = end - start;
-      final length = vector.distance;
+      final vectorX = endX - startX;
+      final vectorY = endY - startY;
+      final length = math.sqrt(vectorX * vectorX + vectorY * vectorY);
       if (!length.isFinite || length <= _progressEpsilon) continue;
-      final unit = vector / length;
-      if (!_isRenderable(unit)) continue;
+      final unitX = vectorX / length;
+      final unitY = vectorY / length;
+      if (!_isRenderableCoordinates(unitX, unitY)) continue;
 
       var traversed = 0.0;
       while (traversed < length) {
@@ -133,13 +169,16 @@ final class DashedInkPathBuilder {
         }
 
         if (drawing) {
-          final from = start + unit * traversed;
-          final to = start + unit * nextTraversed;
-          if (!_isRenderable(from) || !_isRenderable(to)) {
+          final fromX = startX + unitX * traversed;
+          final fromY = startY + unitY * traversed;
+          final toX = startX + unitX * nextTraversed;
+          final toY = startY + unitY * nextTraversed;
+          if (!_isRenderableCoordinates(fromX, fromY) ||
+              !_isRenderableCoordinates(toX, toY)) {
             continuingDash = false;
           } else {
-            if (!continuingDash) path.moveTo(from.dx, from.dy);
-            path.lineTo(to.dx, to.dy);
+            if (!continuingDash) path.moveTo(fromX, fromY);
+            path.lineTo(toX, toY);
             continuingDash = true;
             commandCount++;
           }
@@ -169,9 +208,13 @@ final class DashedInkPathBuilder {
     );
   }
 
-  static bool _isRenderable(Offset point) =>
-      point.dx.isFinite &&
-      point.dy.isFinite &&
-      point.dx.abs() <= maxCoordinateMagnitude &&
-      point.dy.abs() <= maxCoordinateMagnitude;
+  static double _offsetX(Offset point) => point.dx;
+
+  static double _offsetY(Offset point) => point.dy;
+
+  static bool _isRenderableCoordinates(double x, double y) =>
+      x.isFinite &&
+      y.isFinite &&
+      x.abs() <= maxCoordinateMagnitude &&
+      y.abs() <= maxCoordinateMagnitude;
 }

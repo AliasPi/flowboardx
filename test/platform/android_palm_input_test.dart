@@ -17,6 +17,7 @@ void main() {
       const MethodCall('palmTrace', <String, Object?>{
         'traceId': '4:900:2',
         'reason': 'system_canceled',
+        'startedAsPalm': true,
         'radius': 34.5,
         'contactCount': 3,
         'points': <Object?>[
@@ -27,6 +28,10 @@ void main() {
             'radiusMajor': 34.5,
             'radiusMinor': 12.5,
             'orientation': .4,
+            'timestampMillis': 944,
+            'size': .72,
+            'pressure': .63,
+            'contactCount': 4,
           },
         ],
       }),
@@ -43,6 +48,7 @@ void main() {
     final stroke = await received;
     expect(stroke.sessionId, '4:900:2');
     expect(stroke.source, 'system_canceled');
+    expect(stroke.startedAsPalm, isTrue);
     expect(stroke.radius, 34.5);
     expect(stroke.contactCount, 3);
     expect(stroke.points, const <Offset>[Offset(120, 240), Offset(160, 250)]);
@@ -54,6 +60,10 @@ void main() {
     expect(stroke.samples.last.radiusMajor, 34.5);
     expect(stroke.samples.last.radiusMinor, 12.5);
     expect(stroke.samples.last.orientation, .4);
+    expect(stroke.samples.last.timeStamp, const Duration(milliseconds: 944));
+    expect(stroke.samples.last.normalizedSize, .72);
+    expect(stroke.samples.last.normalizedPressure, .63);
+    expect(stroke.samples.last.contactCount, 4);
   });
 
   test('malformed native messages are ignored without stream errors', () async {

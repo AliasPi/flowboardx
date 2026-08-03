@@ -26,6 +26,26 @@ void main() {
       expect(result.path.getBounds(), const Rect.fromLTRB(0, 0, 13, 0));
     });
 
+    test('builds directly from primitive coordinate models', () {
+      const points = <({double x, double y})>[
+        (x: 0, y: 0),
+        (x: 4, y: 0),
+        (x: 8, y: 0),
+        (x: 13, y: 0),
+      ];
+      final result = DashedInkPathBuilder.buildMapped(
+        points: points,
+        xOf: (point) => point.x,
+        yOf: (point) => point.y,
+        dashLength: 5,
+        gapLength: 3,
+      );
+
+      expect(result.commandCount, greaterThan(0));
+      expect(result.wasTruncated, isFalse);
+      expect(result.path.getBounds(), const Rect.fromLTRB(0, 0, 13, 0));
+    });
+
     test('breaks safely around non-finite and extreme recovered points', () {
       final result = DashedInkPathBuilder.build(
         points: const <Offset>[

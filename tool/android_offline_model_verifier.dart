@@ -10,7 +10,7 @@ import 'package:crypto/crypto.dart';
 /// `mlkit-google-ocr-models`. Merely resolving the Maven dependency is not
 /// enough evidence for a distributable build: shrinker or packaging changes
 /// must not silently remove those files from one split APK. The official
-/// PP-OCRv5 ONNX model and its metadata are additionally checked by SHA-256.
+/// PP-OCRv6 ONNX model and its metadata are additionally checked by SHA-256.
 final class AndroidOfflineModelVerifier {
   const AndroidOfflineModelVerifier();
 
@@ -30,17 +30,17 @@ final class AndroidOfflineModelVerifier {
 
   static const Map<String, String> requiredHandwritingAssetHashes =
       <String, String>{
-        'handwriting/latin_PP-OCRv5_mobile_rec.onnx':
-            '7888113072263cb471b93f66dd5e2ad70548dc526fa1ace760d0d973dd121498',
-        'handwriting/latin_PP-OCRv5_mobile_rec.yml':
-            '0bbe984570f597af3638e50bdf2e8276f3ab26a61966096538b3b0d1849f5c84',
+        'handwriting/PP-OCRv6_small_rec.onnx':
+            '5435fd747c9e0efe15a96d0b378d5bd157e9492ed8fd80edf08f30d02fa24634',
+        'handwriting/PP-OCRv6_small_rec.yml':
+            'ab078671bb49f06228eadccd34f1bb501e157f7a047095ffb943ba81512c77d1',
         'handwriting/PADDLEOCR_APACHE_2_LICENSE.txt':
             '3840c5c0c61c294264d2dd77b8777be6ddd90121ef4e0e64abcd22edea581d6e',
         'handwriting/ONNXRUNTIME_MIT_LICENSE.txt':
             '2f07c72751aed99790b8a4869cf2311df85a860b22ded05fa22803587a48922c',
       };
 
-  static const int minimumPaddleModelBytes = 8_000_000;
+  static const int minimumPaddleModelBytes = 20_000_000;
   static const int minimumOnnxRuntimeLibraryBytes = 50_000;
   static const List<String> releaseAbis = <String>[
     'armeabi-v7a',
@@ -174,7 +174,7 @@ final class AndroidOfflineModelVerifier {
     if (missingOrChangedHandwriting.isNotEmpty) {
       throw StateError(
         'Das Android-Artefakt $artifactName enthält kein unverändertes '
-        'eingebettetes PP-OCRv5-Handschriftmodell '
+        'eingebettetes PP-OCRv6-Handschriftmodell '
         '(fehlend/geändert: ${missingOrChangedHandwriting.join(', ')}).',
       );
     }
@@ -305,7 +305,7 @@ void main(List<String> arguments) {
     stdout.writeln(
       '${report.artifactName}: ${report.modelFileCount} Modelldateien, '
       '${report.uncompressedModelBytes} Byte ML Kit; '
-      '${report.handwritingAssetCount} PP-OCRv5-Assets, '
+      '${report.handwritingAssetCount} PP-OCRv6-Assets, '
       '${report.handwritingAssetBytes} Byte; '
       '${report.onnxRuntimeLibraryCount} ONNX-Runtime-Bibliotheken, '
       '${report.onnxRuntimeJavaTypeCount} JNI-Java-Typen, '

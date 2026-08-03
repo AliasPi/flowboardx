@@ -381,9 +381,7 @@ class DocumentLibraryController extends ChangeNotifier {
     }
   }
 
-  Future<DocumentLibraryOpenResult?> createDocument({
-    String title = 'Unbenanntes Whiteboard',
-  }) async {
+  Future<DocumentLibraryOpenResult?> createDocument({String? title}) async {
     if (_creating) return null;
     _creating = true;
     _operationError = null;
@@ -395,10 +393,14 @@ class DocumentLibraryController extends ChangeNotifier {
           'Das neue Dokument konnte keine gültige ID erhalten.',
         );
       }
+      final creationTime = _clock();
+      final normalizedTitle = title?.trim();
       final document = WhiteboardDocument.create(
         id: id,
-        title: _normalizedTitle(title),
-        now: _clock().toUtc(),
+        title: normalizedTitle == null || normalizedTitle.isEmpty
+            ? null
+            : normalizedTitle,
+        now: creationTime,
       );
       await repository.save(document);
       final directory = await repository.assetDirectory(document.id);
@@ -767,11 +769,6 @@ class DocumentLibraryController extends ChangeNotifier {
     _loadGeneration++;
     super.dispose();
   }
-}
-
-String _normalizedTitle(String title) {
-  final normalized = title.trim();
-  return normalized.isEmpty ? 'Unbenanntes Whiteboard' : normalized;
 }
 
 String _messageFor(Object error, {required String fallback}) {

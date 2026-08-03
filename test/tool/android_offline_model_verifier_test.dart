@@ -8,7 +8,11 @@ void main() {
     for (final entry
         in AndroidOfflineModelVerifier.requiredHandwritingAssetHashes.entries)
       'base/assets/${entry.key}': OfflineAssetEvidence(
-        size: entry.key.endsWith('.onnx') ? 8042023 : 12000,
+        size: entry.key.endsWith('.onnx')
+            ? 21159378
+            : entry.key.endsWith('.yml')
+            ? 150579
+            : 12000,
         sha256: entry.value,
       ),
   };
@@ -84,7 +88,7 @@ void main() {
       (path) => path.endsWith('.onnx'),
     );
     changed[modelPath] = const OfflineAssetEvidence(
-      size: 8042023,
+      size: 21159378,
       sha256: '00',
     );
 
@@ -100,7 +104,7 @@ void main() {
         isA<StateError>().having(
           (error) => error.message,
           'message',
-          contains('PP-OCRv5-Handschriftmodell'),
+          contains('PP-OCRv6-Handschriftmodell'),
         ),
       ),
     );

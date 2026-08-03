@@ -46,6 +46,7 @@ final class BoardPointerIndicatorPainter extends CustomPainter {
     required this.tool,
     required this.brushWidth,
     required this.viewportScale,
+    this.paintOrigin = Offset.zero,
   });
 
   final List<BoardPointerIndicator> indicators;
@@ -53,6 +54,7 @@ final class BoardPointerIndicatorPainter extends CustomPainter {
   final BoardTool tool;
   final double brushWidth;
   final double viewportScale;
+  final Offset paintOrigin;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -104,45 +106,46 @@ final class BoardPointerIndicatorPainter extends CustomPainter {
       ..style = PaintingStyle.stroke
       ..strokeCap = StrokeCap.round
       ..strokeJoin = StrokeJoin.round;
+    final position = indicator.position - paintOrigin;
     switch (indicator.kind) {
       case BoardPointerIndicatorKind.ink:
         paint
           ..color = FlowboardColors.mint.withValues(alpha: .82)
           ..strokeWidth = 1.25;
-        canvas.drawCircle(indicator.position, radius, paint);
+        canvas.drawCircle(position, radius, paint);
       case BoardPointerIndicatorKind.eraser:
         paint
           ..color = FlowboardColors.warning.withValues(alpha: .9)
           ..strokeWidth = 1.6;
-        canvas.drawCircle(indicator.position, radius, paint);
+        canvas.drawCircle(position, radius, paint);
       case BoardPointerIndicatorKind.selection:
         paint
           ..color = FlowboardColors.blue.withValues(alpha: .9)
           ..strokeWidth = 1.4;
-        canvas.drawCircle(indicator.position, radius, paint);
+        canvas.drawCircle(position, radius, paint);
         canvas.drawLine(
-          indicator.position - Offset(radius + 3, 0),
-          indicator.position + Offset(radius + 3, 0),
+          position - Offset(radius + 3, 0),
+          position + Offset(radius + 3, 0),
           paint,
         );
         canvas.drawLine(
-          indicator.position - Offset(0, radius + 3),
-          indicator.position + Offset(0, radius + 3),
+          position - Offset(0, radius + 3),
+          position + Offset(0, radius + 3),
           paint,
         );
       case BoardPointerIndicatorKind.shape:
         paint
           ..color = FlowboardColors.mint.withValues(alpha: .88)
           ..strokeWidth = 1.4;
-        canvas.drawCircle(indicator.position, radius, paint);
+        canvas.drawCircle(position, radius, paint);
         canvas.drawLine(
-          indicator.position - Offset(radius + 2, 0),
-          indicator.position + Offset(radius + 2, 0),
+          position - Offset(radius + 2, 0),
+          position + Offset(radius + 2, 0),
           paint,
         );
         canvas.drawLine(
-          indicator.position - Offset(0, radius + 2),
-          indicator.position + Offset(0, radius + 2),
+          position - Offset(0, radius + 2),
+          position + Offset(0, radius + 2),
           paint,
         );
     }
@@ -154,5 +157,6 @@ final class BoardPointerIndicatorPainter extends CustomPainter {
       oldDelegate.hoverPosition != hoverPosition ||
       oldDelegate.tool != tool ||
       oldDelegate.brushWidth != brushWidth ||
-      oldDelegate.viewportScale != viewportScale;
+      oldDelegate.viewportScale != viewportScale ||
+      oldDelegate.paintOrigin != paintOrigin;
 }

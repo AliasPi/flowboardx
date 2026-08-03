@@ -15,6 +15,7 @@ class PersistedInkLayer extends StatefulWidget {
     required this.worldToScreenOffset,
     this.worldClip,
     this.selectionIds = const <String>{},
+    this.isolateRepaints = true,
     super.key,
   });
 
@@ -23,6 +24,7 @@ class PersistedInkLayer extends StatefulWidget {
   final Offset worldToScreenOffset;
   final Rect2? worldClip;
   final Set<String> selectionIds;
+  final bool isolateRepaints;
 
   @override
   State<PersistedInkLayer> createState() => _PersistedInkLayerState();
@@ -32,6 +34,18 @@ class _PersistedInkLayerState extends State<PersistedInkLayer> {
   final InkPictureCache _cache = InkPictureCache(livePreview: false);
 
   @override
+  void didUpdateWidget(covariant PersistedInkLayer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!identical(oldWidget.strokes, widget.strokes) ||
+        !setEquals(oldWidget.selectionIds, widget.selectionIds)) {
+      // Persisted ink is rendered exclusively by bounded batch pictures.
+      // Selection halos are painted underneath those batches, so no historical
+      // per-stroke picture may survive selection changes.
+      _cache.retainOnly(const <String>{});
+    }
+  }
+
+  @override
   void dispose() {
     _cache.dispose();
     super.dispose();
@@ -39,18 +53,19 @@ class _PersistedInkLayerState extends State<PersistedInkLayer> {
 
   @override
   Widget build(BuildContext context) {
-    return RepaintBoundary(
-      child: CustomPaint(
-        painter: PersistedInkPainter(
-          strokes: widget.strokes,
-          worldToScreenScale: widget.worldToScreenScale,
-          worldToScreenOffset: widget.worldToScreenOffset,
-          worldClip: widget.worldClip,
-          selectionIds: widget.selectionIds,
-          cache: _cache,
-        ),
+    final paint = CustomPaint(
+      painter: PersistedInkPainter(
+        strokes: widget.strokes,
+        worldToScreenScale: widget.worldToScreenScale,
+        worldToScreenOffset: widget.worldToScreenOffset,
+        worldClip: widget.worldClip,
+        selectionIds: widget.selectionIds,
+        cache: _cache,
       ),
     );
+    return widget.isolateRepaints
+        ? RepaintBoundary(child: paint)
+        : ClipRect(child: paint);
   }
 }
 
@@ -79,28 +94,31 @@ class PersistedInkPainter extends CustomPainter {
         scale <= 0 ||
         !worldToScreenOffset.dx.isFinite ||
         !worldToScreenOffset.dy.isFinite) {
-      // Invalid recovered viewport data must not keep pictures for strokes
-      // that have already disappeared while painting is temporarily skipped.
-      cache.retainOnly(const <String>{});
+      // Recovered invalid viewport data is ignored defensively.
       return;
     }
-    final retained = <String>{for (final stroke in strokes) stroke.id};
     canvas
       ..save()
       ..translate(worldToScreenOffset.dx, worldToScreenOffset.dy)
       ..scale(scale);
-    for (final stroke in strokes) {
-      if (stroke.points.isEmpty ||
-          (worldClip != null && !stroke.bounds.intersects(worldClip!))) {
-        continue;
-      }
-      if (selectionIds.contains(stroke.id)) {
+    // Paint selection decoration first. The immutable base batches then cover
+    // the centre of the halo and render every stroke exactly once. In
+    // particular, a translucent marker must not be alpha-blended twice merely
+    // because it is selected.
+    if (selectionIds.isNotEmpty) {
+      for (final stroke in strokes) {
+        if (!selectionIds.contains(stroke.id) ||
+            stroke.points.isEmpty ||
+            (worldClip != null && !stroke.bounds.intersects(worldClip!))) {
+          continue;
+        }
         InkPainter.drawSelectionHalo(canvas, stroke, scale);
       }
-      canvas.drawPicture(cache.pictureFor(stroke));
+    }
+    for (final picture in cache.batchPicturesFor(strokes)) {
+      canvas.drawPicture(picture);
     }
     canvas.restore();
-    cache.retainOnly(retained);
   }
 
   @override

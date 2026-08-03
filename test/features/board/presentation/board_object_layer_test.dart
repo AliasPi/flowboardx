@@ -2,6 +2,7 @@ import 'dart:typed_data';
 
 import 'package:flowboard_x/src/domain/model/board_object.dart';
 import 'package:flowboard_x/src/domain/model/geometry.dart';
+import 'package:flowboard_x/src/domain/model/ink.dart';
 import 'package:flowboard_x/src/features/board/presentation/board_object_layer.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -145,6 +146,286 @@ void main() {
       expect(await pump(alreadyOrdered: false), <String>['back', 'front']);
       expect(await pump(alreadyOrdered: true), <String>['front', 'back']);
     });
+
+    testWidgets('omits identity transform, opacity and content stack nodes', (
+      tester,
+    ) async {
+      final shape = ShapeObject(id: 'plain', transform: transform);
+      await tester.pumpWidget(
+        MaterialApp(
+          home: SizedBox(
+            width: 400,
+            height: 300,
+            child: BoardObjectLayer(
+              objects: <BoardObject>[shape],
+              annotationLayers: const <ObjectInkLayer>[],
+              scale: 1,
+              offset: Offset.zero,
+              assets: const _NoAssets(),
+            ),
+          ),
+        ),
+      );
+
+      final object = find.byKey(const ValueKey<String>('board-object-plain'));
+      expect(
+        find.descendant(of: object, matching: find.byType(Transform)),
+        findsNothing,
+      );
+      expect(
+        find.descendant(of: object, matching: find.byType(Opacity)),
+        findsNothing,
+      );
+      expect(
+        find.descendant(of: object, matching: find.byType(Stack)),
+        findsNothing,
+      );
+    });
+
+    testWidgets('reuses recorded object annotation while viewport zooms', (
+      tester,
+    ) async {
+      final shape = ShapeObject(id: 'annotated', transform: transform);
+      final objects = <BoardObject>[shape];
+      final annotations = <ObjectInkLayer>[_layer('annotation', shape.id)];
+
+      Future<CustomPainter?> pump(double scale) async {
+        await tester.pumpWidget(
+          MaterialApp(
+            home: SizedBox(
+              width: 500,
+              height: 400,
+              child: BoardObjectLayer(
+                objects: objects,
+                annotationLayers: annotations,
+                scale: scale,
+                offset: Offset.zero,
+                assets: const _NoAssets(),
+              ),
+            ),
+          ),
+        );
+        final annotation = find.byKey(
+          const ValueKey<String>('board-annotation-annotated'),
+        );
+        return tester
+            .widget<CustomPaint>(
+              find.descendant(
+                of: annotation,
+                matching: find.byType(CustomPaint),
+              ),
+            )
+            .painter;
+      }
+
+      final initialPainter = await pump(1);
+      final zoomedPainter = await pump(1.37);
+      expect(zoomedPainter, same(initialPainter));
+    });
+
+    testWidgets(
+      'bounds annotation recording work while hundreds of strokes append',
+      (tester) async {
+        var layer = ObjectInkLayer(
+          id: 'dense-annotation',
+          objectId: 'shape',
+          strokes: List<InkStroke>.generate(256, _annotationStroke),
+        );
+        final cache = ObjectAnnotationPictureCache();
+        addTearDown(cache.dispose);
+
+        cache.update(layer: layer, logicalSize: const Size(120, 80));
+        expect(cache.debugFullRebuildCount, 1);
+        expect(cache.debugLastRecordedStrokeCount, 256);
+        expect(cache.debugPictureCount, 8);
+
+        for (var index = 256; index < 768; index++) {
+          layer = layer.appendStroke(_annotationStroke(index));
+          cache.update(layer: layer, logicalSize: const Size(120, 80));
+          expect(
+            cache.debugLastRecordedStrokeCount,
+            lessThanOrEqualTo(ObjectAnnotationPictureCache.strokesPerPicture),
+          );
+        }
+        expect(cache.debugFullRebuildCount, 1);
+        expect(cache.debugPictureCount, 24);
+
+        final recordedBeforeUniformResize = cache.debugRecordedStrokeCount;
+        cache.update(layer: layer, logicalSize: const Size(300, 200));
+        expect(
+          cache.debugRecordedStrokeCount,
+          recordedBeforeUniformResize,
+          reason: 'Uniform object resize should reuse vector pictures.',
+        );
+
+        cache.update(layer: layer, logicalSize: const Size(300, 300));
+        expect(cache.debugFullRebuildCount, 2);
+        expect(cache.debugLastRecordedStrokeCount, 768);
+
+        final replaced = layer.copyWith(
+          strokes: <InkStroke>[
+            ...layer.strokes.take(layer.strokes.length - 1),
+            _annotationStroke(9999),
+          ],
+        );
+        cache.update(layer: replaced, logicalSize: const Size(300, 300));
+        expect(
+          cache.debugFullRebuildCount,
+          3,
+          reason: 'A replace must never be mistaken for an append.',
+        );
+
+        cache.dispose();
+        expect(cache.debugPictureDisposeCount, cache.debugPictureCreateCount);
+      },
+    );
+
+    testWidgets('reuses text layout while only viewport zoom changes', (
+      tester,
+    ) async {
+      final text = TextObject(
+        id: 'text',
+        transform: transform,
+        text: 'Ein stabil zwischengespeicherter Absatz',
+      );
+      final objects = <BoardObject>[text];
+
+      Future<BoardTextPainter> pump(double scale) async {
+        await tester.pumpWidget(
+          MaterialApp(
+            home: SizedBox(
+              width: 500,
+              height: 400,
+              child: BoardObjectLayer(
+                objects: objects,
+                annotationLayers: const <ObjectInkLayer>[],
+                scale: scale,
+                offset: Offset.zero,
+                assets: const _NoAssets(),
+              ),
+            ),
+          ),
+        );
+        return tester
+                .widget<CustomPaint>(
+                  find.byKey(const ValueKey<String>('board-text-text')),
+                )
+                .painter!
+            as BoardTextPainter;
+      }
+
+      final initial = await pump(1);
+      expect(initial.debugUsesPersistentLayoutCache, isTrue);
+      expect(initial.debugLayoutCount, 1);
+
+      final zoomed = await pump(1.37);
+      expect(zoomed.debugUsesPersistentLayoutCache, isTrue);
+      expect(zoomed.debugLayoutCount, 1);
+    });
+
+    testWidgets(
+      'does not retain a giant raster layer for an oversized object',
+      (tester) async {
+        final oversized = ShapeObject(
+          id: 'oversized',
+          transform: const ObjectTransform(
+            x: 0,
+            y: 0,
+            width: 100000,
+            height: 100000,
+          ),
+        );
+        await tester.pumpWidget(
+          MaterialApp(
+            home: SizedBox(
+              width: 800,
+              height: 600,
+              child: BoardObjectLayer(
+                objects: <BoardObject>[oversized],
+                annotationLayers: const <ObjectInkLayer>[],
+                scale: 1,
+                offset: Offset.zero,
+                assets: const _NoAssets(),
+              ),
+            ),
+          ),
+        );
+
+        final object = find.byKey(
+          const ValueKey<String>('board-object-oversized'),
+        );
+        expect(object, findsOneWidget);
+        expect(
+          find.descendant(of: object, matching: find.byType(RepaintBoundary)),
+          findsNothing,
+        );
+      },
+    );
+
+    testWidgets('ignores a malformed object transform defensively', (
+      tester,
+    ) async {
+      final malformed = ShapeObject(
+        id: 'malformed',
+        transform: const ObjectTransform(
+          x: double.nan,
+          y: 0,
+          width: 40,
+          height: 40,
+        ),
+      );
+      await tester.pumpWidget(
+        MaterialApp(
+          home: SizedBox(
+            width: 800,
+            height: 600,
+            child: BoardObjectLayer(
+              objects: <BoardObject>[malformed],
+              annotationLayers: const <ObjectInkLayer>[],
+              scale: 1,
+              offset: Offset.zero,
+              assets: const _NoAssets(),
+            ),
+          ),
+        ),
+      );
+
+      expect(
+        find.byKey(const ValueKey<String>('board-object-malformed')),
+        findsNothing,
+      );
+      expect(tester.takeException(), isNull);
+    });
+  });
+
+  group('boardObjectShouldIsolateRepaint', () {
+    test('bounds retained raster dimensions and area', () {
+      expect(boardObjectShouldIsolateRepaint(const Size(800, 600)), isTrue);
+      expect(boardObjectShouldIsolateRepaint(const Size(3000, 100)), isFalse);
+      expect(boardObjectShouldIsolateRepaint(const Size(1800, 1800)), isFalse);
+      expect(
+        boardObjectShouldIsolateRepaint(const Size(double.infinity, 100)),
+        isFalse,
+      );
+    });
+  });
+
+  group('boardObjectRasterScaleTier', () {
+    test('rounds up and remains stable inside a PDF zoom band', () {
+      expect(boardObjectRasterScaleTier(.76), 1);
+      expect(boardObjectRasterScaleTier(.99), 1);
+      expect(boardObjectRasterScaleTier(1), 1);
+      expect(boardObjectRasterScaleTier(1.01), 1.5);
+      expect(boardObjectRasterScaleTier(1.49), 1.5);
+      expect(boardObjectRasterScaleTier(2.01), 3);
+    });
+
+    test('defensively bounds invalid and extreme scales', () {
+      expect(boardObjectRasterScaleTier(double.nan), 1);
+      expect(boardObjectRasterScaleTier(0), 1);
+      expect(boardObjectRasterScaleTier(-4), 1);
+      expect(boardObjectRasterScaleTier(1000), 16);
+    });
   });
 }
 
@@ -163,6 +444,25 @@ ObjectInkLayer _layer(
   objectId: objectId,
   pdfPageIndex: page,
   visible: visible,
+);
+
+InkStroke _annotationStroke(int index) => InkStroke(
+  id: 'annotation-$index',
+  points: <InkPoint>[
+    InkPoint(x: (index % 17) / 18, y: (index % 13) / 14, pressure: .65),
+    InkPoint(
+      x: ((index + 1) % 17) / 18,
+      y: ((index + 2) % 13) / 14,
+      pressure: .72,
+    ),
+    InkPoint(
+      x: ((index + 2) % 17) / 18,
+      y: ((index + 4) % 13) / 14,
+      pressure: .8,
+    ),
+  ],
+  width: .025,
+  type: InkToolType.normal,
 );
 
 class _NoAssets implements BoardAssetResolver {

@@ -31,7 +31,8 @@ import kotlin.math.min
 
 /**
  * Offline handwriting adapter backed primarily by the APK-bundled
- * PP-OCRv5 Latin handwriting model, executed through ONNX Runtime.
+ * PP-OCRv6 handwriting model, executed through ONNX Runtime with a
+ * Latin-script decoder mask for the requested languages.
  *
  * Flowboard keeps ink as vectors. For recognition only, this service renders a
  * tightly cropped, high-contrast line bitmap off the Android main thread.
@@ -66,6 +67,37 @@ class AndroidHandwritingRecognitionService(
     @Volatile
     private var disposed = false
 
+    private val releaseIdleResources = Runnable {
+        if (disposed) return@Runnable
+        try {
+            rasterExecutor.execute {
+                if (disposed ||
+                    pendingRequests.get() != 0 ||
+                    activeNativeTasks.get() != 0
+                ) {
+                    scheduleIdleResourceRelease()
+                    return@execute
+                }
+                paddleRecognizer?.releaseIdleResources()
+                val idleFallback = synchronized(fallbackRecognizerLock) {
+                    fallbackRecognizer.also {
+                        fallbackRecognizer = null
+                        // Closing an idle client is a memory optimization, not
+                        // a permanent initialization failure. A later explicit
+                        // conversion may create a fresh bundled client.
+                        fallbackRecognizerInitializationAttempted = false
+                    }
+                }
+                idleFallback?.let(::closeFallbackRecognizer)
+            }
+        } catch (error: Throwable) {
+            rethrowVirtualMachineError(error)
+            if (!disposed) {
+                Log.w(TAG, "Could not schedule idle OCR resource release", error)
+            }
+        }
+    }
+
     init {
         channel.setMethodCallHandler(::handleMethodCall)
     }
@@ -76,16 +108,16 @@ class AndroidHandwritingRecognitionService(
                 // In particular catch LinkageError/ExceptionInInitializerError.
                 // Paddle is an optional primary engine; its failure must never
                 // prevent the independent ML Kit fallback from starting.
-                Log.e(TAG, "Bundled PP-OCRv5 engine could not be prepared", error)
+                Log.e(TAG, "Bundled PP-OCRv6 engine could not be prepared", error)
             },
         ) {
             PaddleOcrHandwritingRecognizer(context)
         }
 
     /**
-     * ML Kit is a compatibility fallback, not a second opinion after a
-     * successful Paddle run. Delaying construction keeps its model and native
-     * runtime out of memory on the normal bundled-Paddle path.
+     * ML Kit is a lazy, independent compatibility/corroboration engine.
+     * Delaying construction keeps its model and native runtime out of memory
+     * when Paddle already produced a strongly verified result.
      */
     private fun getOrCreateFallbackRecognizer(): TextRecognizer? {
         fallbackRecognizer?.let { return it }
@@ -142,13 +174,14 @@ class AndroidHandwritingRecognitionService(
         runCatching { failedRecognizer.close() }
             .onFailure { closeError ->
                 rethrowVirtualMachineError(closeError)
-                Log.w(TAG, "Could not close failed PP-OCRv5 engine", closeError)
+                Log.w(TAG, "Could not close failed PP-OCRv6 engine", closeError)
             }
-        Log.w(TAG, "Bundled PP-OCRv5 disabled; using Latin OCR fallback", error)
+        Log.w(TAG, "Bundled PP-OCRv6 disabled; using Latin OCR fallback", error)
     }
 
     fun dispose() {
         disposed = true
+        mainHandler.removeCallbacks(releaseIdleResources)
         channel.setMethodCallHandler(null)
         // OrtSession.run is native and ignores Thread.interrupt(). Ask ORT to
         // stop an active inference before the worker is drained.
@@ -183,6 +216,7 @@ class AndroidHandwritingRecognitionService(
     }
 
     private fun recognize(arguments: Any?, result: MethodChannel.Result) {
+        mainHandler.removeCallbacks(releaseIdleResources)
         if (paddleRecognizer?.hasBundledAssets() != true &&
             getOrCreateFallbackRecognizer() == null
         ) {
@@ -350,9 +384,13 @@ class AndroidHandwritingRecognitionService(
 
     /**
      * Printed-text OCR is less tolerant of raw pen geometry than Windows Ink.
-     * Use several small, handwriting-sized rasterizations before declaring a
-     * valid request unrecognized. All attempts use the Latin model linked into
-     * the APK; this method never downloads or installs a model.
+     * The bundled Paddle model is therefore evaluated against the geometric
+     * line/word structure of the selected vector ink. A technically completed
+     * inference is not automatically a trustworthy transcription: uncertain
+     * Paddle output is corroborated by a genuinely separate bundled ML Kit
+     * engine before source ink can be replaced.
+     *
+     * Every attempt runs off the UI thread and uses only APK-bundled assets.
      */
     private fun recognizeWithOfflineFallbacks(
         request: RecognitionRequest,
@@ -364,14 +402,16 @@ class AndroidHandwritingRecognitionService(
         var completedAttempt = false
         var timedOut = false
         var lastFailure: Throwable? = null
-        val candidates = ArrayList<OcrCandidate>(
-            PRIMARY_RENDER_STYLES.size + RECOVERY_RENDER_STYLES.size + 2,
-        )
+        val candidates = ArrayList<OcrCandidate>(12)
         val lines = HandwritingInkPreprocessor
             .splitIntoLines(request.strokes)
             .ifEmpty { listOf(request.strokes) }
-        val lineCountHint = lines.size.coerceIn(1, MAX_LINE_FALLBACKS)
-        val normalizedRequest = RecognitionRequest(lines.flatten())
+        val lineCountHint = lines.size.coerceAtLeast(1)
+        val canSegmentEveryLine = lines.size <= MAX_LINE_FALLBACKS
+        val normalizedRequest = RecognitionRequest(
+            strokes = lines.flatten(),
+            languageTag = request.languageTag,
+        )
         val wordsByLine = lines.map(HandwritingInkPreprocessor::splitIntoWords)
         val expectedWordCount = wordsByLine.sumOf { it.size }
 
@@ -380,9 +420,10 @@ class AndroidHandwritingRecognitionService(
             style: RenderStyle,
             label: String,
         ): OcrCandidate? {
+            if (!canSegmentEveryLine) return null
             val recognizedLines = ArrayList<OcrCandidate>(lines.size)
             var completePaddleResult = true
-            for (line in lines.take(MAX_LINE_FALLBACKS)) {
+            for (line in lines) {
                 if (System.nanoTime() >= deadlineNanos) {
                     timedOut = true
                     completePaddleResult = false
@@ -390,7 +431,7 @@ class AndroidHandwritingRecognitionService(
                 }
                 attempts++
                 val bitmap = renderInk(
-                    RecognitionRequest(line),
+                    RecognitionRequest(line, request.languageTag),
                     style,
                     1,
                 )
@@ -409,11 +450,23 @@ class AndroidHandwritingRecognitionService(
                         completePaddleResult = false
                         break
                     }
+                    val textQuality = HandwritingTextQualityPolicy.evaluate(
+                        recognized.text,
+                        request.languageTag,
+                    )
+                    if (textQuality.normalizedText.isEmpty()) {
+                        completePaddleResult = false
+                        break
+                    }
                     recognizedLines += OcrCandidate(
-                        text = recognized.text,
+                        text = textQuality.normalizedText,
                         confidence = recognized.confidence,
-                        quality = candidateTextQuality(recognized.text),
+                        quality = textQuality.quality,
                         layoutFidelity = 1.0,
+                        backend = HandwritingRecognitionBackend.PADDLE_OCR,
+                        segmentationEvidence =
+                            CandidateSegmentationEvidence.LINES,
+                        profile = label,
                     )
                 } catch (error: Throwable) {
                     rethrowVirtualMachineError(error)
@@ -425,7 +478,11 @@ class AndroidHandwritingRecognitionService(
                     }
                     if (error is InterruptedException) {
                         Thread.currentThread().interrupt()
+                        break
                     }
+                    // A deadline termination is request-local. Disabling the
+                    // model after it merely makes every later conversion on
+                    // this process worse.
                     disablePaddleRecognizer(engine, error)
                     break
                 } finally {
@@ -435,11 +492,98 @@ class AndroidHandwritingRecognitionService(
             if (!completePaddleResult || recognizedLines.size != lines.size) {
                 return null
             }
-            Log.d(TAG, "Bundled PP-OCRv5 $label profile completed")
-            return combineLineCandidates(recognizedLines)
+            Log.d(TAG, "Bundled PP-OCRv6 $label profile completed")
+            return combineLineCandidates(
+                lines = recognizedLines,
+                languageTag = request.languageTag,
+                segmentationEvidence = CandidateSegmentationEvidence.LINES,
+                profile = label,
+            )
         }
 
-        fun paddleOutcome(candidate: OcrCandidate?): RecognitionOutcome {
+        fun runPaddleWordProfile(
+            engine: PaddleOcrHandwritingRecognizer,
+        ): OcrCandidate? {
+            if (!canSegmentEveryLine ||
+                expectedWordCount !in 2..MAX_WORD_FALLBACKS
+            ) {
+                return null
+            }
+            val recognizedLines = ArrayList<OcrCandidate>(wordsByLine.size)
+            for ((lineIndex, words) in wordsByLine.withIndex()) {
+                val recognizedWords = ArrayList<OcrCandidate>(words.size)
+                for ((wordIndex, word) in words.withIndex()) {
+                    if (System.nanoTime() >= deadlineNanos) {
+                        timedOut = true
+                        return null
+                    }
+                    attempts++
+                    val bitmap = renderInk(
+                        RecognitionRequest(word, request.languageTag),
+                        WORD_RENDER_STYLE,
+                        1,
+                    )
+                    try {
+                        val recognized = engine.recognize(bitmap, deadlineNanos)
+                        completedAttempt = true
+                        if (System.nanoTime() >= deadlineNanos) {
+                            timedOut = true
+                            return null
+                        }
+                        if (recognized == null) return null
+                        val textQuality = HandwritingTextQualityPolicy.evaluate(
+                            recognized.text,
+                            request.languageTag,
+                        )
+                        if (textQuality.normalizedText.isEmpty()) return null
+                        recognizedWords += OcrCandidate(
+                            text = textQuality.normalizedText
+                                .replace(WHITESPACE, " ")
+                                .trim(),
+                            confidence = recognized.confidence,
+                            quality = textQuality.quality,
+                            layoutFidelity = 1.0,
+                            backend =
+                                HandwritingRecognitionBackend.PADDLE_OCR,
+                            segmentationEvidence =
+                                CandidateSegmentationEvidence.WORDS,
+                            profile = "word-$lineIndex-$wordIndex",
+                        )
+                    } catch (error: Throwable) {
+                        rethrowVirtualMachineError(error)
+                        lastFailure = error
+                        if (System.nanoTime() >= deadlineNanos || disposed) {
+                            timedOut = true
+                            return null
+                        }
+                        if (error is InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            return null
+                        }
+                        disablePaddleRecognizer(engine, error)
+                        return null
+                    } finally {
+                        bitmap.recycle()
+                    }
+                }
+                if (recognizedWords.size != words.size) return null
+                recognizedLines += combineWordCandidates(
+                    words = recognizedWords,
+                    languageTag = request.languageTag,
+                    profile = "word-line-$lineIndex",
+                )
+            }
+            if (recognizedLines.size != wordsByLine.size) return null
+            Log.d(TAG, "Bundled PP-OCRv6 geometric word profile completed")
+            return combineLineCandidates(
+                lines = recognizedLines,
+                languageTag = request.languageTag,
+                segmentationEvidence = CandidateSegmentationEvidence.WORDS,
+                profile = "word-segmented",
+            )
+        }
+
+        fun outcome(candidate: OcrCandidate?): RecognitionOutcome {
             val durationMillis = TimeUnit.NANOSECONDS
                 .toMillis(System.nanoTime() - startedNanos)
                 .coerceIn(0L, Int.MAX_VALUE.toLong())
@@ -454,10 +598,11 @@ class AndroidHandwritingRecognitionService(
             )
         }
 
-        // A single moderate-confidence raster must not replace the selected ink
-        // before any independent evidence is available. Very strong geometry-
-        // consistent output may return directly; otherwise use a second Paddle
-        // raster. ML Kit is only initialized if Paddle cannot execute at all.
+        // A single moderate-confidence raster must not replace selected ink.
+        // A very strong, layout-consistent result can finish immediately;
+        // otherwise geometric word evidence and an independent engine remain
+        // reachable. The old implementation returned here after any completed
+        // ORT call, even when its candidate was known to be weak.
         val localPaddle = paddleRecognizer
         if (localPaddle != null &&
             !disposed &&
@@ -478,13 +623,14 @@ class AndroidHandwritingRecognitionService(
                         expectedWordCount = expectedWordCount,
                     )
                 ) {
-                    return paddleOutcome(primaryPaddle)
+                    return outcome(primaryPaddle)
                 }
             }
 
             if (!timedOut &&
                 paddleRecognizer === localPaddle &&
-                PADDLE_RENDER_STYLES.size > 1
+                PADDLE_RENDER_STYLES.size > 1 &&
+                expectedWordCount <= 1
             ) {
                 val confirmingPaddle = runPaddleProfile(
                     localPaddle,
@@ -493,49 +639,81 @@ class AndroidHandwritingRecognitionService(
                 )
                 if (confirmingPaddle != null) {
                     candidates += confirmingPaddle
-                    if (primaryPaddle != null &&
-                        PaddleCandidatePolicy.hasIndependentRasterConsensus(
-                            firstConfidence = primaryPaddle.confidence,
-                            firstQuality = primaryPaddle.quality,
-                            secondConfidence = confirmingPaddle.confidence,
-                            secondQuality = confirmingPaddle.quality,
-                            similarity = candidateSimilarity(
-                                primaryPaddle.text,
-                                confirmingPaddle.text,
-                            ),
-                        )
-                    ) {
-                        val agreed = chooseBestCandidate(
-                            listOf(primaryPaddle, confirmingPaddle),
-                            expectedLineCount = lines.size,
-                            expectedWordCount = expectedWordCount,
-                        ) ?: primaryPaddle
-                        return paddleOutcome(agreed)
-                    }
                 }
             }
-        }
 
-        if (completedAttempt) {
-            // ORT completed successfully, so do not retain a second OCR runtime
-            // merely to obtain another opinion. Preserve any candidate which
-            // already satisfies the common acceptance policy; otherwise report
-            // a safe not-recognized result and leave the source ink untouched.
-            val acceptedPaddle = chooseBestCandidate(
-                candidates.filter { candidate ->
-                    candidateIsAcceptable(
-                        candidate,
-                        candidates = candidates,
+            // The strong direct path already returned above. For every other
+            // multi-word selection, recognize the geometric words themselves
+            // instead of spending the budget on another correlated full-line
+            // raster. This is especially important for very wide board text.
+            if (expectedWordCount in 2..MAX_WORD_FALLBACKS &&
+                !timedOut &&
+                paddleRecognizer === localPaddle
+            ) {
+                runPaddleWordProfile(localPaddle)?.let(candidates::add)
+            }
+
+            var bestPaddle = chooseBestCandidate(
+                candidates,
+                expectedLineCount = lines.size,
+                expectedWordCount = expectedWordCount,
+            )
+            if (!timedOut &&
+                paddleRecognizer === localPaddle &&
+                (
+                    bestPaddle == null ||
+                        !candidateIsAcceptable(
+                            bestPaddle,
+                            candidates,
+                            lines.size,
+                            expectedWordCount,
+                        )
+                    )
+            ) {
+                for (style in RECOVERY_RENDER_STYLES) {
+                    runPaddleProfile(
+                        localPaddle,
+                        style,
+                        "recovery-${style.targetLineHeight.toInt()}",
+                    )?.let(candidates::add)
+                    bestPaddle = chooseBestCandidate(
+                        candidates,
                         expectedLineCount = lines.size,
                         expectedWordCount = expectedWordCount,
                     )
+                    if (bestPaddle != null &&
+                        candidateIsAcceptable(
+                            bestPaddle,
+                            candidates,
+                            lines.size,
+                            expectedWordCount,
+                        )
+                    ) {
+                        break
+                    }
+                    if (timedOut) break
+                }
+            }
+
+            val acceptedPaddle = chooseBestCandidate(
+                candidates.filter { candidate ->
+                    candidate.backend == HandwritingRecognitionBackend.PADDLE_OCR &&
+                        candidateIsAcceptable(
+                            candidate,
+                            candidates,
+                            lines.size,
+                            expectedWordCount,
+                        )
                 },
                 expectedLineCount = lines.size,
                 expectedWordCount = expectedWordCount,
             )
-            return paddleOutcome(acceptedPaddle)
+            if (acceptedPaddle != null) return outcome(acceptedPaddle)
         }
 
+        // Paddle completed but remained uncertain: keep its candidates and ask
+        // the separately bundled Latin OCR engine for corroboration. This path
+        // is intentionally lazy to keep steady-state memory low.
         val recognizer = getOrCreateFallbackRecognizer()
 
         fun runAttempt(
@@ -543,6 +721,7 @@ class AndroidHandwritingRecognitionService(
             style: RenderStyle,
             expectedLines: Int,
             label: String,
+            segmentationEvidence: CandidateSegmentationEvidence,
         ): OcrCandidate? {
             if (recognizer == null ||
                 timedOut ||
@@ -555,7 +734,14 @@ class AndroidHandwritingRecognitionService(
             attempts++
             val bitmap = renderInk(attemptRequest, style, expectedLines)
             try {
-                val candidate = recognizeBitmap(recognizer, bitmap, deadlineNanos)
+                val candidate = recognizeBitmap(
+                    recognizer = recognizer,
+                    bitmap = bitmap,
+                    deadlineNanos = deadlineNanos,
+                    languageTag = request.languageTag,
+                    segmentationEvidence = segmentationEvidence,
+                    profile = label,
+                )
                 completedAttempt = true
                 return candidate
             } catch (error: TimeoutException) {
@@ -581,6 +767,7 @@ class AndroidHandwritingRecognitionService(
             PRIMARY_RENDER_STYLES.first(),
             lineCountHint,
             "primary raster",
+            CandidateSegmentationEvidence.NONE,
         )?.let(candidates::add)
 
         // Multi-line ink is always recognized line-by-line once. High OCR
@@ -591,10 +778,11 @@ class AndroidHandwritingRecognitionService(
             var completeLineResult = true
             for (line in lines) {
                 val candidate = runAttempt(
-                    RecognitionRequest(line),
+                    RecognitionRequest(line, request.languageTag),
                     LINE_RENDER_STYLE,
                     1,
                     "line",
+                    CandidateSegmentationEvidence.LINES,
                 )
                 if (candidate == null) {
                     completeLineResult = false
@@ -604,7 +792,13 @@ class AndroidHandwritingRecognitionService(
             }
             // Never replace all selected ink with a partial transcription.
             if (completeLineResult && recognizedLines.size == lines.size) {
-                candidates += combineLineCandidates(recognizedLines)
+                candidates += combineLineCandidates(
+                    lines = recognizedLines,
+                    languageTag = request.languageTag,
+                    segmentationEvidence =
+                        CandidateSegmentationEvidence.LINES,
+                    profile = "mlkit-lines",
+                )
             }
         }
 
@@ -616,6 +810,7 @@ class AndroidHandwritingRecognitionService(
                 PRIMARY_RENDER_STYLES[1],
                 lineCountHint,
                 "sharp raster",
+                CandidateSegmentationEvidence.NONE,
             )?.let(candidates::add)
         }
 
@@ -647,10 +842,11 @@ class AndroidHandwritingRecognitionService(
                 val recognizedWords = ArrayList<OcrCandidate>(words.size)
                 for (word in words) {
                     val candidate = runAttempt(
-                        RecognitionRequest(word),
+                        RecognitionRequest(word, request.languageTag),
                         WORD_RENDER_STYLE,
                         1,
                         "word",
+                        CandidateSegmentationEvidence.WORDS,
                     )
                     if (candidate == null) {
                         completeWordResult = false
@@ -661,11 +857,21 @@ class AndroidHandwritingRecognitionService(
                     )
                 }
                 if (recognizedWords.size == words.size) {
-                    recognizedLines += combineWordCandidates(recognizedWords)
+                    recognizedLines += combineWordCandidates(
+                        words = recognizedWords,
+                        languageTag = request.languageTag,
+                        profile = "mlkit-words",
+                    )
                 }
             }
             if (completeWordResult && recognizedLines.size == wordsByLine.size) {
-                candidates += combineLineCandidates(recognizedLines)
+                candidates += combineLineCandidates(
+                    lines = recognizedLines,
+                    languageTag = request.languageTag,
+                    segmentationEvidence =
+                        CandidateSegmentationEvidence.WORDS,
+                    profile = "mlkit-word-segmented",
+                )
             }
         }
 
@@ -691,6 +897,7 @@ class AndroidHandwritingRecognitionService(
                     style,
                     lineCountHint,
                     "recovery raster",
+                    CandidateSegmentationEvidence.NONE,
                 )?.let(candidates::add)
                 best = chooseBestCandidate(
                     candidates,
@@ -726,34 +933,14 @@ class AndroidHandwritingRecognitionService(
             expectedLineCount = lines.size,
             expectedWordCount = expectedWordCount,
         )
-        val durationMillis = TimeUnit.NANOSECONDS
-            .toMillis(System.nanoTime() - startedNanos)
-            .coerceIn(0L, Int.MAX_VALUE.toLong())
-            .toInt()
-        if (candidate != null) {
-            return RecognitionOutcome(
-                candidate = candidate,
-                attemptCount = attempts,
-                lineCountHint = lines.size,
-                wordCountHint = expectedWordCount,
-                durationMillis = durationMillis,
-                timedOut = timedOut,
-            )
-        }
+        if (candidate != null) return outcome(candidate)
         // A deadline on a slow first invocation is an ordinary absence of a
         // candidate, not malformed handwriting. Only propagate a real engine
         // error when not one native attempt completed successfully.
         if (!completedAttempt && lastFailure != null && lastFailure !is TimeoutException) {
             throw lastFailure
         }
-        return RecognitionOutcome(
-            candidate = null,
-            attemptCount = attempts,
-            lineCountHint = lines.size,
-            wordCountHint = expectedWordCount,
-            durationMillis = durationMillis,
-            timedOut = timedOut,
-        )
+        return outcome(null)
     }
 
     /**
@@ -768,6 +955,9 @@ class AndroidHandwritingRecognitionService(
         recognizer: TextRecognizer,
         bitmap: Bitmap,
         deadlineNanos: Long,
+        languageTag: String,
+        segmentationEvidence: CandidateSegmentationEvidence,
+        profile: String,
     ): OcrCandidate? {
         val remainingNanos = deadlineNanos - System.nanoTime()
         if (remainingNanos <= 0L) {
@@ -793,7 +983,12 @@ class AndroidHandwritingRecognitionService(
         task.addOnCompleteListener(DIRECT_EXECUTOR) { releaseBitmap() }
         return try {
             val recognition = Tasks.await(task, remainingNanos, TimeUnit.NANOSECONDS)
-            candidateFromRecognition(recognition)
+            candidateFromRecognition(
+                recognition = recognition,
+                languageTag = languageTag,
+                segmentationEvidence = segmentationEvidence,
+                profile = profile,
+            )
         } finally {
             // Normally the direct listener has already run before await
             // returns. This idempotent fallback closes any scheduling race.
@@ -810,7 +1005,11 @@ class AndroidHandwritingRecognitionService(
         synchronized(nativeTaskMonitor) {
             nativeTaskMonitor.notifyAll()
         }
-        if (disposed) closeRecognizerWhenIdle()
+        if (disposed) {
+            closeRecognizerWhenIdle()
+        } else if (remaining <= 0 && pendingRequests.get() <= 0) {
+            scheduleIdleResourceRelease()
+        }
     }
 
     private fun releasePendingRequest() {
@@ -819,7 +1018,20 @@ class AndroidHandwritingRecognitionService(
             pendingRequests.set(0)
             Log.e(TAG, "Pending handwriting request accounting became negative")
         }
-        if (disposed && remaining <= 0) closeRecognizerWhenIdle()
+        if (disposed && remaining <= 0) {
+            closeRecognizerWhenIdle()
+        } else if (remaining <= 0 && activeNativeTasks.get() <= 0) {
+            scheduleIdleResourceRelease()
+        }
+    }
+
+    private fun scheduleIdleResourceRelease() {
+        if (disposed) return
+        mainHandler.removeCallbacks(releaseIdleResources)
+        mainHandler.postDelayed(
+            releaseIdleResources,
+            IDLE_RESOURCE_RELEASE_DELAY_MILLIS,
+        )
     }
 
     private fun awaitNativeTasksIdle(timeoutSeconds: Long): Boolean {
@@ -864,7 +1076,7 @@ class AndroidHandwritingRecognitionService(
         runCatching { localPaddle?.close() }
             .onFailure { error ->
                 rethrowVirtualMachineError(error)
-                Log.w(TAG, "Could not close PP-OCRv5 recognizer", error)
+                Log.w(TAG, "Could not close PP-OCRv6 recognizer", error)
             }
     }
 
@@ -885,8 +1097,17 @@ class AndroidHandwritingRecognitionService(
         }
     }
 
-    private fun candidateFromRecognition(recognition: Text): OcrCandidate? {
-        val text = normalizeRecognizedText(recognition.text)
+    private fun candidateFromRecognition(
+        recognition: Text,
+        languageTag: String,
+        segmentationEvidence: CandidateSegmentationEvidence,
+        profile: String,
+    ): OcrCandidate? {
+        val textQuality = HandwritingTextQualityPolicy.evaluate(
+            recognition.text,
+            languageTag,
+        )
+        val text = textQuality.normalizedText
         if (text.isEmpty()) return null
         var confidenceWeight = 0
         var confidenceTotal = 0.0
@@ -908,12 +1129,27 @@ class AndroidHandwritingRecognitionService(
         return OcrCandidate(
             text = text,
             confidence = confidence,
-            quality = candidateTextQuality(text),
-            layoutFidelity = 0.0,
+            quality = textQuality.quality,
+            layoutFidelity = if (
+                segmentationEvidence == CandidateSegmentationEvidence.NONE
+            ) {
+                0.0
+            } else {
+                1.0
+            },
+            backend = HandwritingRecognitionBackend.ML_KIT_LATIN_OCR,
+            segmentationEvidence = segmentationEvidence,
+            profile = profile,
         )
     }
 
-    private fun combineLineCandidates(lines: List<OcrCandidate>): OcrCandidate {
+    private fun combineLineCandidates(
+        lines: List<OcrCandidate>,
+        languageTag: String,
+        segmentationEvidence: CandidateSegmentationEvidence,
+        profile: String,
+    ): OcrCandidate {
+        require(lines.isNotEmpty()) { "Cannot combine an empty OCR line list" }
         var confidenceWeight = 0
         var confidenceTotal = 0.0
         lines.forEach { line ->
@@ -926,19 +1162,28 @@ class AndroidHandwritingRecognitionService(
         val text = lines.joinToString("\n") {
             it.text.replace(WHITESPACE, " ").trim()
         }
+        val textQuality = HandwritingTextQualityPolicy.evaluate(text, languageTag)
         return OcrCandidate(
-            text = text,
+            text = textQuality.normalizedText,
             confidence = if (confidenceWeight == 0) {
                 null
             } else {
                 (confidenceTotal / confidenceWeight).coerceIn(0.0, 1.0)
             },
-            quality = candidateTextQuality(text),
+            quality = textQuality.quality,
             layoutFidelity = 1.0,
+            backend = lines.first().backend,
+            segmentationEvidence = segmentationEvidence,
+            profile = profile,
         )
     }
 
-    private fun combineWordCandidates(words: List<OcrCandidate>): OcrCandidate {
+    private fun combineWordCandidates(
+        words: List<OcrCandidate>,
+        languageTag: String,
+        profile: String,
+    ): OcrCandidate {
+        require(words.isNotEmpty()) { "Cannot combine an empty OCR word list" }
         var confidenceWeight = 0
         var confidenceTotal = 0.0
         words.forEach { word ->
@@ -949,15 +1194,19 @@ class AndroidHandwritingRecognitionService(
             }
         }
         val text = words.joinToString(" ") { it.text.trim() }
+        val textQuality = HandwritingTextQualityPolicy.evaluate(text, languageTag)
         return OcrCandidate(
-            text = text,
+            text = textQuality.normalizedText,
             confidence = if (confidenceWeight == 0) {
                 null
             } else {
                 (confidenceTotal / confidenceWeight).coerceIn(0.0, 1.0)
             },
-            quality = candidateTextQuality(text),
+            quality = textQuality.quality,
             layoutFidelity = 1.0,
+            backend = words.first().backend,
+            segmentationEvidence = CandidateSegmentationEvidence.WORDS,
+            profile = profile,
         )
     }
 
@@ -967,13 +1216,11 @@ class AndroidHandwritingRecognitionService(
         expectedWordCount: Int? = null,
     ): OcrCandidate? {
         if (candidates.isEmpty()) return null
-        val agreement = candidates.groupingBy { canonicalCandidate(it.text) }.eachCount()
         return candidates.maxWithOrNull(
             compareBy<OcrCandidate> {
                 candidateScore(
                     candidate = it,
                     candidates = candidates,
-                    agreement = agreement,
                     expectedLineCount = expectedLineCount,
                     expectedWordCount = expectedWordCount,
                 )
@@ -985,16 +1232,22 @@ class AndroidHandwritingRecognitionService(
     private fun candidateScore(
         candidate: OcrCandidate,
         candidates: List<OcrCandidate>,
-        agreement: Map<String, Int> =
-            candidates.groupingBy { canonicalCandidate(it.text) }.eachCount(),
         expectedLineCount: Int? = null,
         expectedWordCount: Int? = null,
     ): Double {
-        val repetitions = agreement[canonicalCandidate(candidate.text)] ?: 1
-        val confidence = candidate.confidence ?: UNKNOWN_CONFIDENCE
-        val consensus = candidates
+        val independentCandidates = candidates
             .asSequence()
-            .filter { other -> other !== candidate }
+            .filter { other ->
+                other !== candidate &&
+                    candidate.hasIndependentEvidenceFrom(other)
+            }
+            .toList()
+        val repetitions = 1 + independentCandidates.count { other ->
+            canonicalCandidate(other.text) == canonicalCandidate(candidate.text)
+        }
+        val confidence = candidate.confidence ?: UNKNOWN_CONFIDENCE
+        val consensus = independentCandidates
+            .asSequence()
             .map { other -> candidateSimilarity(candidate.text, other.text) }
             .averageOrZero()
         val lineLayout = expectedLineCount?.let { expected ->
@@ -1041,45 +1294,88 @@ class AndroidHandwritingRecognitionService(
         ) {
             return false
         }
-        val strongestAgreement = candidates
+        if (PaddleCandidatePolicy.isStrongStandalone(
+                text = candidate.text,
+                confidence = candidate.confidence,
+                quality = candidate.quality,
+                expectedLineCount = expectedLineCount,
+                expectedWordCount = expectedWordCount,
+            )
+        ) {
+            return true
+        }
+        if (PaddleCandidatePolicy.isPlausibleSegmentedCandidate(
+                text = candidate.text,
+                confidence = candidate.confidence,
+                quality = candidate.quality,
+                expectedLineCount = expectedLineCount,
+                expectedWordCount = expectedWordCount,
+                evidence = candidate.segmentationEvidence,
+            )
+        ) {
+            return true
+        }
+
+        // Only an actually different runtime is a second OCR opinion.
+        for (other in candidates) {
+            if (other === candidate || other.backend == candidate.backend) continue
+            if (PaddleCandidatePolicy.hasIndependentEngineConsensus(
+                    firstBackend = candidate.backend,
+                    firstConfidence = candidate.confidence,
+                    firstQuality = candidate.quality,
+                    secondBackend = other.backend,
+                    secondConfidence = other.confidence,
+                    secondQuality = other.quality,
+                    similarity = candidateSimilarity(candidate.text, other.text),
+                )
+            ) {
+                return true
+            }
+        }
+
+        // A word-segmented result agreeing with a line/whole-image result has
+        // meaningful geometric support even though both came from one engine.
+        val strongestGeometricAgreement = candidates
             .asSequence()
-            .filter { it !== candidate }
+            .filter { other ->
+                other !== candidate &&
+                    other.backend == candidate.backend &&
+                    candidate.hasIndependentEvidenceFrom(other)
+            }
             .map { candidateSimilarity(candidate.text, it.text) }
             .maxOrNull() ?: 0.0
-        val confidence = candidate.confidence
-        val directSingleWordLayoutMatches =
-            expectedLineCount == 1 &&
-                expectedWordCount == 1 &&
-                candidate.text.lines().size == 1 &&
-                candidate.text.split(WHITESPACE).count { it.isNotBlank() } == 1
-        if (confidence != null &&
-            confidence >= VERIFIED_SINGLE_WORD_CONFIDENCE &&
-            directSingleWordLayoutMatches
+        if ((candidate.confidence ?: 0.0) >= GEOMETRIC_CONSENSUS_CONFIDENCE &&
+            candidate.quality >= GEOMETRIC_CONSENSUS_QUALITY &&
+            strongestGeometricAgreement >= GEOMETRIC_CONSENSUS_SIMILARITY
         ) {
             return true
         }
-        if (confidence != null &&
-            confidence >= HIGH_CONFIDENCE_ACCEPTANCE &&
-            (candidate.layoutFidelity >= 1.0 ||
-                strongestAgreement >= HIGH_CONFIDENCE_MINIMUM_AGREEMENT)
-        ) {
-            return true
-        }
-        if (candidate.layoutFidelity >= 1.0 &&
-            confidence != null &&
-            confidence >= SEGMENTED_CONFIDENCE_ACCEPTANCE &&
-            strongestAgreement >= SEGMENTED_MINIMUM_AGREEMENT
-        ) {
-            return true
-        }
+
+        val strongestIndependentAgreement = candidates
+            .asSequence()
+            .filter { other ->
+                other !== candidate &&
+                    candidate.hasIndependentEvidenceFrom(other)
+            }
+            .map { other -> candidateSimilarity(candidate.text, other.text) }
+            .maxOrNull() ?: 0.0
         val score = candidateScore(
             candidate = candidate,
             candidates = candidates,
             expectedLineCount = expectedLineCount,
             expectedWordCount = expectedWordCount,
         )
-        return strongestAgreement >= MINIMUM_CANDIDATE_AGREEMENT &&
+        return strongestIndependentAgreement >= MINIMUM_CANDIDATE_AGREEMENT &&
             score >= MINIMUM_CANDIDATE_SCORE
+    }
+
+    private fun OcrCandidate.hasIndependentEvidenceFrom(
+        other: OcrCandidate,
+    ): Boolean {
+        if (backend != other.backend) return true
+        if (segmentationEvidence == other.segmentationEvidence) return false
+        return segmentationEvidence != CandidateSegmentationEvidence.NONE ||
+            other.segmentationEvidence != CandidateSegmentationEvidence.NONE
     }
 
     private fun Sequence<Double>.averageOrZero(): Double {
@@ -1095,15 +1391,6 @@ class AndroidHandwritingRecognitionService(
     private fun countSimilarity(actual: Int, expected: Int): Double {
         if (expected <= 0) return if (actual <= 0) 1.0 else 0.0
         return (1.0 - abs(actual - expected).toDouble() / expected)
-            .coerceIn(0.0, 1.0)
-    }
-
-    private fun candidateTextQuality(text: String): Double {
-        val visible = text.count { !it.isWhitespace() }
-        if (visible == 0) return 0.0
-        val lettersAndDigits = text.count(Char::isLetterOrDigit)
-        val controlCharacters = text.count { it.isISOControl() && it != '\n' }
-        return ((lettersAndDigits - controlCharacters * 2).toDouble() / visible)
             .coerceIn(0.0, 1.0)
     }
 
@@ -1241,7 +1528,10 @@ class AndroidHandwritingRecognitionService(
         if (strokes.isEmpty() || totalPoints == 0) {
             throw ChannelException("invalid_ink", "Keine Handschriftpunkte vorhanden.")
         }
-        return RecognitionRequest(strokes)
+        return RecognitionRequest(
+            strokes = strokes,
+            languageTag = languageTag,
+        )
     }
 
     private fun renderInk(
@@ -1420,13 +1710,6 @@ class AndroidHandwritingRecognitionService(
         return dx * dx + dy * dy
     }
 
-    private fun normalizeRecognizedText(raw: String): String = raw
-        .replace('\u0000', ' ')
-        .lines()
-        .map { line -> line.trim().replace(WHITESPACE, " ") }
-        .filter { it.isNotEmpty() }
-        .joinToString("\n")
-
     private fun isSupportedLanguageTag(rawTag: String): Boolean {
         val tag = rawTag.trim()
         if (tag.isEmpty() || tag.length > MAX_LANGUAGE_TAG_LENGTH) return false
@@ -1463,6 +1746,7 @@ class AndroidHandwritingRecognitionService(
     private data class RasterPoint(val x: Float, val y: Float)
     private data class RecognitionRequest(
         val strokes: List<List<HandwritingInkPoint>>,
+        val languageTag: String,
     )
     private data class RecognitionOutcome(
         val candidate: OcrCandidate?,
@@ -1477,6 +1761,9 @@ class AndroidHandwritingRecognitionService(
         val confidence: Double?,
         val quality: Double,
         val layoutFidelity: Double,
+        val backend: HandwritingRecognitionBackend,
+        val segmentationEvidence: CandidateSegmentationEvidence,
+        val profile: String,
     )
     private data class RenderStyle(
         val targetLineHeight: Float,
@@ -1495,7 +1782,7 @@ class AndroidHandwritingRecognitionService(
         const val CHANNEL_NAME = "de.flowboardx/handwriting_recognition"
         const val DEFAULT_LANGUAGE_TAG = "de-DE"
         const val TAG = "FlowboardHandwriting"
-        const val ENGINE_NAME = "bundledPaddleOcrV5WithLatinOcrFallback"
+        const val ENGINE_NAME = "bundledPaddleOcrV6WithLatinOcrFallback"
         const val MODEL_DELIVERY = "bundled-apk"
         const val MAX_LANGUAGE_TAG_LENGTH = 64
         const val MAX_STROKES = 4_096
@@ -1511,12 +1798,19 @@ class AndroidHandwritingRecognitionService(
         const val MAX_SCALE = 64f
         const val MIN_BITMAP_SIZE = 128
         const val MAX_BITMAP_SIZE = 1_536
-        const val MAX_PENDING_REQUESTS = 1
+        // One request may execute while the second participant waits on the
+        // serialized native runtime. Rejecting that valid second request made
+        // two-user conversion appear randomly unavailable.
+        const val MAX_PENDING_REQUESTS = 2
         const val NATIVE_DRAIN_TIMEOUT_SECONDS = 8L
+        // OCR is an explicit, comparatively rare operation. Retaining its
+        // native session indefinitely can evict Flutter raster caches on
+        // memory-constrained boards and make later handwriting feel sluggish.
+        const val IDLE_RESOURCE_RELEASE_DELAY_MILLIS = 5_000L
         // Cold inference is part of the first real queued request. It no longer
         // races a speculative warm-up, so this full budget is deterministic.
         const val RECOGNITION_TIMEOUT_SECONDS = 18L
-        const val MAX_LINE_FALLBACKS = 6
+        const val MAX_LINE_FALLBACKS = 12
         const val MAX_WORD_FALLBACKS = 16
         const val UNKNOWN_CONFIDENCE = 0.40
         const val CONFIDENCE_WEIGHT = 0.44
@@ -1530,13 +1824,11 @@ class AndroidHandwritingRecognitionService(
         const val RELIABLE_CONFIDENCE = 0.72
         const val RELIABLE_TEXT_QUALITY = 0.65
         const val MINIMUM_TEXT_QUALITY = 0.48
-        const val HIGH_CONFIDENCE_ACCEPTANCE = 0.82
-        const val VERIFIED_SINGLE_WORD_CONFIDENCE = 0.84
-        const val HIGH_CONFIDENCE_MINIMUM_AGREEMENT = 0.30
-        const val SEGMENTED_CONFIDENCE_ACCEPTANCE = 0.62
-        const val SEGMENTED_MINIMUM_AGREEMENT = 0.42
-        const val MINIMUM_CANDIDATE_AGREEMENT = 0.50
-        const val MINIMUM_CANDIDATE_SCORE = 0.48
+        const val GEOMETRIC_CONSENSUS_CONFIDENCE = 0.72
+        const val GEOMETRIC_CONSENSUS_QUALITY = 0.82
+        const val GEOMETRIC_CONSENSUS_SIMILARITY = 0.86
+        const val MINIMUM_CANDIDATE_AGREEMENT = 0.86
+        const val MINIMUM_CANDIDATE_SCORE = 0.60
         val DIRECT_EXECUTOR = Executor { command -> command.run() }
         val PRIMARY_RENDER_STYLES = listOf(
             RenderStyle(112f, 1_900f, 30f, 7f),

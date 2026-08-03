@@ -3,6 +3,8 @@ import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 
+import 'eraser_contact_geometry.dart';
+
 /// A conservative fallback for panels which split the heel of a clenched hand
 /// into several ordinary-looking touch contacts.
 ///
@@ -52,6 +54,7 @@ final class ClusteredTouchEraserTracker {
       downTime: event.timeStamp,
       initialPosition: localPosition,
       currentPosition: localPosition,
+      currentRadius: EraserContactGeometry.reportedContactScreenRadius(event),
     );
   }
 
@@ -68,6 +71,9 @@ final class ClusteredTouchEraserTracker {
     final updated = _contacts[event.pointer];
     if (updated == null) return null;
     updated.currentPosition = localPosition;
+    updated.currentRadius = EraserContactGeometry.reportedContactScreenRadius(
+      event,
+    );
 
     if (_contacts.length < minimumContacts) return null;
     final nearby = _contacts.values
@@ -101,14 +107,42 @@ final class ClusteredTouchEraserTracker {
             cluster.add(candidate);
           }
         }
-        final diameter = _maximumPairDistance(
+        final center = _centroid(
           cluster.map((contact) => contact.currentPosition),
         );
-        final radius = (16 + diameter * .30).clamp(24.0, 52.0);
+        var envelopeRadius = 0.0;
+        for (final contact in cluster) {
+          envelopeRadius = math.max(
+            envelopeRadius,
+            (contact.currentPosition - center).distance + contact.currentRadius,
+          );
+        }
+        final pressureRange = event.pressureMax - event.pressureMin;
+        final normalizedPressure =
+            pressureRange.isFinite &&
+                pressureRange > .05 &&
+                event.pressure.isFinite
+            ? ((event.pressure - event.pressureMin) / pressureRange)
+                  .clamp(0.0, 1.0)
+                  .toDouble()
+            : 0.0;
+        final radius = EraserContactGeometry.recognizedFistScreenRadius(
+          measuredRadius: 0,
+          normalizedSize: event.size,
+          normalizedPressure: normalizedPressure,
+          contactCount: cluster.length,
+          clusterEnvelopeRadius: envelopeRadius,
+        );
         return ClusteredTouchEraserMatch(
+          center: center,
+          timeStamp: event.timeStamp,
           positions: <int, Offset>{
             for (final contact in cluster)
               contact.pointer: contact.currentPosition,
+          },
+          contactRadii: <int, double>{
+            for (final contact in cluster)
+              contact.pointer: contact.currentRadius,
           },
           brushRadius: radius,
         );
@@ -205,11 +239,18 @@ final class ClusteredTouchEraserTracker {
 @immutable
 final class ClusteredTouchEraserMatch {
   ClusteredTouchEraserMatch({
+    required this.center,
+    required this.timeStamp,
     required Map<int, Offset> positions,
+    required Map<int, double> contactRadii,
     required this.brushRadius,
-  }) : positions = Map<int, Offset>.unmodifiable(positions);
+  }) : positions = Map<int, Offset>.unmodifiable(positions),
+       contactRadii = Map<int, double>.unmodifiable(contactRadii);
 
+  final Offset center;
+  final Duration timeStamp;
   final Map<int, Offset> positions;
+  final Map<int, double> contactRadii;
 
   /// Eraser radius in logical screen pixels.
   final double brushRadius;
@@ -221,10 +262,12 @@ final class _TrackedTouchContact {
     required this.downTime,
     required this.initialPosition,
     required this.currentPosition,
+    required this.currentRadius,
   });
 
   final int pointer;
   final Duration downTime;
   final Offset initialPosition;
   Offset currentPosition;
+  double currentRadius;
 }

@@ -57,7 +57,7 @@ void main() {
   test(
     'create saves a UUID document before returning its asset directory',
     () async {
-      final now = DateTime.utc(2026, 7, 21, 12);
+      final now = DateTime(2026, 7, 21, 12, 5);
       final controller = DocumentLibraryController(
         repository: repository,
         documentIdFactory: () => '8f225af4-2321-49ca-b41b-68f728d17a8f',
@@ -69,6 +69,8 @@ void main() {
 
       expect(result, isNotNull);
       expect(result!.document.id, '8f225af4-2321-49ca-b41b-68f728d17a8f');
+      expect(result.document.title, '20260721-12_05');
+      expect(result.document.createdAt, now.toUtc());
       expect(result.document.pages, hasLength(1));
       expect(repository.savedIds, <String>[result.document.id]);
       expect(repository.assetRequests, <String>[result.document.id]);
