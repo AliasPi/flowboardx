@@ -46,6 +46,10 @@ class RadialPenSettings {
   static const double minThickness = 1;
   static const double maxThickness = 32;
 
+  /// Classroom-safe colour selected whenever the marker tool is activated.
+  /// A later palette or free-colour choice deliberately remains possible.
+  static const Color markerDefaultColor = Color(0xFFFFC107);
+
   final Color color;
   final double thickness;
   final RadialPenType type;

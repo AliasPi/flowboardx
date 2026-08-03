@@ -3,10 +3,11 @@ import 'dart:io';
 
 import 'package:flowboard_x/src/data/document_repository.dart';
 import 'package:flowboard_x/src/domain/model/document.dart';
+import 'package:flowboard_x/src/domain/model/ink.dart';
 import 'package:flowboard_x/src/features/board/presentation/board_surface.dart';
 import 'package:flowboard_x/src/features/editor/editor_pen_quick_controls.dart';
 import 'package:flowboard_x/src/features/editor/editor_screen.dart';
-import 'package:flowboard_x/src/features/radial_menu/radial_menu_models.dart';
+import 'package:flowboard_x/src/features/radial_menu/radial_menu.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -127,15 +128,6 @@ void main() {
     expect(find.text('Links'), findsWidgets);
     expect(find.text('Rechts'), findsWidgets);
 
-    await tester.tap(secondaryColorFinder);
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Rot'));
-    await tester.pumpAndSettle();
-    await tester.tap(secondaryTypeFinder);
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Radiergummi'));
-    await tester.pumpAndSettle();
-
     final primaryColorControl = find.ancestor(
       of: primaryColorFinder,
       matching: find.byType(EditorPenColorQuickButton),
@@ -152,18 +144,79 @@ void main() {
       of: secondaryTypeFinder,
       matching: find.byType(EditorPenTypeQuickButton),
     );
+
+    await tester.tap(secondaryColorFinder);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Rot'));
+    await tester.pumpAndSettle();
+    await tester.tap(secondaryTypeFinder);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Marker'));
+    await tester.pumpAndSettle();
+
     expect(
       tester.widget<EditorPenColorQuickButton>(primaryColorControl).color,
       Colors.black,
     );
     expect(
       tester.widget<EditorPenColorQuickButton>(secondaryColorControl).color,
-      const Color(0xFFF44336),
+      RadialPenSettings.markerDefaultColor,
     );
     expect(
       tester.widget<EditorPenTypeQuickButton>(primaryTypeControl).type,
       RadialPenType.normal,
     );
+    expect(
+      tester.widget<EditorPenTypeQuickButton>(secondaryTypeControl).type,
+      RadialPenType.marker,
+    );
+
+    final leftBoard = tester.widget<BoardSurface>(
+      find.byKey(const ValueKey('left-board-surface')),
+    );
+    final rightBoard = tester.widget<BoardSurface>(
+      find.byKey(const ValueKey('right-board-surface')),
+    );
+    expect(leftBoard.controller.penStyle.colorArgb, Colors.black.toARGB32());
+    expect(leftBoard.controller.penStyle.type, InkToolType.normal);
+    expect(
+      rightBoard.controller.penStyle.colorArgb,
+      RadialPenSettings.markerDefaultColor.toARGB32(),
+    );
+    expect(rightBoard.controller.penStyle.type, InkToolType.marker);
+    final leftRadial = tester.widget<RadialMenu>(
+      find.byKey(const ValueKey('left-radial-menu')),
+    );
+    final rightRadial = tester.widget<RadialMenu>(
+      find.byKey(const ValueKey('right-radial-menu')),
+    );
+    expect(leftRadial.controller!.penSettings, const RadialPenSettings());
+    expect(
+      rightRadial.controller!.penSettings,
+      const RadialPenSettings(
+        color: RadialPenSettings.markerDefaultColor,
+        type: RadialPenType.marker,
+      ),
+    );
+
+    // A later colour choice must not leave the marker mode.
+    await tester.tap(secondaryColorFinder);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Rot'));
+    await tester.pumpAndSettle();
+    expect(
+      tester.widget<EditorPenColorQuickButton>(secondaryColorControl).color,
+      const Color(0xFFF44336),
+    );
+    expect(
+      tester.widget<EditorPenTypeQuickButton>(secondaryTypeControl).type,
+      RadialPenType.marker,
+    );
+
+    await tester.tap(secondaryTypeFinder);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Radiergummi'));
+    await tester.pumpAndSettle();
     expect(
       tester.widget<EditorPenTypeQuickButton>(secondaryTypeControl).type,
       RadialPenType.eraser,
@@ -213,6 +266,30 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('Stift: Marker'), findsOneWidget);
     expect(find.text('Stift: Radiergummi'), findsOneWidget);
+    await tester.tap(find.text('Stift: Marker'));
+    await tester.pumpAndSettle();
+
+    final compactBoard = tester.widget<BoardSurface>(
+      find.byKey(const ValueKey('solo-board-surface')),
+    );
+    expect(compactBoard.controller.penStyle.type, InkToolType.marker);
+    expect(
+      compactBoard.controller.penStyle.colorArgb,
+      RadialPenSettings.markerDefaultColor.toARGB32(),
+    );
+    final compactRadial = tester.widget<RadialMenu>(
+      find.byKey(const ValueKey('solo-radial-menu')),
+    );
+    expect(
+      compactRadial.controller!.penSettings,
+      const RadialPenSettings(
+        color: RadialPenSettings.markerDefaultColor,
+        type: RadialPenType.marker,
+      ),
+    );
+
+    await tester.tap(find.byTooltip('Weitere Aktionen'));
+    await tester.pumpAndSettle();
     await tester.tap(find.text('Stift: Radiergummi'));
     await tester.pumpAndSettle();
 

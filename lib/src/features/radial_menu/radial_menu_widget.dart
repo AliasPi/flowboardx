@@ -46,7 +46,7 @@ class RadialMenu extends StatefulWidget {
     Color(0xFF2196F3),
     Color(0xFFF44336),
     Color(0xFF4CAF50),
-    Color(0xFFFFC107),
+    RadialPenSettings.markerDefaultColor,
     Color(0xFF00BCD4),
     Colors.white,
     Color(0xFF9C27B0),
@@ -796,7 +796,15 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
     if (_controller.activeBranch == RadialMenuBranch.pen) {
       if (index >= 0 && index < RadialPenType.values.length) {
         final type = RadialPenType.values[index];
-        _updatePen(_controller.penSettings.copyWith(type: type));
+        final current = _controller.penSettings;
+        _updatePen(
+          current.copyWith(
+            type: type,
+            color: type == RadialPenType.marker
+                ? RadialPenSettings.markerDefaultColor
+                : current.color,
+          ),
+        );
         if (type == RadialPenType.eraser) {
           // Erasing is a complete tool, not another configurable pen family.
           // Keep the primary ring available, but dismiss the colour/type fan

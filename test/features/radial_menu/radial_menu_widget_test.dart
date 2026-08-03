@@ -206,6 +206,74 @@ void main() {
     expect(changes, hasLength(2));
   });
 
+  testWidgets('marker selection starts yellow and remains freely recolorable', (
+    tester,
+  ) async {
+    final controller = RadialMenuController(
+      isOpen: true,
+      activeBranch: RadialMenuBranch.pen,
+      penSettings: const RadialPenSettings(
+        color: Colors.red,
+        thickness: 17,
+        type: RadialPenType.normal,
+      ),
+    );
+    addTearDown(controller.dispose);
+    final changes = <RadialPenSettings>[];
+    await tester.pumpWidget(
+      host(
+        controller: controller,
+        callbacks: RadialMenuCallbacks(onPenSettingsChanged: changes.add),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    const geometry = RadialMenuGeometry(Size.square(600));
+    final marker = segmentGlobalPoint(
+      tester,
+      index: RadialPenType.marker.index,
+      count: RadialPenType.values.length,
+      radius: 256,
+      startAngle: geometry.penTypesStartAngle,
+      span: geometry.penTypesSpan,
+    );
+    await tester.tapAt(marker);
+    await tester.pump();
+
+    expect(
+      controller.penSettings,
+      const RadialPenSettings(
+        color: RadialPenSettings.markerDefaultColor,
+        thickness: 17,
+        type: RadialPenType.marker,
+      ),
+    );
+    expect(changes, hasLength(1));
+
+    final blue = segmentGlobalPoint(
+      tester,
+      index: 1,
+      count:
+          RadialMenu.defaultPalette.length +
+          1 +
+          RadialPenPreset.defaults.length,
+      radius: 192,
+      startAngle: geometry.compactSubmenuStartAngle(RadialMenuAction.pen.index),
+      span: geometry.compactSubmenuSpan,
+    );
+    await tester.tapAt(blue);
+    await tester.pump();
+
+    expect(controller.penSettings.color, const Color(0xFF2196F3));
+    expect(controller.penSettings.type, RadialPenType.marker);
+
+    await tester.tapAt(marker);
+    await tester.pump();
+    expect(controller.penSettings.color, RadialPenSettings.markerDefaultColor);
+    expect(controller.penSettings.thickness, 17);
+    expect(changes, hasLength(3));
+  });
+
   testWidgets(
     'eraser activates directly and dismisses the configurable pen fan',
     (tester) async {

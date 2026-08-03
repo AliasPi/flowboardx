@@ -836,7 +836,13 @@ class _EditorScreenState extends State<EditorScreen>
   void _applyQuickPenType(EditorController editor, RadialPenType type) {
     final inkType = _inkType(type);
     if (inkType != null) {
-      _applyQuickPen(editor, type: inkType);
+      _applyQuickPen(
+        editor,
+        color: type == RadialPenType.marker
+            ? RadialPenSettings.markerDefaultColor
+            : null,
+        type: inkType,
+      );
       return;
     }
 
