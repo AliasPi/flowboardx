@@ -1036,11 +1036,12 @@ void main() {
           size: .12,
         ),
       );
-      // A narrow finger starting on content owns direct manipulation. A
-      // vendor CANCEL may report inflated final geometry, but that packet is
-      // not proof of eraser intent and must only roll the preview back.
-      expect(controller.viewport.offset, initialOffset);
-      expect(controller.renderStrokes.single.points.first.x, closeTo(500, .01));
+      // An unselected item does not take over the first drag: the gesture is a
+      // provisional camera pan. A vendor CANCEL may report inflated final
+      // geometry, but that packet is not proof of eraser intent and must only
+      // roll the camera preview back.
+      expect(controller.viewport.offset, isNot(initialOffset));
+      expect(controller.renderStrokes.single.points.first.x, closeTo(390, .01));
       await tester.sendEventToBinding(
         const PointerCancelEvent(
           pointer: 451,

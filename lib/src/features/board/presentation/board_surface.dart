@@ -233,7 +233,6 @@ class _BoardSurfaceState extends State<BoardSurface> {
   int _selectionGestureRevision = 0;
   final Map<int, Offset> _selectionStarts = {};
   final Map<int, Offset> _selectionMoveStarts = {};
-  final Set<int> _selectionChosenOnDown = <int>{};
   final Set<int> _selectionPinchPointers = <int>{};
   double? _selectionPinchStartDistance;
   Offset? _selectionPinchAnchor;
@@ -697,7 +696,6 @@ class _BoardSurfaceState extends State<BoardSurface> {
     _selectionGestures.clear();
     _selectionStarts.clear();
     _selectionMoveStarts.clear();
-    _selectionChosenOnDown.clear();
     _selectionPinchPointers.clear();
     _selectionPinchStartDistance = null;
     _selectionPinchAnchor = null;
@@ -1209,7 +1207,6 @@ class _BoardSurfaceState extends State<BoardSurface> {
       _eraserPointers.remove(pointer);
       _selectionStarts.remove(pointer);
       _selectionMoveStarts.remove(pointer);
-      _selectionChosenOnDown.remove(pointer);
       _selectionGestures.remove(pointer);
       _selectionPinchPointers.remove(pointer);
       _clusteredTouchEraser.remove(pointer);
@@ -1304,9 +1301,6 @@ class _BoardSurfaceState extends State<BoardSurface> {
       setState(() {});
       return;
     }
-    if (_tryBeginDirectTouchManipulation(event, localPosition, world)) {
-      return;
-    }
     if (activeTool == BoardTool.shape &&
         (event.kind != PointerDeviceKind.touch ||
             widget.fingerDrawingEnabled)) {
@@ -1350,6 +1344,18 @@ class _BoardSurfaceState extends State<BoardSurface> {
       // it in the global priority route.
       role = _ordinaryTouchRole(stylusCurrentlyActive);
     }
+    // This is the final gate before beginInk. Touch must never author ink
+    // while the user-facing finger-drawing switch is off, even if a future
+    // pointer-policy change accidentally classifies it as ink.
+    if (event.kind == PointerDeviceKind.touch &&
+        role == PointerRole.ink &&
+        !widget.fingerDrawingEnabled) {
+      role = PointerRole.navigate;
+    }
+    // Keep an ordinary unselected touch in navigation for its complete
+    // lifecycle. UP turns a stationary contact into selection, while movement
+    // beyond tap slop stays a camera pan. Only a selection that existed before
+    // DOWN may be promoted to a body move below.
     // In the normal editor a participant controller is present even in
     // one-person mode. Its pen tool deliberately keeps ordinary touches in
     // navigation so a finger can pan while the stylus writes. Once the user
@@ -1432,69 +1438,6 @@ class _BoardSurfaceState extends State<BoardSurface> {
     }
   }
 
-  /// Gives a narrow finger contact direct ownership of existing content.
-  ///
-  /// With finger drawing disabled, empty space remains camera navigation (or
-  /// rectangle/lasso while that explicit tool is active). A hit on selectable
-  /// content, however, must not require a preliminary tap followed by a second
-  /// drag. Selecting on DOWN enables a live transform from the first movement;
-  /// [_selectionChosenOnDown] prevents the matching UP from cycling the same
-  /// semantic hit a second time.
-  bool _tryBeginDirectTouchManipulation(
-    PointerDownEvent event,
-    Offset localPosition,
-    Offset world,
-  ) {
-    if (event.kind != PointerDeviceKind.touch ||
-        widget.fingerDrawingEnabled ||
-        controller.inkSessions.hasActiveStylus ||
-        (controller.hasSelection &&
-            controller.selectionContains(
-              world,
-              tolerance: 12 / viewport.scale,
-            ))) {
-      return false;
-    }
-    final point = Vec2(world.dx, world.dy);
-    final tolerance = 12 / viewport.scale;
-    if (!controller.selectionEngine.hasSelectableAt(
-      controller.page,
-      point,
-      tolerance: tolerance,
-      inkGroupCandidates: controller.groupingEngine.selectionCandidatesAt(
-        controller.page,
-        point,
-        tolerance: tolerance,
-      ),
-    )) {
-      return false;
-    }
-
-    controller.selectAt(world, viewportScale: viewport.scale);
-    if (!controller.hasSelection ||
-        !controller.selectionContains(world, tolerance: tolerance)) {
-      return false;
-    }
-    final owner = 'body-${event.pointer}';
-    if (!_claimSelectionTransform(owner)) {
-      _roles[event.pointer] = PointerRole.ignored;
-      return true;
-    }
-    _claimTouchSelection(event);
-    _hideNavigatorForContentInteraction();
-    _roles[event.pointer] = PointerRole.select;
-    _selectionStarts[event.pointer] = world;
-    _selectionMoveStarts[event.pointer] = world;
-    _selectionChosenOnDown.add(event.pointer);
-    _trackPointerIndicator(
-      event,
-      localPosition,
-      BoardPointerIndicatorKind.selection,
-    );
-    if (mounted) setState(() {});
-    return true;
-  }
-
   bool _tryBeginSelectionPinch(
     PointerDownEvent event,
     Offset localPosition,
@@ -1542,7 +1485,6 @@ class _BoardSurfaceState extends State<BoardSurface> {
     _selectionMoveStarts.remove(firstPointer);
     _selectionStarts.remove(firstPointer);
     _selectionGestures.remove(firstPointer);
-    _selectionChosenOnDown.remove(firstPointer);
     if (!_claimSelectionTransform('selection-pinch')) return false;
 
     _roles[firstPointer] = PointerRole.select;
@@ -1569,10 +1511,10 @@ class _BoardSurfaceState extends State<BoardSurface> {
   /// was not claimed by [_tryBeginSelectionPinch].
   ///
   /// Selection tools intentionally route their first touch to a rectangle,
-  /// lasso, or body move. Waiting for a second touch lets one-finger selection
-  /// retain that behavior while still making pinch-to-zoom universally
-  /// available. A pinch fully inside the selected content is handled first
-  /// and continues to resize that content.
+  /// lasso, body move, or provisional finger stroke. Waiting for a second
+  /// touch lets one-finger interaction retain that behavior while still
+  /// making pinch-to-zoom universally available. A pinch fully inside content
+  /// that was already selected is handled first and continues to resize it.
   bool _tryBeginTouchNavigationPinch(
     PointerDownEvent event,
     Offset localPosition,
@@ -1588,7 +1530,28 @@ class _BoardSurfaceState extends State<BoardSurface> {
       for (final pointer in _navigationPointers.keys)
         if (_pointerKinds[pointer] == PointerDeviceKind.touch) pointer,
     ];
-    if (selectionPointers.isEmpty && navigationPointers.isEmpty) return false;
+    final inkPointers = <int>[
+      for (final entry in _roles.entries)
+        if (entry.value == PointerRole.ink &&
+            _pointerKinds[entry.key] == PointerDeviceKind.touch)
+          entry.key,
+    ];
+    if (selectionPointers.isEmpty &&
+        navigationPointers.isEmpty &&
+        inkPointers.isEmpty) {
+      return false;
+    }
+
+    // The second finger irrevocably establishes navigation intent. Remove a
+    // provisional first-finger stroke before either pointer can add another
+    // ink sample or commit it on UP.
+    for (final pointer in inkPointers) {
+      controller.cancelInk(pointer);
+      _pointerIndicators.removePointer(pointer);
+      _roles[pointer] = PointerRole.navigate;
+      final position = _pointerLocalPositions[pointer];
+      if (position != null) _beginNavigation(pointer, position);
+    }
 
     if (selectionPointers.isNotEmpty) {
       final owner = _selectionTransformOwner;
@@ -1600,7 +1563,6 @@ class _BoardSurfaceState extends State<BoardSurface> {
         _selectionStarts.remove(pointer);
         _selectionMoveStarts.remove(pointer);
         _selectionGestures.remove(pointer);
-        _selectionChosenOnDown.remove(pointer);
         _pointerIndicators.removePointer(pointer);
         _roles[pointer] = PointerRole.navigate;
         final position = _pointerLocalPositions[pointer];
@@ -1655,7 +1617,6 @@ class _BoardSurfaceState extends State<BoardSurface> {
       _selectionMoveStarts.remove(pointer);
       _selectionGestures.remove(pointer);
       _pointerIndicators.removePointer(pointer);
-      _selectionChosenOnDown.remove(pointer);
       _pointerIndicators.removePointer(pointer);
       if (pointer == liftedPointer) {
         _roles.remove(pointer);
@@ -1989,7 +1950,6 @@ class _BoardSurfaceState extends State<BoardSurface> {
       controller.cancelSelectionTransform();
       _releaseSelectionTransform('body-${event.pointer}');
     }
-    _selectionChosenOnDown.remove(event.pointer);
     _selectionGestures.remove(event.pointer);
     _selectionStarts.remove(event.pointer);
     _pointerKinds.remove(event.pointer);
@@ -2267,8 +2227,7 @@ class _BoardSurfaceState extends State<BoardSurface> {
         _selectionPinchPointers.isNotEmpty ||
         _selectionGestures.isNotEmpty ||
         _selectionStarts.isNotEmpty ||
-        _selectionMoveStarts.isNotEmpty ||
-        _selectionChosenOnDown.isNotEmpty;
+        _selectionMoveStarts.isNotEmpty;
     for (final entry in _roles.entries.toList(growable: false)) {
       if (entry.key != eraserPointer && entry.value == PointerRole.select) {
         _roles[entry.key] = PointerRole.ignored;
@@ -2281,7 +2240,6 @@ class _BoardSurfaceState extends State<BoardSurface> {
     _selectionGestures.clear();
     _selectionStarts.clear();
     _selectionMoveStarts.clear();
-    _selectionChosenOnDown.clear();
     _selectionPinchPointers.clear();
     _selectionPinchStartDistance = null;
     _selectionPinchAnchor = null;
@@ -2696,7 +2654,6 @@ class _BoardSurfaceState extends State<BoardSurface> {
   void _finishSelection(int pointer, Offset end) {
     final start = _selectionStarts.remove(pointer);
     final moveStart = _selectionMoveStarts.remove(pointer);
-    final selectedOnDown = _selectionChosenOnDown.remove(pointer);
     final preview = _selectionGestures.remove(pointer);
     final path = preview?.points ?? const <Offset>[];
     if (start == null) {
@@ -2710,9 +2667,7 @@ class _BoardSurfaceState extends State<BoardSurface> {
           controller.commitSelectionTransform();
         } else {
           controller.cancelSelectionTransform();
-          if (!selectedOnDown) {
-            controller.selectAt(end, viewportScale: viewport.scale);
-          }
+          controller.selectAt(end, viewportScale: viewport.scale);
         }
       } finally {
         _releaseSelectionTransform('body-$pointer');

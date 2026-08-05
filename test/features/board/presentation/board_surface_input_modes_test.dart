@@ -356,6 +356,16 @@ void main() {
       final objectId = controller.page.objects.single.id;
       controller.clearSelection();
       await tester.pump();
+
+      final select = await tester.startGesture(
+        const Offset(300, 240),
+        pointer: 720,
+        kind: PointerDeviceKind.touch,
+      );
+      await select.up();
+      await tester.pump();
+      expect(controller.selectedIds, <String>{objectId});
+
       final before = controller.page.objects.single.transform;
 
       await tester.sendEventToBinding(
@@ -440,7 +450,7 @@ void main() {
   );
 
   testWidgets(
-    'first finger drag selects an unselected item and moves it live',
+    'first finger drag pans without selecting or moving an unselected item',
     (tester) async {
       final controller = await pumpBoard(
         tester,
@@ -450,7 +460,6 @@ void main() {
         ShapeKind.rectangle,
         const Rect.fromLTWH(200, 180, 220, 140),
       );
-      final objectId = controller.page.objects.single.id;
       controller.clearSelection();
       await tester.pump();
       final before = controller.page.objects.single.transform;
@@ -462,83 +471,56 @@ void main() {
         kind: PointerDeviceKind.touch,
       );
       await tester.pump();
-      expect(controller.selectedIds, <String>{objectId});
+      expect(controller.selectedIds, isEmpty);
 
       await drag.moveTo(const Offset(350, 270));
       await tester.pump();
       expect(controller.page.objects.single.transform, before);
-      expect(
-        controller.renderObjects.single.transform.x,
-        closeTo(before.x + 50, .01),
-      );
-      expect(
-        controller.renderObjects.single.transform.y,
-        closeTo(before.y + 30, .01),
-      );
+      expect(controller.renderObjects.single.transform, before);
 
       await drag.up();
       await tester.pump();
-      expect(
-        controller.page.objects.single.transform.x,
-        closeTo(before.x + 50, .01),
-      );
-      expect(
-        controller.page.objects.single.transform.y,
-        closeTo(before.y + 30, .01),
-      );
-      expect(controller.history.undoDepth, historyBeforeMove + 1);
-      expect(controller.viewport.offset, Offset.zero);
+      expect(controller.page.objects.single.transform, before);
+      expect(controller.selectedIds, isEmpty);
+      expect(controller.history.undoDepth, historyBeforeMove);
+      expect(controller.viewport.offset, isNot(Offset.zero));
       await controller.flush();
     },
   );
 
-  testWidgets(
-    'finger directly moves an unselected item with shape tool active',
-    (tester) async {
-      final controller = await pumpBoard(tester);
-      controller.addShape(
-        ShapeKind.rectangle,
-        const Rect.fromLTWH(200, 180, 220, 140),
-      );
-      final objectId = controller.page.objects.single.id;
-      controller.clearSelection();
-      controller.armShape(ShapeKind.ellipse);
-      await tester.pump();
-      final before = controller.page.objects.single.transform;
+  testWidgets('finger pans over an unselected item with shape tool active', (
+    tester,
+  ) async {
+    final controller = await pumpBoard(tester);
+    controller.addShape(
+      ShapeKind.rectangle,
+      const Rect.fromLTWH(200, 180, 220, 140),
+    );
+    controller.clearSelection();
+    controller.armShape(ShapeKind.ellipse);
+    await tester.pump();
+    final before = controller.page.objects.single.transform;
 
-      final drag = await tester.startGesture(
-        const Offset(300, 240),
-        pointer: 76,
-        kind: PointerDeviceKind.touch,
-      );
-      await drag.moveTo(const Offset(345, 265));
-      await tester.pump();
+    final drag = await tester.startGesture(
+      const Offset(300, 240),
+      pointer: 76,
+      kind: PointerDeviceKind.touch,
+    );
+    await drag.moveTo(const Offset(345, 265));
+    await tester.pump();
 
-      expect(controller.selectedIds, <String>{objectId});
-      expect(
-        controller.renderObjects.single.transform.x,
-        closeTo(before.x + 45, .01),
-      );
-      expect(
-        controller.renderObjects.single.transform.y,
-        closeTo(before.y + 25, .01),
-      );
-      expect(controller.page.objects, hasLength(1));
+    expect(controller.selectedIds, isEmpty);
+    expect(controller.renderObjects.single.transform, before);
+    expect(controller.page.objects, hasLength(1));
 
-      await drag.up();
-      await tester.pump();
-      expect(
-        controller.page.objects.single.transform.x,
-        closeTo(before.x + 45, .01),
-      );
-      expect(
-        controller.page.objects.single.transform.y,
-        closeTo(before.y + 25, .01),
-      );
-      expect(controller.page.objects, hasLength(1));
-      await controller.flush();
-    },
-  );
+    await drag.up();
+    await tester.pump();
+    expect(controller.page.objects.single.transform, before);
+    expect(controller.selectedIds, isEmpty);
+    expect(controller.viewport.offset, isNot(Offset.zero));
+    expect(controller.page.objects, hasLength(1));
+    await controller.flush();
+  });
 
   testWidgets(
     'finger drag on empty space pans instead of drawing with shape tool',
@@ -654,6 +636,57 @@ void main() {
       await controller.flush();
     });
   }
+
+  testWidgets(
+    'participant pinch over unselected content only zooms when finger ink is off',
+    (tester) async {
+      final controller = await pumpBoard(
+        tester,
+        withParticipantController: true,
+      );
+      controller.addShape(
+        ShapeKind.rectangle,
+        const Rect.fromLTWH(180, 200, 300, 160),
+      );
+      controller.clearSelection();
+      await tester.pump();
+      final original = controller.page.objects.single.transform;
+      final scaleBefore = controller.viewport.scale;
+
+      final first = await tester.startGesture(
+        const Offset(260, 280),
+        pointer: 82,
+        kind: PointerDeviceKind.touch,
+      );
+      await first.moveTo(const Offset(250, 280));
+      expect(controller.inkSessions.sessions, isEmpty);
+      expect(controller.selectedIds, isEmpty);
+
+      final second = await tester.startGesture(
+        const Offset(420, 280),
+        pointer: 83,
+        kind: PointerDeviceKind.touch,
+      );
+      await first.moveTo(const Offset(210, 280));
+      await second.moveTo(const Offset(500, 280));
+      await tester.pump();
+
+      expect(controller.viewport.scale, greaterThan(scaleBefore));
+      expect(controller.inkSessions.sessions, isEmpty);
+      expect(controller.page.strokes, isEmpty);
+      expect(controller.selectedIds, isEmpty);
+      expect(controller.renderObjects.single.transform, original);
+
+      await second.up();
+      await first.up();
+      await tester.pump();
+
+      expect(controller.page.strokes, isEmpty);
+      expect(controller.selectedIds, isEmpty);
+      expect(controller.page.objects.single.transform, original);
+      await controller.flush();
+    },
+  );
 
   testWidgets('two broad-looking fingertips remain a pinch gesture', (
     tester,

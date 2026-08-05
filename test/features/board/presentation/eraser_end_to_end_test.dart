@@ -478,8 +478,8 @@ void main() {
       expect(controller.tool, BoardTool.selectRectangle);
       expect(controller.page.strokes, hasLength(1));
       expect(controller.selectedIds, isNotEmpty);
-      expect(controller.page.strokes.single.points.first.x, closeTo(240, .01));
-      expect(controller.page.strokes.single.points.last.x, closeTo(840, .01));
+      expect(controller.page.strokes.single.points.first.x, closeTo(100, .01));
+      expect(controller.page.strokes.single.points.last.x, closeTo(700, .01));
       await controller.flush();
     },
   );
@@ -788,6 +788,28 @@ void main() {
 
       await tester.sendEventToBinding(
         const PointerDownEvent(
+          pointer: 879,
+          device: 879,
+          kind: PointerDeviceKind.touch,
+          position: Offset(280, 250),
+          timeStamp: Duration(milliseconds: 800),
+          buttons: kPrimaryButton,
+        ),
+      );
+      await tester.sendEventToBinding(
+        const PointerUpEvent(
+          pointer: 879,
+          device: 879,
+          kind: PointerDeviceKind.touch,
+          position: Offset(280, 250),
+          timeStamp: Duration(milliseconds: 900),
+        ),
+      );
+      await tester.pump();
+      expect(controller.selectedIds, <String>{objectId});
+
+      await tester.sendEventToBinding(
+        const PointerDownEvent(
           pointer: 880,
           device: 880,
           kind: PointerDeviceKind.touch,
@@ -1060,88 +1082,89 @@ void main() {
     },
   );
 
-  testWidgets('palm reported from DOWN overrides provisional touch selection', (
-    tester,
-  ) async {
-    final document = withPage(
-      'initial-native-palm-dual-channel',
-      update: (page) =>
-          page.copyWith(strokes: <InkStroke>[horizontalStroke(y: 250)]),
-    );
-    final source = _PalmInputSource();
-    addTearDown(source.dispose);
-    final controller = await pumpBoard(
-      tester,
-      document,
-      palmInputSource: source,
-    );
+  testWidgets(
+    'palm reported from DOWN overrides provisional touch navigation',
+    (tester) async {
+      final document = withPage(
+        'initial-native-palm-dual-channel',
+        update: (page) =>
+            page.copyWith(strokes: <InkStroke>[horizontalStroke(y: 250)]),
+      );
+      final source = _PalmInputSource();
+      addTearDown(source.dispose);
+      final controller = await pumpBoard(
+        tester,
+        document,
+        palmInputSource: source,
+      );
 
-    await tester.sendEventToBinding(
-      const PointerDownEvent(
-        pointer: 883,
-        device: 883,
-        kind: PointerDeviceKind.touch,
-        position: Offset(380, 250),
-        timeStamp: Duration(milliseconds: 1000),
-        buttons: kPrimaryButton,
-      ),
-    );
-    await tester.sendEventToBinding(
-      const PointerMoveEvent(
-        pointer: 883,
-        device: 883,
-        kind: PointerDeviceKind.touch,
-        position: Offset(420, 250),
-        delta: Offset(40, 0),
-        timeStamp: Duration(milliseconds: 1100),
-        buttons: kPrimaryButton,
-      ),
-    );
-    await tester.pump();
-    expect(controller.hasSelection, isTrue);
+      await tester.sendEventToBinding(
+        const PointerDownEvent(
+          pointer: 883,
+          device: 883,
+          kind: PointerDeviceKind.touch,
+          position: Offset(380, 250),
+          timeStamp: Duration(milliseconds: 1000),
+          buttons: kPrimaryButton,
+        ),
+      );
+      await tester.sendEventToBinding(
+        const PointerMoveEvent(
+          pointer: 883,
+          device: 883,
+          kind: PointerDeviceKind.touch,
+          position: Offset(420, 250),
+          delta: Offset(40, 0),
+          timeStamp: Duration(milliseconds: 1100),
+          buttons: kPrimaryButton,
+        ),
+      );
+      await tester.pump();
+      expect(controller.hasSelection, isFalse);
 
-    source.add(
-      const NativePalmStroke(
-        sessionId: 'initial-palm-wins',
-        points: <Offset>[Offset(380, 250), Offset(420, 250)],
-        radius: 48,
-        contactCount: 1,
-        source: 'tool_type_palm',
-        startedAsPalm: true,
-        samples: <NativePalmSample>[
-          NativePalmSample(
-            position: Offset(380, 250),
-            radiusMajor: 48,
-            radiusMinor: 24,
-            orientation: 0,
-            timeStamp: Duration(milliseconds: 1000),
-          ),
-          NativePalmSample(
-            position: Offset(420, 250),
-            radiusMajor: 48,
-            radiusMinor: 24,
-            orientation: 0,
-            timeStamp: Duration(milliseconds: 1100),
-          ),
-        ],
-      ),
-    );
-    await tester.pump();
-    await tester.sendEventToBinding(
-      const PointerCancelEvent(
-        pointer: 883,
-        device: 883,
-        kind: PointerDeviceKind.touch,
-        position: Offset(420, 250),
-        timeStamp: Duration(milliseconds: 1200),
-      ),
-    );
-    await tester.pump(const Duration(milliseconds: 220));
+      source.add(
+        const NativePalmStroke(
+          sessionId: 'initial-palm-wins',
+          points: <Offset>[Offset(380, 250), Offset(420, 250)],
+          radius: 48,
+          contactCount: 1,
+          source: 'tool_type_palm',
+          startedAsPalm: true,
+          samples: <NativePalmSample>[
+            NativePalmSample(
+              position: Offset(380, 250),
+              radiusMajor: 48,
+              radiusMinor: 24,
+              orientation: 0,
+              timeStamp: Duration(milliseconds: 1000),
+            ),
+            NativePalmSample(
+              position: Offset(420, 250),
+              radiusMajor: 48,
+              radiusMinor: 24,
+              orientation: 0,
+              timeStamp: Duration(milliseconds: 1100),
+            ),
+          ],
+        ),
+      );
+      await tester.pump();
+      await tester.sendEventToBinding(
+        const PointerCancelEvent(
+          pointer: 883,
+          device: 883,
+          kind: PointerDeviceKind.touch,
+          position: Offset(420, 250),
+          timeStamp: Duration(milliseconds: 1200),
+        ),
+      );
+      await tester.pump(const Duration(milliseconds: 220));
 
-    expect(controller.page.strokes, hasLength(2));
-    expect(_strokeCrossesX(controller.page.strokes, 400), isFalse);
-    await controller.flush();
-  });
+      expect(controller.page.strokes, hasLength(2));
+      expect(_strokeCrossesX(controller.page.strokes, 400), isFalse);
+      await controller.flush();
+    },
+  );
 
   testWidgets('palm trace which began before a page switch is discarded', (
     tester,
