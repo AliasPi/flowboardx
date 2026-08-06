@@ -257,6 +257,51 @@ void main() {
     },
   );
 
+  testWidgets('finger moves a compact handwriting selection by its body', (
+    tester,
+  ) async {
+    final controller = await pumpBoard(tester, withParticipantController: true);
+    final stroke = InkStroke(
+      id: 'small-writing',
+      points: <InkPoint>[InkPoint(x: 300, y: 260), InkPoint(x: 316, y: 266)],
+      width: 4,
+    );
+    controller.execute(AddStrokeCommand(controller.page.id, stroke));
+    controller.selectAt(const Offset(308, 263));
+    await tester.pump();
+    expect(controller.selectedIds, <String>{stroke.id});
+    expect(
+      find.bySemanticsLabel(RegExp(r'Auswahl .* frei skalieren')),
+      findsNothing,
+    );
+
+    final historyBeforeMove = controller.history.undoDepth;
+    final drag = await tester.startGesture(
+      const Offset(308, 263),
+      pointer: 84,
+      kind: PointerDeviceKind.touch,
+    );
+    await drag.moveBy(const Offset(55, 35));
+    await tester.pump();
+
+    expect(controller.page.strokes.single.points.first.x, 300);
+    expect(controller.page.strokes.single.points.first.y, 260);
+    expect(controller.renderStrokes.single.points.first.x, closeTo(355, .01));
+    expect(controller.renderStrokes.single.points.first.y, closeTo(295, .01));
+    expect(controller.renderStrokes.single.bounds.width, stroke.bounds.width);
+    expect(controller.renderStrokes.single.bounds.height, stroke.bounds.height);
+
+    await drag.up();
+    await tester.pump();
+
+    expect(controller.page.strokes.single.points.first.x, closeTo(355, .01));
+    expect(controller.page.strokes.single.points.first.y, closeTo(295, .01));
+    expect(controller.page.strokes.single.bounds.width, stroke.bounds.width);
+    expect(controller.page.strokes.single.bounds.height, stroke.bounds.height);
+    expect(controller.history.undoDepth, historyBeforeMove + 1);
+    await controller.flush();
+  });
+
   testWidgets(
     'finger can drag from empty space inside the visible selection frame',
     (tester) async {

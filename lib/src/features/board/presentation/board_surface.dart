@@ -2813,6 +2813,11 @@ class _SelectionOverlayState extends State<_SelectionOverlay> {
       Offset(world.right, world.bottom),
     );
     final rect = Rect.fromPoints(topLeft, bottomRight).inflate(5);
+    // Four 44 px edge targets plus the 48 px corner controls can cover the
+    // complete body of a small or very flat selection. In compact mode retain
+    // uniform scaling and rotation outside the frame, leaving its entire body
+    // available for the underlying move gesture.
+    final compactControls = rect.width < 96 || rect.height < 96;
     return Listener(
       behavior: HitTestBehavior.deferToChild,
       onPointerDown: widget.onClaimPointerDown,
@@ -2849,8 +2854,8 @@ class _SelectionOverlayState extends State<_SelectionOverlay> {
           if (!widget.inlineTextEditing)
             Positioned(
               key: const ValueKey('selection-rotation-handle'),
-              left: rect.left - 24,
-              top: rect.bottom - 24,
+              left: compactControls ? rect.left - 56 : rect.left - 24,
+              top: compactControls ? rect.bottom + 8 : rect.bottom - 24,
               child: Semantics(
                 label: 'Auswahl drehen',
                 button: true,
@@ -2888,8 +2893,8 @@ class _SelectionOverlayState extends State<_SelectionOverlay> {
           // right, visually overlapping) size control.
           if (!widget.inlineTextEditing && controller.selectedCover == null)
             Positioned(
-              left: rect.right - 24,
-              top: rect.bottom - 24,
+              left: compactControls ? rect.right + 8 : rect.right - 24,
+              top: compactControls ? rect.bottom + 8 : rect.bottom - 24,
               child: Semantics(
                 label: 'Auswahl skalieren',
                 button: true,
@@ -2955,7 +2960,9 @@ class _SelectionOverlayState extends State<_SelectionOverlay> {
                 ),
               ),
             ),
-          if (!widget.inlineTextEditing && controller.selectedCover == null)
+          if (!widget.inlineTextEditing &&
+              controller.selectedCover == null &&
+              !compactControls)
             Positioned.fill(
               child: _SelectionEdgeResizeHandles(
                 controller: controller,
