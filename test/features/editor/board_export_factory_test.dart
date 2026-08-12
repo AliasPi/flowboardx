@@ -33,8 +33,10 @@ void main() {
     );
     addTearDown(prepared.dispose);
 
+    expect(prepared.snapshot.pages, hasLength(2));
+
     await expectLater(
-      prepared.snapshot.pages.single.rasterize(_request),
+      prepared.snapshot.pages[1].rasterize(_request),
       throwsA(
         isA<BoardExportException>()
             .having(
@@ -79,6 +81,78 @@ void main() {
     );
     expect(rendererCalled, isFalse);
   });
+
+  testWidgets(
+    'bundled multi-page PDF exports every imported source page in order',
+    (tester) async {
+      final renderedSourcePages = <int>[];
+      final factory = BoardExportFactory(
+        pdfPageRenderer: (_, object) async {
+          renderedSourcePages.add(object.activeSourcePageIndex);
+          throw StateError('page probe');
+        },
+      );
+      final prepared = await factory.prepare(
+        _documentWithPdf(pageIndices: const <int>[2, 5, 9], activePageIndex: 1),
+        const _PdfResolver(r'C:\assets\lesson.pdf'),
+      );
+      addTearDown(prepared.dispose);
+
+      expect(prepared.snapshot.pages, hasLength(3));
+      expect(prepared.snapshot.pages.map((page) => page.label), <String>[
+        'Physik · PDF-Seite 3',
+        'Physik · PDF-Seite 6',
+        'Physik · PDF-Seite 10',
+      ]);
+
+      for (final page in prepared.snapshot.pages) {
+        await expectLater(
+          page.rasterize(_request),
+          throwsA(isA<BoardExportException>()),
+        );
+      }
+      expect(renderedSourcePages, <int>[2, 5, 9]);
+    },
+  );
+
+  testWidgets(
+    'multiple bundled PDFs cover every source page without Cartesian growth',
+    (tester) async {
+      final prepared = await const BoardExportFactory().prepare(
+        _documentWithPdf(
+          pageIndices: const <int>[1, 4, 8],
+          activePageIndex: 1,
+          additionalObjects: <BoardObject>[
+            PdfObject(
+              id: 'second-pdf',
+              transform: const ObjectTransform(
+                x: 1000,
+                y: 0,
+                width: 800,
+                height: 540,
+              ),
+              assetId: 'second-pdf-asset',
+              pageIndices: const <int>[3, 7, 11],
+              activePageIndex: 1,
+            ),
+          ],
+        ),
+        const _PdfResolver(r'C:\assets\lesson.pdf'),
+      );
+      addTearDown(prepared.dispose);
+
+      // Three views driven by the first PDF, plus the two non-active variants
+      // of the second PDF; a 3 x 3 Cartesian export would incorrectly make 9.
+      expect(prepared.snapshot.pages, hasLength(5));
+      expect(prepared.snapshot.pages.map((page) => page.label), <String>[
+        'Physik · PDF 1, Seite 2',
+        'Physik · PDF 1, Seite 5',
+        'Physik · PDF 1, Seite 9',
+        'Physik · PDF 2, Seite 4',
+        'Physik · PDF 2, Seite 12',
+      ]);
+    },
+  );
 }
 
 const _request = ExportRasterRequest(
@@ -91,6 +165,7 @@ const _request = ExportRasterRequest(
 WhiteboardDocument _documentWithPdf({
   List<int> pageIndices = const <int>[0],
   int activePageIndex = 0,
+  List<BoardObject> additionalObjects = const <BoardObject>[],
 }) {
   final timestamp = DateTime.utc(2026, 7, 22);
   return WhiteboardDocument(
@@ -115,6 +190,7 @@ WhiteboardDocument _documentWithPdf({
             pageIndices: pageIndices,
             activePageIndex: activePageIndex,
           ),
+          ...additionalObjects,
         ],
       ),
     ],

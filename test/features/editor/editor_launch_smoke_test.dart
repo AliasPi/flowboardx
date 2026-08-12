@@ -63,6 +63,12 @@ void main() {
           reason: 'The editor workspace must fill its route on first frame.',
         );
         expect(find.byTooltip('Übersicht'), findsOneWidget);
+        if (size.width >= 1180) {
+          expect(
+            find.byKey(const ValueKey('create-whiteboard-from-pages')),
+            findsOneWidget,
+          );
+        }
         expect(tester.takeException(), isNull);
       },
     );

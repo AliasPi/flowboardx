@@ -43,6 +43,8 @@ import 'participant_mode_toggle.dart';
 import 'pdf_import_dialog.dart';
 import 'pdf_import_coordinator.dart';
 import 'pen_color_picker_dialog.dart';
+import 'selected_pages_document_creator.dart';
+import 'selected_pages_preview_dialog.dart';
 import 'table_insert_dialog.dart';
 
 final class _OpenedPdfPreview {
@@ -208,11 +210,15 @@ class _EditorScreenState extends State<EditorScreen>
   bool _pageSheetOpen = false;
   bool _pageDeleteDialogOpen = false;
   bool _exporting = false;
+  bool _creatingSelectedPagesDocument = false;
   double? _exportProgress;
   bool _leaving = false;
   bool _topBarCollapsed = false;
   bool _fingerDrawingEnabled = false;
   late final CountdownTimerController _countdownTimer;
+  late final AndroidCountdownPictureInPicture _countdownPictureInPicture;
+  bool _inTimerPictureInPicture = false;
+  bool? _lastPictureInPictureTimerActive;
   final CountdownTimerOverlayPresenter _largeTimerPresenter =
       CountdownTimerOverlayPresenter();
   Size _layoutSize = Size.zero;
@@ -240,7 +246,15 @@ class _EditorScreenState extends State<EditorScreen>
     );
     _countdownTimer = CountdownTimerController(
       onAlarm: playSystemCountdownAlarm,
+      onAlarmStopped: stopSystemCountdownAlarm,
     );
+    _countdownPictureInPicture = AndroidCountdownPictureInPicture();
+    _countdownPictureInPicture.addListener(
+      _handleCountdownPictureInPictureChange,
+    );
+    _countdownTimer.addListener(_synchronizeCountdownPictureInPicture);
+    unawaited(_countdownPictureInPicture.refresh());
+    _synchronizeCountdownPictureInPicture();
     _secondaryEditor = EditorController.participantView(
       _editor,
       participantId: 'right',
@@ -298,6 +312,7 @@ class _EditorScreenState extends State<EditorScreen>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       _countdownTimer.refresh();
+      unawaited(_countdownPictureInPicture.refresh());
     }
     if (state == AppLifecycleState.inactive ||
         state == AppLifecycleState.paused ||
@@ -317,6 +332,12 @@ class _EditorScreenState extends State<EditorScreen>
     _primaryParticipant.dispose();
     _secondaryParticipant.dispose();
     _largeTimerPresenter.dispose();
+    _countdownTimer.removeListener(_synchronizeCountdownPictureInPicture);
+    _countdownPictureInPicture.removeListener(
+      _handleCountdownPictureInPictureChange,
+    );
+    unawaited(_countdownPictureInPicture.setTimerActive(false));
+    _countdownPictureInPicture.dispose();
     _countdownTimer.dispose();
     _radialPageGestureActive.dispose();
     _secondaryRadialPageGestureActive.dispose();
@@ -333,6 +354,9 @@ class _EditorScreenState extends State<EditorScreen>
 
   @override
   Widget build(BuildContext context) {
+    if (_inTimerPictureInPicture) {
+      return CountdownTimerPictureInPictureView(controller: _countdownTimer);
+    }
     return PopScope(
       canPop: false,
       onPopInvokedWithResult: (didPop, _) {
@@ -365,6 +389,8 @@ class _EditorScreenState extends State<EditorScreen>
                     onBack: _leave,
                     onRename: _rename,
                     onPages: _showPagesSheet,
+                    onCreateWhiteboardFromPages: () =>
+                        unawaited(_createWhiteboardFromSelectedPages()),
                     onSaveCurrentPageAsTemplate: () =>
                         unawaited(_saveCurrentPageAsTemplate()),
                     onResetMenuPosition: _resetRadialMenuPosition,
@@ -409,7 +435,7 @@ class _EditorScreenState extends State<EditorScreen>
                     width: 500,
                     child: _ErrorBanner(message: message),
                   ),
-                if (_exporting)
+                if (_exporting || _creatingSelectedPagesDocument)
                   Positioned.fill(
                     child: ColoredBox(
                       color: Colors.black54,
@@ -423,16 +449,21 @@ class _EditorScreenState extends State<EditorScreen>
                                 mainAxisSize: MainAxisSize.min,
                                 children: [
                                   CircularProgressIndicator(
-                                    value: _exportProgress,
+                                    value: _creatingSelectedPagesDocument
+                                        ? null
+                                        : _exportProgress,
                                   ),
                                   const SizedBox(height: 20),
                                   Text(
-                                    'PDF wird erstellt',
+                                    _creatingSelectedPagesDocument
+                                        ? 'Neues Whiteboard wird erstellt'
+                                        : 'PDF wird erstellt',
                                     style: Theme.of(
                                       context,
                                     ).textTheme.titleLarge,
                                   ),
-                                  if (_exportProgress != null) ...[
+                                  if (!_creatingSelectedPagesDocument &&
+                                      _exportProgress != null) ...[
                                     const SizedBox(height: 8),
                                     Text(
                                       '${(_exportProgress! * 100).round()} %',
@@ -788,6 +819,8 @@ class _EditorScreenState extends State<EditorScreen>
       RadialExportAction.savePdf => _savePdf(),
       RadialExportAction.shareLocal => _sharePdf(),
       RadialExportAction.quickShare => _quickSharePdf(),
+      RadialExportAction.newWhiteboardFromPages =>
+        _createWhiteboardFromSelectedPages(),
     }),
   );
 
@@ -1078,6 +1111,54 @@ class _EditorScreenState extends State<EditorScreen>
     }
   }
 
+  void _synchronizeCountdownPictureInPicture() {
+    final active = _countdownTimer.isRunning || _countdownTimer.isAlarmActive;
+    if (_lastPictureInPictureTimerActive == active) return;
+    _lastPictureInPictureTimerActive = active;
+    unawaited(_countdownPictureInPicture.setTimerActive(active));
+  }
+
+  void _handleCountdownPictureInPictureChange() {
+    if (!mounted) return;
+    final next = _countdownPictureInPicture.isInPictureInPictureMode;
+    if (_inTimerPictureInPicture == next) return;
+    if (next) {
+      // The root OverlayEntry otherwise remains above the compact PiP tree.
+      _largeTimerPresenter.hide(controller: _countdownTimer, force: true);
+    }
+    setState(() => _inTimerPictureInPicture = next);
+    if (!next && (_countdownTimer.isRunning || _countdownTimer.isAlarmActive)) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && !_inTimerPictureInPicture) _showLargeTimer();
+      });
+    }
+  }
+
+  Future<void> _minimizeActiveTimer() async {
+    if (_leaving) return;
+    _leaving = true;
+    _showLargeTimer();
+    try {
+      await _editor.flush();
+      if (!mounted) return;
+      if (!_countdownTimer.isRunning && !_countdownTimer.isAlarmActive) {
+        Navigator.of(context).pop(true);
+        return;
+      }
+      await _countdownPictureInPicture.enterNow();
+      // If PiP is unavailable, keeping the large panel open is safer than
+      // silently disposing a countdown which the user asked to keep visible.
+    } catch (error) {
+      if (mounted) {
+        _showError(
+          'Das Whiteboard konnte vor dem Minimieren noch nicht sicher gespeichert werden: $error',
+        );
+      }
+    } finally {
+      _leaving = false;
+    }
+  }
+
   void _onEditorChanged() {
     if (!mounted) return;
     if (_participantMode == EditorParticipantMode.onePerson) {
@@ -1331,11 +1412,11 @@ class _EditorScreenState extends State<EditorScreen>
   }
 
   Future<void> _leave() async {
-    if (_countdownTimer.isAlarmActive) {
-      // Back navigation must not silently dispose the controller and thereby
-      // stop an unacknowledged alarm. Bring its explicit confirmation back to
-      // the foreground instead.
-      _showLargeTimer();
+    if (_countdownTimer.isRunning || _countdownTimer.isAlarmActive) {
+      // Back navigation behaves like leaving for another app while a timer is
+      // active: minimize into PiP instead of disposing the countdown. On a
+      // device without PiP the synchronized large panel remains in-app.
+      unawaited(_minimizeActiveTimer());
       return;
     }
     if (_leaving) return;
@@ -1688,6 +1769,7 @@ class _EditorScreenState extends State<EditorScreen>
   }
 
   Future<void> _showPagesSheet() async {
+    if (_pageSheetOpen) return;
     final screen = MediaQuery.sizeOf(context);
     final itemExtent = math.min(290.0, math.max(230.0, screen.width * .24));
     _pageSheetOpen = true;
@@ -1719,6 +1801,59 @@ class _EditorScreenState extends State<EditorScreen>
     } finally {
       _pageSheetOpen = false;
       if (mounted && _thumbnailRefreshQueued) _startThumbnailRefresh();
+    }
+  }
+
+  Future<void> _createWhiteboardFromSelectedPages() async {
+    if (_pageSheetOpen ||
+        _creatingSelectedPagesDocument ||
+        _exporting ||
+        !mounted) {
+      return;
+    }
+
+    final sourceDocument = _editor.document;
+    _thumbnailDebounce?.cancel();
+    _pageSheetOpen = true;
+    SelectedPagesRequest? request;
+    try {
+      request = await SelectedPagesPreviewDialog.show(
+        context,
+        pages: List<BoardPage>.of(sourceDocument.pages),
+        thumbnails: Map<String, ui.Image>.of(_thumbnails),
+        suggestedTitle: '${sourceDocument.title} – Auswahl',
+      );
+    } finally {
+      _pageSheetOpen = false;
+      if (mounted && _thumbnailRefreshQueued) _startThumbnailRefresh();
+    }
+    if (request == null || !mounted) return;
+
+    setState(() => _creatingSelectedPagesDocument = true);
+    try {
+      // Persist the source first so returning to it from the library never
+      // reveals an older snapshot than the pages copied below.
+      await _editor.flush();
+      final created = await SelectedPagesDocumentCreator().create(
+        sourceDocument: _editor.document,
+        sourceAssetDirectory: widget.assetDirectory,
+        selectedPageIds: request.pageIds,
+        title: request.title,
+        repository: widget.repository,
+      );
+      if (!mounted) return;
+      setState(() => _creatingSelectedPagesDocument = false);
+      // FlowboardHome opens this result after the current editor route has
+      // completed and disposed, avoiding two live editor/timer controllers.
+      Navigator.of(context).pop(created);
+    } catch (error) {
+      if (mounted) {
+        _showError('Das neue Whiteboard konnte nicht erstellt werden: $error');
+      }
+    } finally {
+      if (mounted && _creatingSelectedPagesDocument) {
+        setState(() => _creatingSelectedPagesDocument = false);
+      }
     }
   }
 
@@ -2418,6 +2553,7 @@ class _EditorTopBar extends StatelessWidget {
     required this.onBack,
     required this.onRename,
     required this.onPages,
+    required this.onCreateWhiteboardFromPages,
     required this.onSaveCurrentPageAsTemplate,
     required this.onResetMenuPosition,
     required this.onHelp,
@@ -2442,6 +2578,7 @@ class _EditorTopBar extends StatelessWidget {
   final Future<void> Function() onBack;
   final VoidCallback onRename;
   final VoidCallback? onPages;
+  final VoidCallback onCreateWhiteboardFromPages;
   final VoidCallback onSaveCurrentPageAsTemplate;
   final VoidCallback onResetMenuPosition;
   final VoidCallback onHelp;
@@ -2586,6 +2723,12 @@ class _EditorTopBar extends StatelessWidget {
                     ),
                   if (showAuxiliaryActions) ...[
                     IconButton(
+                      key: const ValueKey('create-whiteboard-from-pages'),
+                      tooltip: 'Seiten in neues Whiteboard übernehmen',
+                      onPressed: onCreateWhiteboardFromPages,
+                      icon: const Icon(Icons.library_add_outlined),
+                    ),
+                    IconButton(
                       tooltip: 'Aktuelle Seite als Vorlage speichern',
                       onPressed: onSaveCurrentPageAsTemplate,
                       icon: const Icon(Icons.bookmark_add_outlined),
@@ -2615,6 +2758,8 @@ class _EditorTopBar extends StatelessWidget {
                         switch (action) {
                           case _EditorTopBarAction.pages:
                             onPages?.call();
+                          case _EditorTopBarAction.createWhiteboardFromPages:
+                            onCreateWhiteboardFromPages();
                           case _EditorTopBarAction.saveTemplate:
                             onSaveCurrentPageAsTemplate();
                           case _EditorTopBarAction.resetMenu:
@@ -2882,6 +3027,13 @@ class _EditorTopBar extends StatelessWidget {
                             ),
                           ),
                         const PopupMenuItem(
+                          value: _EditorTopBarAction.createWhiteboardFromPages,
+                          child: ListTile(
+                            leading: Icon(Icons.library_add_outlined),
+                            title: Text('Seiten in neues Whiteboard'),
+                          ),
+                        ),
+                        const PopupMenuItem(
                           value: _EditorTopBarAction.saveTemplate,
                           child: ListTile(
                             leading: Icon(Icons.bookmark_add_outlined),
@@ -3084,6 +3236,7 @@ enum _EditorTopBarAction {
   secondaryPenStraight,
   secondaryPenEraser,
   pages,
+  createWhiteboardFromPages,
   saveTemplate,
   resetMenu,
   help,

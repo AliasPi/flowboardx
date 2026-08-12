@@ -357,6 +357,25 @@ class StylusPalmGuardTest {
         )
     }
 
+    @Test
+    fun discardedStaleStylusCreatesNoReleaseProtection() {
+        val guard = StylusPalmGuard(
+            protectionRadiusDp = 300.0,
+            releaseGraceMillis = 500L,
+        )
+        guard.stylusDown(stylus, point(500.0, 500.0), 100L)
+        guard.discardStyluses(listOf(stylus))
+
+        assertFalse(
+            guard.shouldSuppressTouch(
+                touch,
+                StylusPalmGuard.TouchPhase.START,
+                listOf(palm(520.0, 520.0)),
+                101L,
+            ),
+        )
+    }
+
     private fun point(x: Double, y: Double) =
         StylusPalmGuard.Position(xDp = x, yDp = y)
 

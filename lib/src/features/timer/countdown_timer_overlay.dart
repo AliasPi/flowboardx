@@ -248,6 +248,64 @@ class CountdownTimerOverlay extends StatefulWidget {
   State<CountdownTimerOverlay> createState() => _CountdownTimerOverlayState();
 }
 
+/// Minimal timer-only surface rendered while Android owns the PiP window.
+///
+/// Controls and board chrome deliberately stay out of this tree. Tapping the
+/// system PiP window expands the activity, where the synchronized large panel
+/// exposes pause, reset and alarm acknowledgement again.
+class CountdownTimerPictureInPictureView extends StatelessWidget {
+  const CountdownTimerPictureInPictureView({
+    required this.controller,
+    super.key,
+  });
+
+  final CountdownTimerController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    return ColoredBox(
+      key: const ValueKey('countdown-picture-in-picture'),
+      color: FlowboardColors.background,
+      child: ValueListenableBuilder<CountdownTimerState>(
+        valueListenable: controller.liveState,
+        builder: (context, state, _) {
+          final urgent =
+              state.isRunning && state.remaining <= const Duration(seconds: 30);
+          final color = state.isFinished || urgent
+              ? FlowboardColors.warning
+              : FlowboardColors.textPrimary;
+          return Center(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 8),
+              child: FittedBox(
+                fit: BoxFit.contain,
+                child: Semantics(
+                  liveRegion: true,
+                  label:
+                      'Verbleibende Zeit ${formatCountdown(state.remaining)}',
+                  child: Text(
+                    formatCountdown(state.remaining),
+                    key: const ValueKey('countdown-picture-in-picture-value'),
+                    maxLines: 1,
+                    style: TextStyle(
+                      color: color,
+                      fontSize: 92,
+                      height: .9,
+                      fontFeatures: const [FontFeature.tabularFigures()],
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 1.5,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
 class _CountdownTimerOverlayState extends State<CountdownTimerOverlay> {
   late Rect _rect = CountdownOverlayGeometry.constrain(
     widget.initialRect ?? CountdownOverlayGeometry.initialRect(widget.bounds),

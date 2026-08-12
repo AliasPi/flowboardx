@@ -82,6 +82,7 @@ final class CountdownTimerController extends ChangeNotifier {
   CountdownTimerController({
     Duration initialDuration = const Duration(minutes: 5),
     VoidCallback? onAlarm,
+    VoidCallback? onAlarmStopped,
     CountdownNow? now,
     CountdownScheduler? scheduler,
     this.refreshInterval = const Duration(seconds: 1),
@@ -93,6 +94,7 @@ final class CountdownTimerController extends ChangeNotifier {
        _configuredDuration = clampCountdownDuration(initialDuration),
        _remaining = clampCountdownDuration(initialDuration),
        _onAlarm = onAlarm,
+       _onAlarmStopped = onAlarmStopped,
        _clock = now == null ? _MonotonicClock() : null,
        _nowOverride = now,
        _scheduler = scheduler ?? _scheduleWithDartTimer {
@@ -108,6 +110,7 @@ final class CountdownTimerController extends ChangeNotifier {
   final Duration refreshInterval;
   final Duration alarmRepeatInterval;
   final VoidCallback? _onAlarm;
+  final VoidCallback? _onAlarmStopped;
   final _MonotonicClock? _clock;
   final CountdownNow? _nowOverride;
   final CountdownScheduler _scheduler;
@@ -318,6 +321,23 @@ final class CountdownTimerController extends ChangeNotifier {
     _alarmWakeUp?.cancel();
     _alarmWakeUp = null;
     _alarmActive = false;
+    if (changed) {
+      final callback = _onAlarmStopped;
+      if (callback != null) {
+        try {
+          callback();
+        } catch (error, stackTrace) {
+          FlutterError.reportError(
+            FlutterErrorDetails(
+              exception: error,
+              stack: stackTrace,
+              library: 'FlowboardX countdown timer',
+              context: ErrorDescription('while stopping the countdown alarm'),
+            ),
+          );
+        }
+      }
+    }
     if (notify && changed) _publish();
   }
 
@@ -383,25 +403,87 @@ String formatCountdown(Duration duration) {
   return '$minuteText:$secondText';
 }
 
-/// Plays the platform's alert sound without letting a missing platform
-/// implementation terminate the countdown callback.
-void playSystemCountdownAlarm() {
-  unawaited(
-    SystemSound.play(SystemSoundType.alert).onError((
-      Object error,
-      StackTrace stackTrace,
-    ) {
-      FlutterError.reportError(
-        FlutterErrorDetails(
-          exception: error,
-          stack: stackTrace,
-          library: 'FlowboardX countdown timer',
-          context: ErrorDescription('while invoking the system alert sound'),
-        ),
-      );
-    }),
+/// Platform alarm output used by the countdown controller.
+///
+/// Flutter intentionally ignores [SystemSoundType.alert] on Android. Android
+/// therefore uses the app's native alarm channel, which plays repeated pulses
+/// on the system's alarm audio stream until [stop] is called.
+abstract final class SystemCountdownAlarm {
+  static const MethodChannel _androidChannel = MethodChannel(
+    'de.flowboardx/countdown_alarm',
   );
+
+  static Future<void> play() async {
+    if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+      var started = false;
+      try {
+        started = await _androidChannel.invokeMethod<bool>('play') == true;
+      } catch (error, stackTrace) {
+        _reportAudioError(
+          error,
+          stackTrace,
+          'while invoking Android alarm audio',
+        );
+      }
+      if (!started) {
+        // A device without an alarm implementation still gets an audible
+        // best-effort signal instead of silently doing nothing.
+        try {
+          await SystemSound.play(SystemSoundType.click);
+        } catch (error, stackTrace) {
+          _reportAudioError(
+            error,
+            stackTrace,
+            'while playing the fallback sound',
+          );
+        }
+      }
+      return;
+    }
+
+    try {
+      await SystemSound.play(SystemSoundType.alert);
+    } catch (error, stackTrace) {
+      _reportAudioError(
+        error,
+        stackTrace,
+        'while invoking the system alarm sound',
+      );
+    }
+  }
+
+  static Future<void> stop() async {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return;
+    try {
+      await _androidChannel.invokeMethod<void>('stop');
+    } catch (error, stackTrace) {
+      _reportAudioError(
+        error,
+        stackTrace,
+        'while stopping the system alarm sound',
+      );
+    }
+  }
+
+  static void _reportAudioError(
+    Object error,
+    StackTrace stackTrace,
+    String context,
+  ) {
+    FlutterError.reportError(
+      FlutterErrorDetails(
+        exception: error,
+        stack: stackTrace,
+        library: 'FlowboardX countdown timer',
+        context: ErrorDescription(context),
+      ),
+    );
+  }
 }
+
+void playSystemCountdownAlarm() => unawaited(SystemCountdownAlarm.play());
+
+void stopSystemCountdownAlarm() => unawaited(SystemCountdownAlarm.stop());
 
 final class _MonotonicClock {
   _MonotonicClock() {

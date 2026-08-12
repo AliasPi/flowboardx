@@ -33,7 +33,12 @@ enum RadialPdfImportMode { singlePage, pageRange, allPages }
 
 enum RadialCoverDirection { horizontal, vertical }
 
-enum RadialExportAction { savePdf, shareLocal, quickShare }
+enum RadialExportAction {
+  savePdf,
+  shareLocal,
+  quickShare,
+  newWhiteboardFromPages,
+}
 
 @immutable
 class RadialPenSettings {
@@ -304,6 +309,7 @@ class RadialMenuLabels {
       RadialExportAction.savePdf: 'Als PDF speichern',
       RadialExportAction.shareLocal: 'Per WLAN / QR teilen',
       RadialExportAction.quickShare: 'Quick Share',
+      RadialExportAction.newWhiteboardFromPages: 'Seiten in neues Whiteboard',
     },
     thickness: 'Stiftdicke',
     previousPages: 'Vorherige Seiten',

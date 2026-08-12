@@ -714,6 +714,7 @@ class EditorController extends ChangeNotifier {
     ActivePenStyle? style,
     String? authorId,
     Offset? samplingPosition,
+    double viewportScale = 1,
   }) {
     if (_handwritingConversionInProgress) return false;
     // A transform preview is a single atomic document operation. Ink sessions
@@ -739,6 +740,7 @@ class EditorController extends ChangeNotifier {
       style: style ?? penStyle,
       authorId: authorId ?? 'pointer-${event.device}',
       samplingPosition: samplingPosition,
+      viewportScale: viewportScale,
     );
     if (!began) {
       _annotationTargets.remove(event.pointer);

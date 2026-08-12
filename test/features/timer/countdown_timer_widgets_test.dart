@@ -57,6 +57,38 @@ void main() {
     controller.dispose();
   });
 
+  testWidgets('starting a long timer requests the large display immediately', (
+    tester,
+  ) async {
+    final controller = CountdownTimerController();
+    addTearDown(controller.dispose);
+    var showLargeCount = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: buildFlowboardTheme(),
+        home: Scaffold(
+          body: CountdownTimerSetupDialog(
+            controller: controller,
+            onShowLarge: () => showLargeCount++,
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.widgetWithText(ChoiceChip, '10 min'));
+    await tester.pump();
+    await tester.ensureVisible(
+      find.byKey(const ValueKey('countdown-setup-start-pause')),
+    );
+    await tester.tap(find.byKey(const ValueKey('countdown-setup-start-pause')));
+    await tester.pump();
+
+    expect(controller.isRunning, isTrue);
+    expect(controller.configuredDuration, const Duration(minutes: 10));
+    expect(showLargeCount, 1);
+    controller.dispose();
+  });
+
   testWidgets('large action applies edits and requests the non-modal overlay', (
     tester,
   ) async {

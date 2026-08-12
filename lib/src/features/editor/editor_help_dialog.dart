@@ -111,7 +111,7 @@ class FlowboardHelpDialog extends StatelessWidget {
                       title: 'Timer',
                       lines: [
                         'Über das Timer-Symbol eine Dauer einstellen, starten, pausieren oder zurücksetzen.',
-                        'Ab einer Minute Restzeit erscheint die große Anzeige automatisch. Bei null ertönt der Alarm wiederholt, bis er dort mit „Alarm stoppen“ bestätigt wird.',
+                        'Beim Start erscheint die große Anzeige sofort. Beim Wechsel zu einer anderen App bleibt ein laufender Timer unter Android als Bild-im-Bild sichtbar. Bei null ertönt der Alarm wiederholt, bis er dort mit „Alarm stoppen“ bestätigt wird.',
                         'Die große Anzeige lässt sich verschieben und skalieren. Außerhalb ihres Rechtecks kann ohne Unterbrechung weitergeschrieben werden.',
                       ],
                     ),

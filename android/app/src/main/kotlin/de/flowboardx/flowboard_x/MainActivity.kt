@@ -1,8 +1,11 @@
 package de.flowboardx.flowboard_x
 
 import android.app.Activity
+import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.content.Intent
 import android.os.Bundle
+import android.os.Build
 import android.view.MotionEvent
 import android.view.View
 import io.flutter.embedding.android.FlutterActivity
@@ -19,6 +22,8 @@ class MainActivity : FlutterActivity() {
     private var palmInputService: AndroidPalmInputService? = null
     private var smartBoardCompatibilityService: SmartBoardCompatibilityService? = null
     private var pdfQuickShareService: AndroidPdfQuickShareService? = null
+    private var countdownAlarmService: AndroidCountdownAlarmService? = null
+    private var countdownPictureInPictureService: AndroidCountdownPictureInPictureService? = null
     private var pendingWidgetAction: Map<String, Any?>? = null
     private var pendingPdfSave: PendingPdfSave? = null
 
@@ -86,6 +91,23 @@ class MainActivity : FlutterActivity() {
             this,
             flutterEngine.dartExecutor.binaryMessenger,
         )
+        countdownAlarmService?.dispose()
+        countdownAlarmService = AndroidCountdownAlarmService(
+            flutterEngine.dartExecutor.binaryMessenger,
+        )
+        countdownPictureInPictureService?.dispose()
+        countdownPictureInPictureService =
+            if (
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+                    packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)
+            ) {
+                AndroidCountdownPictureInPictureService(
+                    this,
+                    flutterEngine.dartExecutor.binaryMessenger,
+                )
+            } else {
+                null
+            }
     }
 
     override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
@@ -101,6 +123,10 @@ class MainActivity : FlutterActivity() {
         smartBoardCompatibilityService = null
         pdfQuickShareService?.dispose()
         pdfQuickShareService = null
+        countdownAlarmService?.dispose()
+        countdownAlarmService = null
+        countdownPictureInPictureService?.dispose()
+        countdownPictureInPictureService = null
         pendingPdfSave?.result?.error(
             "engine_closed",
             "Der Speichervorgang wurde beendet.",
@@ -131,6 +157,21 @@ class MainActivity : FlutterActivity() {
     override fun onResume() {
         super.onResume()
         smartBoardCompatibilityService?.applyDrawingSurfacePolicy()
+    }
+
+    override fun onUserLeaveHint() {
+        countdownPictureInPictureService?.onUserLeaveHint()
+        super.onUserLeaveHint()
+    }
+
+    override fun onPictureInPictureModeChanged(
+        isInPictureInPictureMode: Boolean,
+        newConfig: Configuration,
+    ) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        countdownPictureInPictureService?.onPictureInPictureModeChanged(
+            isInPictureInPictureMode,
+        )
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {

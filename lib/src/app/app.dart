@@ -7,6 +7,7 @@ import 'package:uuid/uuid.dart';
 import '../data/document_repository.dart';
 import '../domain/model/document.dart';
 import '../features/editor/editor_screen.dart';
+import '../features/editor/selected_pages_document_creator.dart';
 import '../features/library/document_library.dart';
 import '../platform/android_widget_bridge.dart';
 import '../platform/smart_board_compatibility.dart';
@@ -124,15 +125,27 @@ class _FlowboardHomeState extends State<FlowboardHome>
     WhiteboardDocument document,
     Directory assetDirectory,
   ) async {
-    await Navigator.of(context).push<bool>(
-      MaterialPageRoute(
-        builder: (_) => EditorScreen(
-          document: document,
-          repository: widget.repository,
-          assetDirectory: assetDirectory,
+    var nextDocument = document;
+    var nextAssetDirectory = assetDirectory;
+    while (mounted) {
+      final routeDocument = nextDocument;
+      final routeAssetDirectory = nextAssetDirectory;
+      final result = await Navigator.of(context).push<Object?>(
+        MaterialPageRoute(
+          builder: (_) => EditorScreen(
+            document: routeDocument,
+            repository: widget.repository,
+            assetDirectory: routeAssetDirectory,
+          ),
         ),
-      ),
-    );
+      );
+      if (result is! CreatedPagesDocument || !mounted) break;
+      // The previous route has completed before the new route is pushed. Its
+      // editor and timer controllers therefore cannot remain stacked below the
+      // newly created whiteboard.
+      nextDocument = result.document;
+      nextAssetDirectory = result.assetDirectory;
+    }
     if (!mounted) return;
     setState(() => _libraryGeneration++);
     await _syncAndroidWidget();

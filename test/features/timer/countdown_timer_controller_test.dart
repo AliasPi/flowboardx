@@ -59,6 +59,35 @@ void main() {
       expect(controller.acknowledgeAlarm(), isFalse);
     });
 
+    test('stops active alarm output exactly once', () {
+      final time = _ManualTime();
+      var alarmCount = 0;
+      var stopCount = 0;
+      final controller = CountdownTimerController(
+        initialDuration: const Duration(seconds: 1),
+        now: time.now,
+        scheduler: time.schedule,
+        onAlarm: () => alarmCount++,
+        onAlarmStopped: () => stopCount++,
+      );
+
+      controller.start();
+      time.elapse(const Duration(seconds: 2));
+      expect(alarmCount, 2);
+      expect(stopCount, 0);
+
+      expect(controller.acknowledgeAlarm(), isTrue);
+      expect(stopCount, 1);
+      expect(controller.acknowledgeAlarm(), isFalse);
+      controller.reset();
+      expect(stopCount, 1);
+
+      controller.start();
+      time.elapse(const Duration(seconds: 1));
+      controller.dispose();
+      expect(stopCount, 2, reason: 'Disposal must stop native playback too.');
+    });
+
     test('publishes one atomic live state for every countdown view', () {
       final time = _ManualTime();
       final controller = CountdownTimerController(

@@ -137,6 +137,19 @@ void main() {
     expect(RadialPenPreset.defaults, isEmpty);
   });
 
+  test('export menu exposes creating a whiteboard from selected pages', () {
+    final labels = RadialMenuLabels.german();
+
+    expect(
+      RadialExportAction.values,
+      contains(RadialExportAction.newWhiteboardFromPages),
+    );
+    expect(
+      labels.exportActions[RadialExportAction.newWhiteboardFromPages],
+      'Seiten in neues Whiteboard',
+    );
+  });
+
   test('primary action enum is the required clockwise order', () {
     expect(RadialMenuAction.values, <RadialMenuAction>[
       RadialMenuAction.pen,

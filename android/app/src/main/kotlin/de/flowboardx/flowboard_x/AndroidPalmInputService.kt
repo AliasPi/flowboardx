@@ -13,6 +13,184 @@ import kotlin.math.hypot
 import kotlin.math.max
 
 /**
+ * Tracks exactly which Android pointer lifetimes were forwarded as real pens.
+ *
+ * Some touchscreen drivers briefly label the second finger of a pinch as a
+ * stylus. Once that happens, the pointer must remain ambiguous for the rest
+ * of its lifetime even if the driver changes its tool type again.
+ */
+internal class StylusPointerLifecycle<K : Any> {
+    private data class PointerIdentity(
+        val deviceId: Int,
+        val downTimeMillis: Long,
+        val pointerId: Int,
+    )
+
+    private data class ForwardedPointer<K>(
+        val identity: PointerIdentity,
+        val key: K,
+    )
+
+    private val ambiguousPointers = ArrayList<PointerIdentity>()
+    private val forwardedPointers = ArrayList<ForwardedPointer<K>>()
+
+    /**
+     * Returns true and records [key] only for a down which may represent a
+     * real pen. A stylus-like POINTER_DOWN after an existing finger is latched
+     * as ambiguous instead.
+     */
+    fun registerReportedStylusDown(
+        deviceId: Int,
+        downTimeMillis: Long,
+        pointerId: Int,
+        key: K,
+        hasExistingFinger: Boolean,
+    ): Boolean {
+        val identity = PointerIdentity(deviceId, downTimeMillis, pointerId)
+        // Pointer ownership is monotonic for one Android lifetime. A malformed
+        // duplicate DOWN must not turn a pen already forwarded to the guard
+        // into an ambiguous pointer and leave that guard entry orphaned.
+        if (indexOfForwarded(identity) >= 0) return true
+        if (containsIdentity(ambiguousPointers, identity)) return false
+        if (hasExistingFinger) {
+            ambiguousPointers += identity
+            return false
+        }
+        forwardedPointers += ForwardedPointer(identity, key)
+        return true
+    }
+
+    fun canForwardReportedStylusSample(
+        deviceId: Int,
+        downTimeMillis: Long,
+        pointerId: Int,
+    ): Boolean {
+        val identity = PointerIdentity(deviceId, downTimeMillis, pointerId)
+        return !containsIdentity(ambiguousPointers, identity) &&
+            indexOfForwarded(identity) >= 0
+    }
+
+    /**
+     * Drops unterminated pointer lifetimes when Android starts a new stream on
+     * the same physical device. ACTION_DOWN is an authoritative stream
+     * boundary even when a vendor driver omitted the preceding UP/CANCEL.
+     */
+    fun beginStream(deviceId: Int, downTimeMillis: Long): List<K> {
+        var ambiguousIndex = ambiguousPointers.lastIndex
+        while (ambiguousIndex >= 0) {
+            val identity = ambiguousPointers[ambiguousIndex]
+            if (identity.deviceId == deviceId &&
+                identity.downTimeMillis != downTimeMillis
+            ) {
+                ambiguousPointers.removeAt(ambiguousIndex)
+            }
+            ambiguousIndex -= 1
+        }
+
+        val staleKeys = ArrayList<K>()
+        var forwardedIndex = forwardedPointers.lastIndex
+        while (forwardedIndex >= 0) {
+            val forwarded = forwardedPointers[forwardedIndex]
+            if (forwarded.identity.deviceId == deviceId &&
+                forwarded.identity.downTimeMillis != downTimeMillis
+            ) {
+                staleKeys += forwarded.key
+                forwardedPointers.removeAt(forwardedIndex)
+            }
+            forwardedIndex -= 1
+        }
+        return staleKeys
+    }
+
+    /** Ends one pointer independent of the tool type reported on its UP. */
+    fun finishPointer(
+        deviceId: Int,
+        downTimeMillis: Long,
+        pointerId: Int,
+    ): K? {
+        val identity = PointerIdentity(deviceId, downTimeMillis, pointerId)
+        removeIdentity(ambiguousPointers, identity)
+        val forwardedIndex = indexOfForwarded(identity)
+        if (forwardedIndex < 0) return null
+        return forwardedPointers.removeAt(forwardedIndex).key
+    }
+
+    /** Ends every forwarded pointer and ambiguity marker in one event stream. */
+    fun finishStream(
+        deviceId: Int,
+        downTimeMillis: Long,
+    ): List<K> {
+        var ambiguousIndex = ambiguousPointers.lastIndex
+        while (ambiguousIndex >= 0) {
+            val identity = ambiguousPointers[ambiguousIndex]
+            if (identity.deviceId == deviceId &&
+                identity.downTimeMillis == downTimeMillis
+            ) {
+                ambiguousPointers.removeAt(ambiguousIndex)
+            }
+            ambiguousIndex -= 1
+        }
+
+        val endedKeys = ArrayList<K>()
+        var forwardedIndex = forwardedPointers.lastIndex
+        while (forwardedIndex >= 0) {
+            val forwarded = forwardedPointers[forwardedIndex]
+            if (forwarded.identity.deviceId == deviceId &&
+                forwarded.identity.downTimeMillis == downTimeMillis
+            ) {
+                endedKeys += forwarded.key
+                forwardedPointers.removeAt(forwardedIndex)
+            }
+            forwardedIndex -= 1
+        }
+        return endedKeys
+    }
+
+    fun isAmbiguous(
+        deviceId: Int,
+        downTimeMillis: Long,
+        pointerId: Int,
+    ): Boolean = containsIdentity(
+        ambiguousPointers,
+        PointerIdentity(deviceId, downTimeMillis, pointerId),
+    )
+
+    fun clear() {
+        ambiguousPointers.clear()
+        forwardedPointers.clear()
+    }
+
+    private fun indexOfForwarded(identity: PointerIdentity): Int {
+        for (index in forwardedPointers.indices) {
+            if (forwardedPointers[index].identity == identity) return index
+        }
+        return -1
+    }
+
+    private fun containsIdentity(
+        pointers: List<PointerIdentity>,
+        identity: PointerIdentity,
+    ): Boolean {
+        for (pointer in pointers) {
+            if (pointer == identity) return true
+        }
+        return false
+    }
+
+    private fun removeIdentity(
+        pointers: MutableList<PointerIdentity>,
+        identity: PointerIdentity,
+    ) {
+        for (index in pointers.indices) {
+            if (pointers[index] == identity) {
+                pointers.removeAt(index)
+                return
+            }
+        }
+    }
+}
+
+/**
  * Passive Android palm observer.
  *
  * Samsung/Android can classify an unintended touch only after Flutter has
@@ -40,6 +218,8 @@ class AndroidPalmInputService(
     private val viewOriginScratch = IntArray(2)
     private val stylusPointerKeys =
         LongSparseArray<StylusPalmGuard.PointerKey>()
+    private val stylusPointerLifecycle =
+        StylusPointerLifecycle<StylusPalmGuard.PointerKey>()
     private var coordinateCacheReady = false
     private var cachedCoordinateDensity = fallbackDensity.toDouble()
     private var cachedViewOriginAvailable = false
@@ -57,6 +237,18 @@ class AndroidPalmInputService(
     fun observe(event: MotionEvent): Boolean {
         if (disposed) return false
         try {
+            if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+                // A fresh Android stream proves that every missing terminal
+                // packet from this device is stale. Remove those guard entries
+                // without release grace before deciding whether the new DOWN
+                // itself is touch or stylus input.
+                stylusPalmGuard.discardStyluses(
+                    stylusPointerLifecycle.beginStream(
+                        event.deviceId,
+                        event.downTime,
+                    ),
+                )
+            }
             if (event.actionMasked == MotionEvent.ACTION_DOWN ||
                 event.actionMasked == MotionEvent.ACTION_POINTER_DOWN
             ) {
@@ -185,6 +377,7 @@ class AndroidPalmInputService(
         disposed = true
         traces.clear()
         stylusPointerKeys.clear()
+        stylusPointerLifecycle.clear()
         stylusPalmGuard.clear()
     }
 
@@ -393,22 +586,35 @@ class AndroidPalmInputService(
             -> {
                 val actionIndex = event.actionIndex
                 if (event.isStylusTool(actionIndex)) {
-                    observedStylus = true
-                    logicalViewPosition(
-                        event,
-                        actionIndex,
-                        logicalPositionScratch,
-                    )
-                    stylusPalmGuard.stylusDown(
-                        event.stylusPointerKey(actionIndex),
-                        logicalPositionScratch[0],
-                        logicalPositionScratch[1],
-                        event.eventTime,
-                    )
+                    val stylusKey = event.stylusPointerKey(actionIndex)
+                    val shouldForwardDown =
+                        stylusPointerLifecycle.registerReportedStylusDown(
+                            deviceId = event.deviceId,
+                            downTimeMillis = event.downTime,
+                            pointerId = event.getPointerId(actionIndex),
+                            key = stylusKey,
+                            hasExistingFinger =
+                                event.actionMasked == MotionEvent.ACTION_POINTER_DOWN &&
+                                    event.hasFingerExcept(actionIndex),
+                        )
+                    if (shouldForwardDown) {
+                        observedStylus = true
+                        logicalViewPosition(
+                            event,
+                            actionIndex,
+                            logicalPositionScratch,
+                        )
+                        stylusPalmGuard.stylusDown(
+                            stylusKey,
+                            logicalPositionScratch[0],
+                            logicalPositionScratch[1],
+                            event.eventTime,
+                        )
+                    }
                 }
                 for (pointerIndex in 0 until event.pointerCount) {
                     if (pointerIndex == actionIndex ||
-                        !event.isStylusTool(pointerIndex)
+                        !event.isForwardedStylusPointer(pointerIndex)
                     ) {
                         continue
                     }
@@ -429,7 +635,7 @@ class AndroidPalmInputService(
 
             MotionEvent.ACTION_MOVE -> {
                 for (pointerIndex in 0 until event.pointerCount) {
-                    if (!event.isStylusTool(pointerIndex)) continue
+                    if (!event.isForwardedStylusPointer(pointerIndex)) continue
                     observedStylus = true
                     logicalViewPosition(
                         event,
@@ -449,35 +655,59 @@ class AndroidPalmInputService(
             MotionEvent.ACTION_UP,
             -> {
                 val actionIndex = event.actionIndex
-                for (pointerIndex in 0 until event.pointerCount) {
-                    if (!event.isStylusTool(pointerIndex)) continue
+                val endedStylusKey = stylusPointerLifecycle.finishPointer(
+                    deviceId = event.deviceId,
+                    downTimeMillis = event.downTime,
+                    pointerId = event.getPointerId(actionIndex),
+                )
+                if (endedStylusKey != null) {
                     observedStylus = true
-                    if (pointerIndex == actionIndex) {
-                        stylusPalmGuard.stylusUp(
-                            event.stylusPointerKey(pointerIndex),
-                            event.guardPosition(pointerIndex),
-                            event.eventTime,
-                        )
-                    } else {
-                        stylusPalmGuard.stylusMove(
-                            event.stylusPointerKey(pointerIndex),
-                            event.guardPosition(pointerIndex),
-                            event.eventTime,
-                        )
-                    }
-                }
-            }
-
-            MotionEvent.ACTION_CANCEL -> {
-                for (pointerIndex in 0 until event.pointerCount) {
-                    if (!event.isStylusTool(pointerIndex)) continue
-                    observedStylus = true
+                    // The guard retains the latest valid position. Avoid
+                    // reading axes here so cleanup cannot depend on the tool
+                    // type or malformed metadata in the terminal packet.
                     stylusPalmGuard.stylusUp(
-                        event.stylusPointerKey(pointerIndex),
+                        endedStylusKey,
                         null,
                         event.eventTime,
                     )
                 }
+                for (pointerIndex in 0 until event.pointerCount) {
+                    if (pointerIndex == actionIndex ||
+                        !event.isForwardedStylusPointer(pointerIndex)
+                    ) {
+                        continue
+                    }
+                    observedStylus = true
+                    stylusPalmGuard.stylusMove(
+                        event.stylusPointerKey(pointerIndex),
+                        event.guardPosition(pointerIndex),
+                        event.eventTime,
+                    )
+                }
+                if (event.actionMasked == MotionEvent.ACTION_UP) {
+                    val remainingStylusKeys =
+                        stylusPointerLifecycle.finishStream(
+                            event.deviceId,
+                            event.downTime,
+                        )
+                    if (remainingStylusKeys.isNotEmpty()) observedStylus = true
+                    stylusPalmGuard.cancelStyluses(
+                        remainingStylusKeys,
+                        event.eventTime,
+                    )
+                }
+            }
+
+            MotionEvent.ACTION_CANCEL -> {
+                val endedStylusKeys = stylusPointerLifecycle.finishStream(
+                    event.deviceId,
+                    event.downTime,
+                )
+                observedStylus = endedStylusKeys.isNotEmpty()
+                stylusPalmGuard.cancelStyluses(
+                    endedStylusKeys,
+                    event.eventTime,
+                )
             }
         }
         return observedStylus
@@ -754,6 +984,27 @@ class AndroidPalmInputService(
         val toolType = getToolType(pointerIndex)
         return toolType == MotionEvent.TOOL_TYPE_STYLUS ||
             toolType == MotionEvent.TOOL_TYPE_ERASER
+    }
+
+    private fun MotionEvent.isForwardedStylusPointer(
+        pointerIndex: Int,
+    ): Boolean =
+        isStylusTool(pointerIndex) &&
+            stylusPointerLifecycle.canForwardReportedStylusSample(
+                deviceId = deviceId,
+                downTimeMillis = downTime,
+                pointerId = getPointerId(pointerIndex),
+            )
+
+    private fun MotionEvent.hasFingerExcept(excludedPointerIndex: Int): Boolean {
+        for (pointerIndex in 0 until pointerCount) {
+            if (pointerIndex != excludedPointerIndex &&
+                getToolType(pointerIndex) == MotionEvent.TOOL_TYPE_FINGER
+            ) {
+                return true
+            }
+        }
+        return false
     }
 
     private fun MotionEvent.hasOnlyTouchTools(): Boolean {

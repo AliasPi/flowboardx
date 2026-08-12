@@ -184,6 +184,14 @@ internal class StylusPalmGuard(
         for (key in keys) stylusUp(key, null, eventTimeMillis)
     }
 
+    /** Removes stale native lifetimes without creating release protection. */
+    fun discardStyluses(keys: Iterable<PointerKey>) {
+        for (key in keys) {
+            activeStyluses.remove(key)
+            hoveringStyluses.remove(key)
+        }
+    }
+
     /**
      * Returns true only for a stream which started near a live/recent pen.
      *

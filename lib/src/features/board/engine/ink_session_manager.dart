@@ -7,6 +7,7 @@ import 'package:uuid/uuid.dart';
 
 import '../../../domain/model/geometry.dart';
 import '../../../domain/model/ink.dart';
+import 'board_viewport.dart';
 import 'stroke_sampler.dart';
 
 @immutable
@@ -136,19 +137,22 @@ class InkSessionManager extends ChangeNotifier {
     required ActivePenStyle style,
     required String authorId,
     Offset? samplingPosition,
+    double viewportScale = 1,
   }) {
     if (_sessions.length >= maxConcurrentPointers ||
         _sessions.containsKey(event.pointer)) {
       return false;
     }
     final startedAt = DateTime.now().toUtc();
+    final samplingProfile = _samplingProfile(viewportScale);
     final sampler = StrokeSampler(
-      minimumDistance: _minimumScreenDistance,
-      // The curvature test still commits earlier on a tight bend. A larger
-      // straight-segment ceiling merely removes redundant collinear anchors;
-      // it halves the geometry and path work for broad circles without
-      // sacrificing the sampler's sub-pixel curve tolerance.
-      maximumSegmentLength: _maximumScreenSegmentLength,
+      minimumDistance: samplingProfile.minimumDistance,
+      curveTolerance: samplingProfile.curveTolerance,
+      // At normal zoom the larger straight-segment ceiling keeps broad lines
+      // cheap. When zoomed far out, a small handwritten curve occupies only a
+      // few screen pixels, so tighter thresholds retain enough anchors for a
+      // smooth vector path instead of turning the curve into a polygon.
+      maximumSegmentLength: samplingProfile.maximumSegmentLength,
       sessionStartedAt: startedAt,
     )..addEvent(event, worldPosition, samplingPosition: samplingPosition);
     _sessions[event.pointer] = ActiveInkSession(
@@ -352,7 +356,37 @@ class InkSessionManager extends ChangeNotifier {
   }
 
   static const double _minimumScreenDistance = .75;
+  static const double _zoomedOutMinimumScreenDistance = .2;
+  static const double _screenCurveTolerance = .35;
+  static const double _zoomedOutScreenCurveTolerance = .06;
   static const double _maximumScreenSegmentLength = 8;
+  static const double _zoomedOutMaximumScreenSegmentLength = 2;
+
+  static ({
+    double minimumDistance,
+    double curveTolerance,
+    double maximumSegmentLength,
+  })
+  _samplingProfile(double viewportScale) {
+    final safeScale = viewportScale.isFinite ? viewportScale : 1.0;
+    final normalZoomFraction =
+        ((safeScale - BoardViewport.minScale) / (1 - BoardViewport.minScale))
+            .clamp(0.0, 1.0);
+    return (
+      minimumDistance:
+          _zoomedOutMinimumScreenDistance +
+          (_minimumScreenDistance - _zoomedOutMinimumScreenDistance) *
+              normalZoomFraction,
+      curveTolerance:
+          _zoomedOutScreenCurveTolerance +
+          (_screenCurveTolerance - _zoomedOutScreenCurveTolerance) *
+              normalZoomFraction,
+      maximumSegmentLength:
+          _zoomedOutMaximumScreenSegmentLength +
+          (_maximumScreenSegmentLength - _zoomedOutMaximumScreenSegmentLength) *
+              normalZoomFraction,
+    );
+  }
 
   /// Only this many mutable points are rebuilt on an ordinary MOVE.
   ///

@@ -2,6 +2,7 @@ import 'dart:math' as math;
 
 import 'package:flowboard_x/src/domain/model/ink.dart';
 import 'package:flowboard_x/src/features/board/engine/ink_session_manager.dart';
+import 'package:flowboard_x/src/features/board/presentation/ink_painter.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -142,6 +143,68 @@ void main() {
     expect(second?.authorId, 'right');
     expect(first?.points.first.x, 0);
     expect(second?.points.first.x, 100);
+  });
+
+  test('retains fine curve detail when handwriting at minimum zoom', () {
+    InkStroke drawSmallCircle({required double viewportScale}) {
+      final manager = InkSessionManager();
+      addTearDown(manager.dispose);
+      const pointer = 6;
+      const screenRadius = 3.0;
+      final worldRadius = screenRadius / viewportScale;
+      expect(
+        manager.begin(
+          event: const PointerDownEvent(
+            pointer: pointer,
+            position: Offset(screenRadius, 0),
+          ),
+          worldPosition: Offset(worldRadius, 0),
+          samplingPosition: const Offset(screenRadius, 0),
+          viewportScale: viewportScale,
+          style: const ActivePenStyle(type: InkToolType.normal, width: 4),
+          authorId: 'small-writing',
+        ),
+        isTrue,
+      );
+      for (var index = 1; index < 72; index++) {
+        final angle = index * math.pi * 2 / 72;
+        final screen = Offset(
+          math.cos(angle) * screenRadius,
+          math.sin(angle) * screenRadius,
+        );
+        final world = screen / viewportScale;
+        manager.update(
+          PointerMoveEvent(pointer: pointer, position: screen),
+          world,
+          samplingPosition: screen,
+        );
+      }
+      return manager.end(
+        const PointerUpEvent(
+          pointer: pointer,
+          position: Offset(screenRadius, 0),
+        ),
+        Offset(worldRadius, 0),
+        samplingPosition: const Offset(screenRadius, 0),
+      )!;
+    }
+
+    final normalZoom = drawSmallCircle(viewportScale: 1);
+    final minimumZoom = drawSmallCircle(viewportScale: .18);
+
+    expect(
+      minimumZoom.points.length,
+      greaterThan(normalZoom.points.length),
+      reason:
+          'Small curves need more anchors while the page is strongly zoomed out.',
+    );
+    expect(minimumZoom.points.length, greaterThanOrEqualTo(10));
+    final commands = InkPainter.debugAdaptiveCommandCounts(minimumZoom.points);
+    expect(
+      commands.curves,
+      greaterThan(commands.lines),
+      reason: 'The retained anchors must produce a predominantly curved path.',
+    );
   });
 
   test('bounds a long live marker in reusable preview chunks', () {

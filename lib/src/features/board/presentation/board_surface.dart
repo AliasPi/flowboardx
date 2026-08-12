@@ -215,6 +215,12 @@ class _BoardSurfaceState extends State<BoardSurface> {
       EraserContactGeometry.maximumRecognizedFistScreenRadius;
   final Map<int, PointerRole> _roles = {};
   final Map<int, PointerDeviceKind> _pointerKinds = {};
+  // Some Android panels intermittently report the second finger of an
+  // otherwise ordinary touch gesture as a stylus. Once a real finger already
+  // owns this surface, keep that later pointer in the same non-authoring
+  // gesture for its complete lifetime. The pointer-scoped latch avoids
+  // weakening the inverse, intentional pen-first + resting-palm path.
+  final Set<int> _fingerOwnedNavigationPointers = <int>{};
   final Map<int, Offset> _pointerLocalPositions = {};
   final Map<int, Offset> _navigationPointers = {};
   final Map<int, Offset> _navigationStartPositions = {};
@@ -310,6 +316,9 @@ class _BoardSurfaceState extends State<BoardSurface> {
     }
     if (oldWidget.palmInputSource != widget.palmInputSource) {
       _subscribeToNativePalmInput();
+    }
+    if (oldWidget.fingerDrawingEnabled && !widget.fingerDrawingEnabled) {
+      _cancelFingerInkAfterDisable();
     }
   }
 
@@ -684,6 +693,7 @@ class _BoardSurfaceState extends State<BoardSurface> {
     }
     _roles.clear();
     _pointerKinds.clear();
+    _fingerOwnedNavigationPointers.clear();
     _pointerLocalPositions.clear();
     _navigationPointers.clear();
     _resetNavigationGesture();
@@ -1030,11 +1040,30 @@ class _BoardSurfaceState extends State<BoardSurface> {
     if (event.timeStamp > _latestPointerTimeStamp) {
       _latestPointerTimeStamp = event.timeStamp;
     }
+    if (_fingerOwnedNavigationPointers.contains(event.pointer)) {
+      if (event is PointerUpEvent || event is PointerCancelEvent) {
+        // The hit-tested board route normally performs this cleanup. Keep a
+        // global fallback for a pointer which began or ended over an overlay.
+        scheduleMicrotask(
+          () => _fingerOwnedNavigationPointers.remove(event.pointer),
+        );
+      }
+      return;
+    }
     if ((event.kind == PointerDeviceKind.stylus ||
             event.kind == PointerDeviceKind.invertedStylus) &&
         event is PointerDownEvent) {
       final local = _globalToLocal(event.position);
       if (local != null && _localBounds.contains(local)) {
+        if (_shouldKeepReportedStylusWithFingerGesture()) {
+          // First-contact ownership is monotone. A genuine finger which is
+          // already selecting or navigating must not be discarded merely
+          // because this panel labels the second finger as a stylus. Latch
+          // before the hit-tested route runs; otherwise stylus priority would
+          // erase the only evidence that this was a multi-finger gesture.
+          _fingerOwnedNavigationPointers.add(event.pointer);
+          return;
+        }
         // This route also sees a pen-down when a selection handle is the
         // hit-tested widget. Palm arbitration therefore cannot be bypassed by
         // the overlay sitting above the board listener.
@@ -1104,6 +1133,18 @@ class _BoardSurfaceState extends State<BoardSurface> {
       if (_roles[event.pointer] == PointerRole.ignored) {
         _roles.remove(event.pointer);
       }
+    });
+  }
+
+  bool _shouldKeepReportedStylusWithFingerGesture() {
+    if (defaultTargetPlatform != TargetPlatform.android ||
+        widget.fingerDrawingEnabled) {
+      return false;
+    }
+    return _roles.entries.any((entry) {
+      if (entry.value == PointerRole.ignored) return false;
+      final kind = _pointerKinds[entry.key];
+      return kind != null && _isFingerNavigationKind(kind);
     });
   }
 
@@ -1227,6 +1268,15 @@ class _BoardSurfaceState extends State<BoardSurface> {
 
   void _onPointerDown(PointerDownEvent event) {
     if (_roles.containsKey(event.pointer)) return;
+    if ((event.kind == PointerDeviceKind.stylus ||
+            event.kind == PointerDeviceKind.invertedStylus) &&
+        _shouldKeepReportedStylusWithFingerGesture()) {
+      // Pointer-router ordering is not contractual: the hit-tested listener
+      // can observe DOWN before the global route on some embeddings. Repeat
+      // the monotone ownership decision here so neither ordering can let the
+      // second physical finger enter an authoring path.
+      _fingerOwnedNavigationPointers.add(event.pointer);
+    }
     _pointerKinds[event.pointer] = event.kind;
     if (_inputSuppressed) {
       _roles[event.pointer] = PointerRole.ignored;
@@ -1235,8 +1285,9 @@ class _BoardSurfaceState extends State<BoardSurface> {
     final localPosition = _boundedLocalPosition(event.localPosition);
     _pointerLocalPositions[event.pointer] = localPosition;
     final world = viewport.screenToWorld(localPosition);
-    if (event.kind == PointerDeviceKind.stylus ||
-        event.kind == PointerDeviceKind.invertedStylus) {
+    if ((event.kind == PointerDeviceKind.stylus ||
+            event.kind == PointerDeviceKind.invertedStylus) &&
+        !_fingerOwnedNavigationPointers.contains(event.pointer)) {
       _neutralizeActiveTouchesForStylus();
     }
     if (_inlineTextObjectId != null) {
@@ -1250,6 +1301,7 @@ class _BoardSurfaceState extends State<BoardSurface> {
       _stylusSuppressedTouchPointers.add(event.pointer);
     }
     final isReportedEraser =
+        !_fingerOwnedNavigationPointers.contains(event.pointer) &&
         !(event.kind == PointerDeviceKind.touch && stylusCurrentlyActive) &&
         controller.pointerPolicy.isEraserContact(event);
     if (event.kind == PointerDeviceKind.touch &&
@@ -1302,7 +1354,7 @@ class _BoardSurfaceState extends State<BoardSurface> {
       return;
     }
     if (activeTool == BoardTool.shape &&
-        (event.kind != PointerDeviceKind.touch ||
+        (!_isFingerNavigationPointer(event.pointer, event.kind) ||
             widget.fingerDrawingEnabled)) {
       _hideNavigatorForContentInteraction();
       _claimTouchSelection(event);
@@ -1332,25 +1384,16 @@ class _BoardSurfaceState extends State<BoardSurface> {
       activeNavigationTouches: _navigationPointers.length,
       fingerDrawingEnabled: widget.fingerDrawingEnabled,
     );
-    if (event.kind == PointerDeviceKind.touch &&
-        role == PointerRole.erase &&
+    if (_isFingerNavigationPointer(event.pointer, event.kind) &&
         !isReportedEraser) {
-      // PointerPolicy deliberately accepts a wider range for isolated
-      // low-level use. On a complete board surface that permissive answer
-      // must not bypass the stable broad-contact latch above: ordinary
-      // fingers frequently report a 20x13 or elongated 26x10 ellipse while
-      // pressing, selecting, or pinching. Route such a contact exactly like
-      // an ordinary touch until consecutive unmistakable fist packets promote
-      // it in the global priority route.
+      // This surface owns the fail-closed authoring boundary. Android panels
+      // do not consistently expose direct contacts as Flutter `touch`: mouse,
+      // trackpad and unknown packets have all appeared for ordinary fingers.
+      // Route every non-stylus Android contact through the same opt-in finger
+      // policy, regardless of what the lower-level generic policy selected.
+      // Explicit native palms and coherent touch clusters still use their
+      // separately verified eraser paths.
       role = _ordinaryTouchRole(stylusCurrentlyActive);
-    }
-    // This is the final gate before beginInk. Touch must never author ink
-    // while the user-facing finger-drawing switch is off, even if a future
-    // pointer-policy change accidentally classifies it as ink.
-    if (event.kind == PointerDeviceKind.touch &&
-        role == PointerRole.ink &&
-        !widget.fingerDrawingEnabled) {
-      role = PointerRole.navigate;
     }
     // Keep an ordinary unselected touch in navigation for its complete
     // lifecycle. UP turns a stationary contact into selection, while movement
@@ -1365,7 +1408,7 @@ class _BoardSurfaceState extends State<BoardSurface> {
     // a resting hand while a stylus is active remains ignored by the policy,
     // and a second touch can still promote the move into selection pinch.
     if (role == PointerRole.navigate &&
-        event.kind == PointerDeviceKind.touch &&
+        _isFingerNavigationPointer(event.pointer, event.kind) &&
         !widget.fingerDrawingEnabled &&
         controller.hasSelection &&
         controller.selectionContains(world, tolerance: 12 / viewport.scale)) {
@@ -1379,15 +1422,17 @@ class _BoardSurfaceState extends State<BoardSurface> {
     }
     switch (role) {
       case PointerRole.ink:
-        if (!controller.beginInk(
-          event,
-          world,
-          samplingPosition: localPosition,
-          style: widget.participant?.penStyle,
-          authorId: widget.participant == null
-              ? null
-              : '${widget.participantId}-device-${event.device}',
-        )) {
+        if (!_canAuthorWithPointer(event.pointer, event.kind) ||
+            !controller.beginInk(
+              event,
+              world,
+              samplingPosition: localPosition,
+              viewportScale: viewport.scale,
+              style: widget.participant?.penStyle,
+              authorId: widget.participant == null
+                  ? null
+                  : '${widget.participantId}-device-${event.device}',
+            )) {
           _roles[event.pointer] = PointerRole.ignored;
         } else {
           _trackPointerIndicator(
@@ -1438,12 +1483,33 @@ class _BoardSurfaceState extends State<BoardSurface> {
     }
   }
 
+  void _cancelFingerInkAfterDisable() {
+    final pointers = <int>[
+      for (final entry in _roles.entries)
+        if (!_canAuthorWithPointer(
+              entry.key,
+              _pointerKinds[entry.key] ?? PointerDeviceKind.unknown,
+            ) &&
+            (entry.value == PointerRole.ink ||
+                (entry.value == PointerRole.select &&
+                    _selectionGestures[entry.key]?.tool == BoardTool.shape)))
+          entry.key,
+    ];
+    for (final pointer in pointers) {
+      if (_roles[pointer] == PointerRole.ink) controller.cancelInk(pointer);
+      _roles[pointer] = PointerRole.ignored;
+      _selectionStarts.remove(pointer);
+      _selectionGestures.remove(pointer);
+      _pointerIndicators.removePointer(pointer);
+    }
+  }
+
   bool _tryBeginSelectionPinch(
     PointerDownEvent event,
     Offset localPosition,
     Offset worldPosition,
   ) {
-    if (event.kind != PointerDeviceKind.touch ||
+    if (!_isFingerNavigationPointer(event.pointer, event.kind) ||
         !controller.hasSelection ||
         !controller.selectionContains(
           worldPosition,
@@ -1454,7 +1520,10 @@ class _BoardSurfaceState extends State<BoardSurface> {
     int? firstPointer;
     for (final entry in _roles.entries) {
       if (entry.value != PointerRole.select ||
-          _pointerKinds[entry.key] != PointerDeviceKind.touch) {
+          !_isFingerNavigationPointer(
+            entry.key,
+            _pointerKinds[entry.key] ?? PointerDeviceKind.unknown,
+          )) {
         continue;
       }
       final firstLocal = _pointerLocalPositions[entry.key];
@@ -1519,21 +1588,31 @@ class _BoardSurfaceState extends State<BoardSurface> {
     PointerDownEvent event,
     Offset localPosition,
   ) {
-    if (event.kind != PointerDeviceKind.touch) return false;
+    if (!_isFingerNavigationPointer(event.pointer, event.kind)) return false;
     final selectionPointers = <int>[
       for (final entry in _roles.entries)
         if (entry.value == PointerRole.select &&
-            _pointerKinds[entry.key] == PointerDeviceKind.touch)
+            _isFingerNavigationPointer(
+              entry.key,
+              _pointerKinds[entry.key] ?? PointerDeviceKind.unknown,
+            ))
           entry.key,
     ];
     final navigationPointers = <int>[
       for (final pointer in _navigationPointers.keys)
-        if (_pointerKinds[pointer] == PointerDeviceKind.touch) pointer,
+        if (_isFingerNavigationPointer(
+          pointer,
+          _pointerKinds[pointer] ?? PointerDeviceKind.unknown,
+        ))
+          pointer,
     ];
     final inkPointers = <int>[
       for (final entry in _roles.entries)
         if (entry.value == PointerRole.ink &&
-            _pointerKinds[entry.key] == PointerDeviceKind.touch)
+            (_fingerOwnedNavigationPointers.contains(entry.key) ||
+                (_pointerKinds[entry.key] != PointerDeviceKind.stylus &&
+                    _pointerKinds[entry.key] !=
+                        PointerDeviceKind.invertedStylus)))
           entry.key,
     ];
     if (selectionPointers.isEmpty &&
@@ -1680,6 +1759,28 @@ class _BoardSurfaceState extends State<BoardSurface> {
       tool == BoardTool.dashedPen ||
       tool == BoardTool.straightLine;
 
+  bool _isFingerNavigationKind(PointerDeviceKind kind) {
+    if (kind == PointerDeviceKind.touch) return true;
+    if (defaultTargetPlatform != TargetPlatform.android) return false;
+    // Android display firmware sometimes maps a direct finger contact to
+    // mouse, trackpad or unknown. Fail closed for authoring: only Flutter's
+    // two explicit pen kinds are allowed to bypass the finger-drawing switch.
+    return kind != PointerDeviceKind.stylus &&
+        kind != PointerDeviceKind.invertedStylus;
+  }
+
+  bool _isFingerNavigationPointer(int pointer, PointerDeviceKind kind) {
+    return _fingerOwnedNavigationPointers.contains(pointer) ||
+        _isFingerNavigationKind(kind);
+  }
+
+  bool _canAuthorWithPointer(int pointer, PointerDeviceKind currentKind) {
+    if (widget.fingerDrawingEnabled) return true;
+    final initialKind = _pointerKinds[pointer] ?? currentKind;
+    return !_isFingerNavigationPointer(pointer, initialKind) &&
+        !_isFingerNavigationPointer(pointer, currentKind);
+  }
+
   PointerRole _ordinaryTouchRole(bool stylusCurrentlyActive) {
     if (stylusCurrentlyActive) return PointerRole.ignored;
     if (activeTool == BoardTool.selectRectangle ||
@@ -1767,7 +1868,22 @@ class _BoardSurfaceState extends State<BoardSurface> {
 
   void _onPointerMove(PointerMoveEvent event) {
     if (_inputSuppressed) return;
-    final role = _roles[event.pointer];
+    var role = _roles[event.pointer];
+    if (!_canAuthorWithPointer(event.pointer, event.kind)) {
+      if (role == PointerRole.ink) {
+        controller.cancelInk(event.pointer);
+        _roles[event.pointer] = PointerRole.ignored;
+        _pointerIndicators.removePointer(event.pointer);
+        role = PointerRole.ignored;
+      } else if (role == PointerRole.select &&
+          _selectionGestures[event.pointer]?.tool == BoardTool.shape) {
+        _selectionStarts.remove(event.pointer);
+        _selectionGestures.remove(event.pointer);
+        _roles[event.pointer] = PointerRole.ignored;
+        _pointerIndicators.removePointer(event.pointer);
+        role = PointerRole.ignored;
+      }
+    }
     if (event.kind == PointerDeviceKind.touch &&
         role == PointerRole.ignored &&
         _stylusSuppressedTouchPointers.contains(event.pointer)) {
@@ -1852,6 +1968,7 @@ class _BoardSurfaceState extends State<BoardSurface> {
     if (_clusterEraserSession?.positions.containsKey(event.pointer) == true) {
       _roles.remove(event.pointer);
       _pointerKinds.remove(event.pointer);
+      _fingerOwnedNavigationPointers.remove(event.pointer);
       _pointerLocalPositions.remove(event.pointer);
       _finishClusterErasePointer(event.pointer);
       return;
@@ -1862,6 +1979,7 @@ class _BoardSurfaceState extends State<BoardSurface> {
     if (_selectionPinchPointers.contains(event.pointer)) {
       _finishSelectionPinch(commit: true, liftedPointer: event.pointer);
       _pointerKinds.remove(event.pointer);
+      _fingerOwnedNavigationPointers.remove(event.pointer);
       _pointerLocalPositions.remove(event.pointer);
       _pointerIndicators.removePointer(event.pointer);
       return;
@@ -1872,16 +1990,20 @@ class _BoardSurfaceState extends State<BoardSurface> {
     );
     switch (role) {
       case PointerRole.ink:
-        controller.endInk(
-          event,
-          world,
-          samplingPosition: _boundedLocalPosition(event.localPosition),
-        );
+        if (_canAuthorWithPointer(event.pointer, event.kind)) {
+          controller.endInk(
+            event,
+            world,
+            samplingPosition: _boundedLocalPosition(event.localPosition),
+          );
+        } else {
+          controller.cancelInk(event.pointer);
+        }
       case PointerRole.erase:
         _finishErase(event.pointer);
       case PointerRole.navigate:
         final shouldSelect =
-            event.kind == PointerDeviceKind.touch &&
+            _isFingerNavigationPointer(event.pointer, event.kind) &&
             !widget.fingerDrawingEnabled &&
             _navigationPointers.length == 1 &&
             !_navigationGestureHadMultiplePointers &&
@@ -1906,11 +2028,18 @@ class _BoardSurfaceState extends State<BoardSurface> {
           _scheduleNavigatorHide();
         }
       case PointerRole.select:
-        _finishSelection(event.pointer, world);
+        if (_selectionGestures[event.pointer]?.tool == BoardTool.shape &&
+            !_canAuthorWithPointer(event.pointer, event.kind)) {
+          _selectionGestures.remove(event.pointer);
+          _selectionStarts.remove(event.pointer);
+        } else {
+          _finishSelection(event.pointer, world);
+        }
       case PointerRole.ignored || null:
         break;
     }
     _pointerKinds.remove(event.pointer);
+    _fingerOwnedNavigationPointers.remove(event.pointer);
     _pointerLocalPositions.remove(event.pointer);
     _stylusSuppressedTouchPointers.remove(event.pointer);
     _pointerIndicators.removePointer(event.pointer);
@@ -1921,6 +2050,7 @@ class _BoardSurfaceState extends State<BoardSurface> {
     if (_clusterEraserSession?.positions.containsKey(event.pointer) == true) {
       _roles.remove(event.pointer);
       _pointerKinds.remove(event.pointer);
+      _fingerOwnedNavigationPointers.remove(event.pointer);
       _pointerLocalPositions.remove(event.pointer);
       _finishClusterErasePointer(event.pointer);
       return;
@@ -1928,6 +2058,7 @@ class _BoardSurfaceState extends State<BoardSurface> {
     if (_selectionPinchPointers.contains(event.pointer)) {
       _finishSelectionPinch(commit: false, liftedPointer: event.pointer);
       _pointerKinds.remove(event.pointer);
+      _fingerOwnedNavigationPointers.remove(event.pointer);
       _pointerLocalPositions.remove(event.pointer);
       _pointerIndicators.removePointer(event.pointer);
       return;
@@ -1953,6 +2084,7 @@ class _BoardSurfaceState extends State<BoardSurface> {
     _selectionGestures.remove(event.pointer);
     _selectionStarts.remove(event.pointer);
     _pointerKinds.remove(event.pointer);
+    _fingerOwnedNavigationPointers.remove(event.pointer);
     _pointerLocalPositions.remove(event.pointer);
     _stylusSuppressedTouchPointers.remove(event.pointer);
     _pointerIndicators.removePointer(event.pointer);

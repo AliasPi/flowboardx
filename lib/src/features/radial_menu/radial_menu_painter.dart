@@ -966,6 +966,8 @@ class RadialMenuPainter extends CustomPainter {
             RadialExportAction.savePdf => Icons.picture_as_pdf_rounded,
             RadialExportAction.shareLocal => Icons.qr_code_2,
             RadialExportAction.quickShare => Icons.near_me_rounded,
+            RadialExportAction.newWhiteboardFromPages =>
+              Icons.library_add_outlined,
           },
           label: _compactSecondaryLabel(exportLabel),
           center: position,

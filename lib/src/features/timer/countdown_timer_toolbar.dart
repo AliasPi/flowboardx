@@ -185,6 +185,7 @@ class _CountdownTimerSetupDialogState extends State<CountdownTimerSetupDialog> {
     // synchronously. Own the route pop here so its automatic callback cannot
     // pop the editor route a second time while this dialog animates out.
     _routePopRequested = true;
+    var started = false;
     if (widget.controller.isRunning && !_dirty) {
       widget.controller.pause();
     } else {
@@ -193,10 +194,9 @@ class _CountdownTimerSetupDialogState extends State<CountdownTimerSetupDialog> {
           widget.controller.configuredDuration == Duration.zero) {
         widget.controller.setDuration(Duration(seconds: _editingSeconds));
       }
-      widget.controller.start();
+      started = widget.controller.start();
     }
-    if (widget.controller.state.presentationStage !=
-        CountdownTimerPresentationStage.none) {
+    if (started) {
       widget.onShowLarge();
     }
     Navigator.of(context).pop();

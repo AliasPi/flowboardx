@@ -25,6 +25,97 @@ class PreparedBoardExport {
 typedef BoardPdfPageRenderer =
     Future<ui.Image> Function(String path, PdfObject object);
 
+/// Expands a whiteboard page just enough for every page hidden inside a
+/// bundled PDF object to become visible in the exported, non-interactive PDF.
+///
+/// The first multi-page PDF drives the ordered page sequence. Further
+/// multi-page PDF objects add only their non-active variants. This guarantees
+/// coverage of every imported source page without producing the Cartesian
+/// product of all PDF page combinations on a crowded whiteboard page.
+List<_BoardExportView> _exportViews(BoardPage page) {
+  final multiPagePdfs = page.objects
+      .whereType<PdfObject>()
+      .where((object) => object.pageIndices.length > 1)
+      .toList(growable: false);
+  if (multiPagePdfs.isEmpty) {
+    return <_BoardExportView>[_BoardExportView(page: page, label: page.name)];
+  }
+
+  final views = <_BoardExportView>[];
+  final primary = multiPagePdfs.first;
+  for (var index = 0; index < primary.pageIndices.length; index++) {
+    views.add(
+      _BoardExportView.forPdfPage(
+        page: page,
+        pdf: primary,
+        activePageIndex: index,
+        pdfOrdinal: 1,
+        pdfCount: multiPagePdfs.length,
+      ),
+    );
+  }
+
+  for (var pdfIndex = 1; pdfIndex < multiPagePdfs.length; pdfIndex++) {
+    final pdf = multiPagePdfs[pdfIndex];
+    final activeIndex = pdf.activePageIndex.clamp(
+      0,
+      pdf.pageIndices.length - 1,
+    );
+    for (var index = 0; index < pdf.pageIndices.length; index++) {
+      // The active variant is already visible on every primary sequence page.
+      if (index == activeIndex) continue;
+      views.add(
+        _BoardExportView.forPdfPage(
+          page: page,
+          pdf: pdf,
+          activePageIndex: index,
+          pdfOrdinal: pdfIndex + 1,
+          pdfCount: multiPagePdfs.length,
+        ),
+      );
+    }
+  }
+  return views;
+}
+
+final class _BoardExportView {
+  const _BoardExportView({
+    required this.page,
+    required this.label,
+    this.pdfOverride,
+  });
+
+  factory _BoardExportView.forPdfPage({
+    required BoardPage page,
+    required PdfObject pdf,
+    required int activePageIndex,
+    required int pdfOrdinal,
+    required int pdfCount,
+  }) {
+    final visiblePdf = pdf.copyWithActivePage(activePageIndex);
+    final sourcePageNumber = visiblePdf.activeSourcePageIndex + 1;
+    final suffix = pdfCount == 1
+        ? 'PDF-Seite $sourcePageNumber'
+        : 'PDF $pdfOrdinal, Seite $sourcePageNumber';
+    return _BoardExportView(
+      page: page,
+      label: '${page.name} · $suffix',
+      pdfOverride: visiblePdf,
+    );
+  }
+
+  final BoardPage page;
+  final String label;
+  final PdfObject? pdfOverride;
+
+  BoardObject resolve(BoardObject object) {
+    final replacement = pdfOverride;
+    return replacement != null && object.id == replacement.id
+        ? replacement
+        : object;
+  }
+}
+
 /// A user-actionable failure while materializing board content for export.
 ///
 /// PDF pages must never silently turn into a placeholder in an otherwise
@@ -52,17 +143,18 @@ class BoardExportFactory {
   ) async {
     final pages = <ExportPageSnapshot>[];
     for (final page in document.pages) {
-      final frozenPage = page;
-      pages.add(
-        ExportPageSnapshot(
-          widthPoints: 960,
-          heightPoints: 540,
-          logicalWidth: 1920,
-          logicalHeight: 1080,
-          label: page.name,
-          rasterize: (request) => _rasterizePage(frozenPage, assets, request),
-        ),
-      );
+      for (final view in _exportViews(page)) {
+        pages.add(
+          ExportPageSnapshot(
+            widthPoints: 960,
+            heightPoints: 540,
+            logicalWidth: 1920,
+            logicalHeight: 1080,
+            label: view.label,
+            rasterize: (request) => _rasterizePage(view, assets, request),
+          ),
+        );
+      }
     }
     return PreparedBoardExport(
       ExportDocumentSnapshot(
@@ -76,18 +168,22 @@ class BoardExportFactory {
   }
 
   Future<ExportRaster> _rasterizePage(
-    BoardPage page,
+    _BoardExportView view,
     BoardAssetResolver assets,
     ExportRasterRequest request,
   ) async {
+    final page = view.page;
     final images = <String, ui.Image>{};
     try {
       for (final object in page.objects) {
+        final visibleObject = view.resolve(object);
         ui.Image? decoded;
-        if (object is ImageObject) {
-          decoded = await _decodeAsset(await assets.readBytes(object.assetId));
-        } else if (object is PdfObject) {
-          decoded = await _loadPdfPage(page, object, assets);
+        if (visibleObject is ImageObject) {
+          decoded = await _decodeAsset(
+            await assets.readBytes(visibleObject.assetId),
+          );
+        } else if (visibleObject is PdfObject) {
+          decoded = await _loadPdfPage(page, visibleObject, assets);
         }
         if (decoded != null) images[object.id] = decoded;
       }
@@ -96,7 +192,7 @@ class BoardExportFactory {
         widthPoints: 960,
         heightPoints: 540,
         label: page.name,
-        painter: (canvas, size) => _paintPage(canvas, size, page, images),
+        painter: (canvas, size) => _paintPage(canvas, size, view, images),
       );
       return rasterizer.rasterize(request);
     } finally {
@@ -204,9 +300,10 @@ class BoardExportFactory {
   static void _paintPage(
     ui.Canvas canvas,
     ui.Size size,
-    BoardPage page,
+    _BoardExportView view,
     Map<String, ui.Image> images,
   ) {
+    final page = view.page;
     canvas.drawRect(
       ui.Offset.zero & size,
       ui.Paint()..color = const ui.Color(0xFFF8F7F2),
@@ -238,7 +335,7 @@ class BoardExportFactory {
         InkPainter.drawStroke(canvas, stroke);
         continue;
       }
-      final object = item.object!;
+      final object = view.resolve(item.object!);
       _paintObject(canvas, object, images[object.id]);
       final layer = activeObjectInkLayer(object, annotations);
       if (layer != null) {

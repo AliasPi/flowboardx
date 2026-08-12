@@ -12,6 +12,7 @@ import 'package:flowboard_x/src/features/board/presentation/board_scene_layer.da
 import 'package:flowboard_x/src/features/board/presentation/board_surface.dart';
 import 'package:flowboard_x/src/features/editor/board_participant_controller.dart';
 import 'package:flowboard_x/src/features/editor/editor_controller.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -733,6 +734,385 @@ void main() {
     },
   );
 
+  testWidgets(
+    'Android mouse-emulated first finger and touch second finger only navigate',
+    (tester) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.android;
+      try {
+        final controller = await pumpBoard(
+          tester,
+          withParticipantController: true,
+        );
+        controller.addShape(
+          ShapeKind.rectangle,
+          const Rect.fromLTWH(180, 200, 300, 160),
+        );
+        controller.clearSelection();
+        await tester.pump();
+        final original = controller.page.objects.single.transform;
+        final scaleBefore = controller.viewport.scale;
+
+        final emulatedFirstFinger = await tester.startGesture(
+          const Offset(260, 280),
+          pointer: 824,
+          kind: PointerDeviceKind.mouse,
+          buttons: kPrimaryButton,
+        );
+        await emulatedFirstFinger.moveTo(const Offset(250, 280));
+        expect(controller.inkSessions.sessions, isEmpty);
+        expect(controller.page.strokes, isEmpty);
+        expect(controller.selectedIds, isEmpty);
+
+        final secondFinger = await tester.startGesture(
+          const Offset(420, 280),
+          pointer: 825,
+          kind: PointerDeviceKind.touch,
+        );
+        await emulatedFirstFinger.moveTo(const Offset(210, 280));
+        await secondFinger.moveTo(const Offset(500, 280));
+        await tester.pump();
+
+        expect(controller.viewport.scale, greaterThan(scaleBefore));
+        expect(controller.inkSessions.sessions, isEmpty);
+        expect(controller.page.strokes, isEmpty);
+        expect(controller.selectedIds, isEmpty);
+        expect(controller.renderObjects.single.transform, original);
+
+        await secondFinger.up();
+        await emulatedFirstFinger.up();
+        await tester.pump();
+
+        expect(controller.page.strokes, isEmpty);
+        expect(controller.selectedIds, isEmpty);
+        expect(controller.page.objects.single.transform, original);
+        await controller.flush();
+      } finally {
+        debugDefaultTargetPlatformOverride = null;
+      }
+    },
+  );
+
+  testWidgets(
+    'Android non-stylus pointer kinds cannot author ink when finger ink is off',
+    (tester) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.android;
+      try {
+        final controller = await pumpBoard(tester);
+        var pointer = 830;
+        for (final kind in <PointerDeviceKind>[
+          PointerDeviceKind.touch,
+          PointerDeviceKind.mouse,
+          PointerDeviceKind.unknown,
+        ]) {
+          final start = Offset(160, 180 + (pointer - 830) * 50);
+          final end = start + const Offset(90, 20);
+          await tester.sendEventToBinding(
+            PointerDownEvent(
+              pointer: pointer,
+              device: pointer,
+              kind: kind,
+              position: start,
+              buttons: kPrimaryButton,
+            ),
+          );
+          await tester.sendEventToBinding(
+            PointerMoveEvent(
+              pointer: pointer,
+              device: pointer,
+              kind: kind,
+              position: end,
+              delta: end - start,
+              buttons: kPrimaryButton,
+            ),
+          );
+          expect(
+            controller.inkSessions.sessions,
+            isEmpty,
+            reason: 'Android ${kind.name} must use the disabled finger gate',
+          );
+          await tester.sendEventToBinding(
+            PointerUpEvent(
+              pointer: pointer,
+              device: pointer,
+              kind: kind,
+              position: end,
+            ),
+          );
+          pointer++;
+        }
+        await tester.pump();
+
+        expect(controller.page.strokes, isEmpty);
+
+        final stylus = await tester.startGesture(
+          const Offset(180, 420),
+          pointer: 834,
+          kind: PointerDeviceKind.stylus,
+        );
+        await stylus.moveTo(const Offset(300, 450));
+        await stylus.up();
+        await tester.pump();
+
+        expect(controller.page.strokes, hasLength(1));
+        await controller.flush();
+      } finally {
+        debugDefaultTargetPlatformOverride = null;
+      }
+    },
+  );
+
+  testWidgets('trackpad pan-zoom packets never enter an authoring path', (
+    tester,
+  ) async {
+    final controller = await pumpBoard(tester);
+    await tester.sendEventToBinding(
+      const PointerPanZoomStartEvent(
+        pointer: 837,
+        device: 837,
+        position: Offset(220, 260),
+      ),
+    );
+    await tester.sendEventToBinding(
+      const PointerPanZoomUpdateEvent(
+        pointer: 837,
+        device: 837,
+        position: Offset(220, 260),
+        pan: Offset(80, 30),
+        panDelta: Offset(80, 30),
+      ),
+    );
+    await tester.sendEventToBinding(
+      const PointerPanZoomEndEvent(
+        pointer: 837,
+        device: 837,
+        position: Offset(220, 260),
+      ),
+    );
+    await tester.pump();
+
+    expect(controller.inkSessions.sessions, isEmpty);
+    expect(controller.page.strokes, isEmpty);
+    expect(controller.page.objects, isEmpty);
+    await controller.flush();
+  });
+
+  testWidgets(
+    'Android emulated finger cannot bypass the gate with the shape tool',
+    (tester) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.android;
+      try {
+        final controller = await pumpBoard(tester);
+        controller.setTool(BoardTool.shape);
+        await tester.pump();
+
+        await tester.sendEventToBinding(
+          const PointerDownEvent(
+            pointer: 835,
+            device: 835,
+            kind: PointerDeviceKind.unknown,
+            position: Offset(200, 220),
+            buttons: kPrimaryButton,
+          ),
+        );
+        await tester.sendEventToBinding(
+          const PointerMoveEvent(
+            pointer: 835,
+            device: 835,
+            kind: PointerDeviceKind.unknown,
+            position: Offset(340, 320),
+            delta: Offset(140, 100),
+            buttons: kPrimaryButton,
+          ),
+        );
+        await tester.sendEventToBinding(
+          const PointerUpEvent(
+            pointer: 835,
+            device: 835,
+            kind: PointerDeviceKind.unknown,
+            position: Offset(340, 320),
+          ),
+        );
+        await tester.pump();
+
+        expect(controller.page.objects, isEmpty);
+        expect(controller.page.strokes, isEmpty);
+
+        final stylus = await tester.startGesture(
+          const Offset(200, 220),
+          pointer: 836,
+          kind: PointerDeviceKind.stylus,
+        );
+        await stylus.moveTo(const Offset(340, 320));
+        await stylus.up();
+        await tester.pump();
+
+        expect(controller.page.objects, hasLength(1));
+        await controller.flush();
+      } finally {
+        debugDefaultTargetPlatformOverride = null;
+      }
+    },
+  );
+
+  testWidgets('touch pinch cancels provisional non-stylus ink', (tester) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    try {
+      final controller = await pumpBoard(tester);
+      final scaleBefore = controller.viewport.scale;
+
+      final mouseLikeFirstContact = await tester.startGesture(
+        const Offset(220, 280),
+        pointer: 826,
+        kind: PointerDeviceKind.mouse,
+        buttons: kPrimaryButton,
+      );
+      await mouseLikeFirstContact.moveTo(const Offset(240, 280));
+      expect(controller.inkSessions.sessions, hasLength(1));
+
+      final secondFinger = await tester.startGesture(
+        const Offset(420, 280),
+        pointer: 827,
+        kind: PointerDeviceKind.touch,
+      );
+      expect(controller.inkSessions.sessions, isEmpty);
+
+      await mouseLikeFirstContact.moveTo(const Offset(180, 280));
+      await secondFinger.moveTo(const Offset(500, 280));
+      await tester.pump();
+
+      expect(controller.viewport.scale, greaterThan(scaleBefore));
+      expect(controller.page.strokes, isEmpty);
+
+      await secondFinger.up();
+      await mouseLikeFirstContact.up();
+      await tester.pump();
+
+      expect(controller.inkSessions.sessions, isEmpty);
+      expect(controller.page.strokes, isEmpty);
+      await controller.flush();
+    } finally {
+      debugDefaultTargetPlatformOverride = null;
+    }
+  });
+
+  for (final reportedKind in <PointerDeviceKind>[
+    PointerDeviceKind.stylus,
+    PointerDeviceKind.invertedStylus,
+  ]) {
+    testWidgets(
+      'Android pinch rejects a second finger misreported as ${reportedKind.name}',
+      (tester) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.android;
+        try {
+          final controller = await pumpBoard(tester);
+          final scaleBefore = controller.viewport.scale;
+
+          final firstFinger = await tester.startGesture(
+            const Offset(220, 280),
+            pointer: 842,
+            kind: PointerDeviceKind.touch,
+          );
+          await firstFinger.moveTo(const Offset(218, 280));
+          expect(controller.inkSessions.sessions, isEmpty);
+
+          // The second physical finger may be the packet Android
+          // intermittently mislabels. Its arrival must not let pen priority
+          // discard the first navigation contact and start authoring instead.
+          final misreportedSecondFinger = await tester.startGesture(
+            const Offset(420, 280),
+            pointer: 843,
+            kind: reportedKind,
+          );
+          final sessionCountAfterSecondDown =
+              controller.inkSessions.sessions.length;
+
+          await firstFinger.moveTo(const Offset(170, 280));
+          await misreportedSecondFinger.moveTo(const Offset(500, 280));
+          await tester.pump();
+
+          await misreportedSecondFinger.up();
+          await firstFinger.up();
+          await tester.pump();
+
+          expect(
+            sessionCountAfterSecondDown,
+            0,
+            reason: 'a second direct contact must establish pinch, not ink',
+          );
+          expect(controller.inkSessions.sessions, isEmpty);
+          expect(controller.page.strokes, isEmpty);
+          expect(controller.viewport.scale, greaterThan(scaleBefore));
+          await controller.flush();
+        } finally {
+          debugDefaultTargetPlatformOverride = null;
+        }
+      },
+    );
+  }
+
+  testWidgets('Android pointer-kind downgrade cannot commit provisional ink', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    try {
+      final controller = await pumpBoard(tester);
+      const start = Offset(220, 340);
+      const firstMove = Offset(224, 340);
+      const downgradedMove = Offset(180, 340);
+
+      await tester.sendEventToBinding(
+        const PointerDownEvent(
+          pointer: 840,
+          device: 840,
+          kind: PointerDeviceKind.stylus,
+          position: start,
+          buttons: kPrimaryButton,
+        ),
+      );
+      await tester.sendEventToBinding(
+        const PointerMoveEvent(
+          pointer: 840,
+          device: 840,
+          kind: PointerDeviceKind.stylus,
+          position: firstMove,
+          delta: Offset(4, 0),
+          buttons: kPrimaryButton,
+        ),
+      );
+      expect(controller.inkSessions.sessions, hasLength(1));
+
+      // Vendor drivers can revise the tool classification during the same
+      // physical contact. The initial kind is retained as part of the gate,
+      // while the current non-stylus packet must revoke authoring.
+      await tester.sendEventToBinding(
+        const PointerMoveEvent(
+          pointer: 840,
+          device: 840,
+          kind: PointerDeviceKind.touch,
+          position: downgradedMove,
+          delta: Offset(-44, 0),
+          buttons: kPrimaryButton,
+        ),
+      );
+      expect(controller.inkSessions.sessions, isEmpty);
+
+      await tester.sendEventToBinding(
+        const PointerUpEvent(
+          pointer: 840,
+          device: 840,
+          kind: PointerDeviceKind.touch,
+          position: downgradedMove,
+        ),
+      );
+      await tester.pump();
+
+      expect(controller.page.strokes, isEmpty);
+      await controller.flush();
+    } finally {
+      debugDefaultTargetPlatformOverride = null;
+    }
+  });
+
   testWidgets('two broad-looking fingertips remain a pinch gesture', (
     tester,
   ) async {
@@ -849,7 +1229,7 @@ void main() {
   }
 
   testWidgets(
-    'stylus down cancels a touch selection preview and touch up cannot replay it',
+    'touch-owned selection promotes a later stylus report to navigation',
     (tester) async {
       final controller = await pumpBoard(
         tester,
@@ -881,31 +1261,34 @@ void main() {
       await hand.moveTo(const Offset(350, 270));
       await tester.pump();
       expect(controller.renderObjects.single.transform.x, original.x + 50);
+      final scaleBeforePinch = controller.viewport.scale;
 
       final pen = await tester.startGesture(
         const Offset(520, 120),
         pointer: 103,
         kind: PointerDeviceKind.stylus,
       );
-      expect(controller.inkSessions.hasActiveStylus, isTrue);
+      expect(controller.inkSessions.sessions, isEmpty);
       expect(controller.renderObjects.single.transform, original);
 
-      // The old hand pointer remains down, but is latched as ignored.
-      await hand.moveTo(const Offset(390, 300));
-      await hand.up();
-      await pen.moveTo(const Offset(570, 150));
+      // The first contact owns the interaction. The later stylus-labelled
+      // packet joins its navigation gesture and can never become ink.
+      await hand.moveTo(const Offset(320, 280));
+      await pen.moveTo(const Offset(600, 80));
       await pen.up();
+      await hand.up();
       await tester.pump();
 
       expect(controller.page.objects.single.transform, original);
-      expect(controller.page.strokes, hasLength(1));
+      expect(controller.viewport.scale, greaterThan(scaleBeforePinch));
+      expect(controller.page.strokes, isEmpty);
       expect(controller.inkSessions.isWriting, isFalse);
       await controller.flush();
     },
   );
 
   testWidgets(
-    'stylus down rolls back touch pan and stationary later touch up is inert',
+    'touch-owned pan keeps a later stylus report in the pinch gesture',
     (tester) async {
       final controller = await pumpBoard(tester);
       final initialScale = controller.viewport.scale;
@@ -923,21 +1306,18 @@ void main() {
         pointer: 112,
         kind: PointerDeviceKind.stylus,
       );
-      expect(controller.inkSessions.hasActiveStylus, isTrue);
-      expect(controller.viewport.scale, initialScale);
-      expect(controller.viewport.offset, initialOffset);
+      expect(controller.inkSessions.sessions, isEmpty);
 
-      await pen.moveTo(const Offset(200, 180));
+      await hand.moveTo(const Offset(720, 480));
+      await pen.moveTo(const Offset(80, 80));
       await pen.up();
-      // Releasing the old contact after the pen must not select or recommit
-      // the provisional camera.
       await hand.up();
       await tester.pump();
 
-      expect(controller.viewport.scale, initialScale);
-      expect(controller.viewport.offset, initialOffset);
+      expect(controller.viewport.scale, greaterThan(initialScale));
+      expect(controller.viewport.offset, isNot(initialOffset));
       expect(controller.selectedIds, isEmpty);
-      expect(controller.page.strokes, hasLength(1));
+      expect(controller.page.strokes, isEmpty);
       await controller.flush();
     },
   );
@@ -1090,39 +1470,21 @@ void main() {
     },
   );
 
-  testWidgets('stylus rolls back a provisional touch eraser', (tester) async {
-    final controller = await pumpBoard(tester);
-    final initialInk = await tester.startGesture(
-      const Offset(260, 260),
-      pointer: 131,
-      kind: PointerDeviceKind.stylus,
-    );
-    await initialInk.moveTo(const Offset(420, 260));
-    await initialInk.up();
-    await tester.pump();
-    final existingId = controller.page.strokes.single.id;
+  testWidgets(
+    'broad touch ownership keeps a later stylus report non-destructive',
+    (tester) async {
+      final controller = await pumpBoard(tester);
+      final initialInk = await tester.startGesture(
+        const Offset(260, 260),
+        pointer: 131,
+        kind: PointerDeviceKind.stylus,
+      );
+      await initialInk.moveTo(const Offset(420, 260));
+      await initialInk.up();
+      await tester.pump();
+      final existingId = controller.page.strokes.single.id;
 
-    const palmDown = PointerDownEvent(
-      pointer: 132,
-      device: 132,
-      kind: PointerDeviceKind.touch,
-      position: Offset(340, 260),
-      radiusMajor: 34,
-      radiusMinor: 18,
-      size: .36,
-    );
-    await tester.sendEventToBinding(palmDown);
-
-    final pen = await tester.startGesture(
-      const Offset(520, 380),
-      pointer: 133,
-      kind: PointerDeviceKind.stylus,
-    );
-    expect(controller.inkSessions.hasActiveStylus, isTrue);
-    expect(controller.page.strokeById(existingId), isNotNull);
-
-    await tester.sendEventToBinding(
-      const PointerUpEvent(
+      const palmDown = PointerDownEvent(
         pointer: 132,
         device: 132,
         kind: PointerDeviceKind.touch,
@@ -1130,17 +1492,38 @@ void main() {
         radiusMajor: 34,
         radiusMinor: 18,
         size: .36,
-      ),
-    );
-    await pen.moveTo(const Offset(580, 420));
-    await pen.up();
-    await tester.pump();
+      );
+      await tester.sendEventToBinding(palmDown);
 
-    expect(controller.page.strokeById(existingId), isNotNull);
-    expect(controller.page.strokes, hasLength(2));
-    expect(controller.inkSessions.isWriting, isFalse);
-    await controller.flush();
-  });
+      final pen = await tester.startGesture(
+        const Offset(520, 380),
+        pointer: 133,
+        kind: PointerDeviceKind.stylus,
+      );
+      expect(controller.inkSessions.sessions, isEmpty);
+      expect(controller.page.strokeById(existingId), isNotNull);
+
+      await tester.sendEventToBinding(
+        const PointerUpEvent(
+          pointer: 132,
+          device: 132,
+          kind: PointerDeviceKind.touch,
+          position: Offset(340, 260),
+          radiusMajor: 34,
+          radiusMinor: 18,
+          size: .36,
+        ),
+      );
+      await pen.moveTo(const Offset(580, 420));
+      await pen.up();
+      await tester.pump();
+
+      expect(controller.page.strokeById(existingId), isNotNull);
+      expect(controller.page.strokes, hasLength(1));
+      expect(controller.inkSessions.isWriting, isFalse);
+      await controller.flush();
+    },
+  );
 
   testWidgets(
     'stylus arbitration does not cancel the other participant touch transform',
@@ -1321,6 +1704,40 @@ void main() {
     await controller.flush();
   });
 
+  testWidgets('disabling finger ink cancels an active provisional stroke', (
+    tester,
+  ) async {
+    final controller = await pumpBoard(tester, fingerDrawingEnabled: true);
+    final gesture = await tester.startGesture(
+      const Offset(180, 220),
+      pointer: 12,
+      kind: PointerDeviceKind.touch,
+    );
+    await gesture.moveTo(const Offset(240, 250));
+    expect(controller.inkSessions.sessions, hasLength(1));
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: BoardSurface(
+            controller: controller,
+            fingerDrawingEnabled: false,
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    expect(controller.inkSessions.sessions, isEmpty);
+    await gesture.moveTo(const Offset(300, 280));
+    await gesture.up();
+    await tester.pump();
+
+    expect(controller.inkSessions.sessions, isEmpty);
+    expect(controller.page.strokes, isEmpty);
+    await controller.flush();
+  });
+
   testWidgets('second finger cancels provisional ink and starts navigation', (
     tester,
   ) async {
@@ -1350,7 +1767,7 @@ void main() {
     await controller.flush();
   });
 
-  testWidgets('starting ink removes the expensive transient navigator', (
+  testWidgets('late stylus report cannot steal an active pinch', (
     tester,
   ) async {
     final controller = await pumpBoard(tester);
@@ -1375,11 +1792,13 @@ void main() {
     );
     await tester.pump();
 
-    expect(find.byKey(const ValueKey('board-navigator')), findsNothing);
+    expect(find.byKey(const ValueKey('board-navigator')), findsOneWidget);
+    expect(controller.inkSessions.sessions, isEmpty);
 
     await pen.up();
     await first.up();
     await second.up();
+    expect(controller.page.strokes, isEmpty);
     await controller.flush();
   });
 
