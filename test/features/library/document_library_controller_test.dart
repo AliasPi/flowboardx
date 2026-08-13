@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flowboard_x/src/data/document_repository.dart';
@@ -250,6 +251,157 @@ void main() {
     },
   );
 
+  test('trash restore keeps an existing original folder', () async {
+    final document = WhiteboardDocument.create(id: 'restore-folder');
+    final folder = LibraryFolder(
+      id: 'folder-a',
+      name: 'Biologie',
+      createdAt: DateTime.utc(2026, 7, 1),
+      updatedAt: DateTime.utc(2026, 7, 1),
+    );
+    repository
+      ..documents[document.id] = document
+      ..organization = LibraryOrganization(
+        folders: <LibraryFolder>[folder],
+        documentFolderIds: <String, String>{document.id: folder.id},
+      );
+    final controller = DocumentLibraryController(repository: repository);
+    addTearDown(controller.dispose);
+    await controller.reload();
+
+    expect(await controller.deleteDocument(document.id), isTrue);
+    expect(controller.trashedDocuments.single.originalFolderId, folder.id);
+    expect(await controller.restoreTrashedDocument(document.id), isTrue);
+
+    expect(controller.entries.single.summary.id, document.id);
+    expect(controller.trashedDocuments, isEmpty);
+    expect(controller.folderIdForDocument(document.id), folder.id);
+    expect(repository.organization.documentFolderIds[document.id], folder.id);
+  });
+
+  test(
+    'trash restore falls back to root after original folder is gone',
+    () async {
+      final document = WhiteboardDocument.create(id: 'restore-root');
+      final folder = LibraryFolder(
+        id: 'removed-folder',
+        name: 'Geschichte',
+        createdAt: DateTime.utc(2026, 7, 1),
+        updatedAt: DateTime.utc(2026, 7, 1),
+      );
+      repository
+        ..documents[document.id] = document
+        ..organization = LibraryOrganization(
+          folders: <LibraryFolder>[folder],
+          documentFolderIds: <String, String>{document.id: folder.id},
+        );
+      final controller = DocumentLibraryController(repository: repository);
+      addTearDown(controller.dispose);
+      await controller.reload();
+
+      expect(await controller.deleteDocument(document.id), isTrue);
+      expect(await controller.deleteFolder(folder.id), isTrue);
+      expect(await controller.restoreTrashedDocument(document.id), isTrue);
+
+      expect(controller.folderIdForDocument(document.id), isNull);
+      expect(repository.organization.documentFolderIds[document.id], isNull);
+    },
+  );
+
+  test(
+    'organization save failure never retries an already trashed document',
+    () async {
+      final document = WhiteboardDocument.create(id: 'trash-once');
+      final folder = LibraryFolder(
+        id: 'folder-a',
+        name: 'Mathematik',
+        createdAt: DateTime.utc(2026, 7, 1),
+        updatedAt: DateTime.utc(2026, 7, 1),
+      );
+      repository
+        ..documents[document.id] = document
+        ..organization = LibraryOrganization(
+          folders: <LibraryFolder>[folder],
+          documentFolderIds: <String, String>{document.id: folder.id},
+        );
+      final controller = DocumentLibraryController(repository: repository);
+      addTearDown(controller.dispose);
+      await controller.reload();
+      repository.organizationSaveError = const DocumentStorageException(
+        'Ordnerindex ist gesperrt.',
+      );
+
+      expect(await controller.deleteDocument(document.id), isTrue);
+      expect(controller.entries, isEmpty);
+      expect(controller.trashedDocuments.single.id, document.id);
+      expect(repository.trashMoveIds, <String>[document.id]);
+      expect(controller.operationError, 'Ordnerindex ist gesperrt.');
+
+      expect(await controller.deleteDocument(document.id), isFalse);
+      expect(repository.trashMoveIds, <String>[document.id]);
+    },
+  );
+
+  test(
+    'stale trash reloads cannot overwrite move restore or permanent delete',
+    () async {
+      final document = WhiteboardDocument.create(id: 'trash-reload-race');
+      repository.documents[document.id] = document;
+      final controller = DocumentLibraryController(repository: repository);
+      addTearDown(controller.dispose);
+      await controller.reload();
+
+      var gate = Completer<void>();
+      var started = Completer<void>();
+      repository
+        ..trashListGate = gate
+        ..trashListStarted = started;
+      final staleBeforeMove = controller.reloadTrash();
+      await started.future;
+      expect(await controller.deleteDocument(document.id), isTrue);
+      expect(controller.trashedDocuments.single.id, document.id);
+      expect(controller.isTrashLoading, isFalse);
+      repository.trashListGate = null;
+      gate.complete();
+      await staleBeforeMove;
+      expect(controller.trashedDocuments.single.id, document.id);
+
+      gate = Completer<void>();
+      started = Completer<void>();
+      repository
+        ..trashListGate = gate
+        ..trashListStarted = started;
+      final staleBeforeRestore = controller.reloadTrash();
+      await started.future;
+      expect(await controller.restoreTrashedDocument(document.id), isTrue);
+      expect(controller.trashedDocuments, isEmpty);
+      expect(controller.isTrashLoading, isFalse);
+      repository.trashListGate = null;
+      gate.complete();
+      await staleBeforeRestore;
+      expect(controller.trashedDocuments, isEmpty);
+
+      expect(await controller.deleteDocument(document.id), isTrue);
+      gate = Completer<void>();
+      started = Completer<void>();
+      repository
+        ..trashListGate = gate
+        ..trashListStarted = started;
+      final staleBeforePermanentDelete = controller.reloadTrash();
+      await started.future;
+      expect(
+        await controller.permanentlyDeleteTrashedDocument(document.id),
+        isTrue,
+      );
+      expect(controller.trashedDocuments, isEmpty);
+      expect(controller.isTrashLoading, isFalse);
+      repository.trashListGate = null;
+      gate.complete();
+      await staleBeforePermanentDelete;
+      expect(controller.trashedDocuments, isEmpty);
+    },
+  );
+
   test('direct drag selection replaces an unrelated multi-selection', () async {
     final first = WhiteboardDocument.create(id: 'selected-one');
     final second = WhiteboardDocument.create(id: 'selected-two');
@@ -272,7 +424,10 @@ void main() {
 }
 
 class _FakeDocumentRepository
-    implements DocumentRepository, DocumentOrganizationRepository {
+    implements
+        DocumentRepository,
+        DocumentOrganizationRepository,
+        DocumentTrashRepository {
   _FakeDocumentRepository(this.assets);
 
   final Directory assets;
@@ -287,8 +442,17 @@ class _FakeDocumentRepository
   final List<String> recoverCalls = <String>[];
   final List<String> assetRequests = <String>[];
   final Set<String> deleteErrorIds = <String>{};
+  final Map<String, WhiteboardDocument> trashedDocuments =
+      <String, WhiteboardDocument>{};
+  final Map<String, TrashedDocumentSummary> trash =
+      <String, TrashedDocumentSummary>{};
+  final List<String> trashMoveIds = <String>[];
+  final List<String> permanentlyDeletedTrashIds = <String>[];
   LibraryOrganization organization = LibraryOrganization.empty;
   int organizationSaves = 0;
+  Object? organizationSaveError;
+  Completer<void>? trashListGate;
+  Completer<void>? trashListStarted;
   Duration loadDelay = Duration.zero;
   Object? listError;
   Object? loadError;
@@ -317,7 +481,70 @@ class _FakeDocumentRepository
   @override
   Future<void> saveOrganization(LibraryOrganization organization) async {
     organizationSaves++;
+    if (organizationSaveError case final error?) throw error;
     this.organization = organization;
+  }
+
+  @override
+  Future<TrashedDocumentSummary> moveToTrash(
+    String documentId, {
+    String? originalFolderId,
+  }) async {
+    if (deleteErrorIds.contains(documentId)) {
+      throw const DocumentStorageException('Datei ist gesperrt.');
+    }
+    final document = documents.remove(documentId);
+    if (document == null) {
+      throw const DocumentStorageException('Dokument fehlt.');
+    }
+    deletedIds.add(documentId);
+    trashMoveIds.add(documentId);
+    trashedDocuments[documentId] = document;
+    final summary = TrashedDocumentSummary(
+      id: documentId,
+      title: document.title,
+      deletedAt: DateTime.utc(2026, 8, 1),
+      pageCount: document.pages.length,
+      revision: document.revision,
+      recoverable: true,
+      originalFolderId: originalFolderId,
+    );
+    trash[documentId] = summary;
+    return summary;
+  }
+
+  @override
+  Future<List<TrashedDocumentSummary>> listTrashed() async {
+    final snapshot = trash.values.toList(growable: false);
+    final started = trashListStarted;
+    if (started != null && !started.isCompleted) started.complete();
+    final gate = trashListGate;
+    if (gate != null) await gate.future;
+    return snapshot;
+  }
+
+  @override
+  Future<RestoredTrashDocument> restoreFromTrash(String documentId) async {
+    final document = trashedDocuments.remove(documentId);
+    final summary = trash.remove(documentId);
+    if (document == null || summary == null) {
+      throw const DocumentStorageException('Dokument fehlt im Papierkorb.');
+    }
+    documents[documentId] = document;
+    return RestoredTrashDocument(
+      document: document,
+      originalFolderId: summary.originalFolderId,
+    );
+  }
+
+  @override
+  Future<void> deletePermanentlyFromTrash(String documentId) async {
+    if (!trash.containsKey(documentId)) {
+      throw const DocumentStorageException('Dokument fehlt im Papierkorb.');
+    }
+    trash.remove(documentId);
+    trashedDocuments.remove(documentId);
+    permanentlyDeletedTrashIds.add(documentId);
   }
 
   @override

@@ -18,6 +18,7 @@ import '../../domain/model/board_object.dart';
 import '../../domain/model/document.dart';
 import '../../domain/model/geometry.dart';
 import '../../domain/model/ink.dart';
+import '../../domain/model/page_identity_rebinder.dart';
 import '../../domain/model/scene_order.dart';
 import '../assets/document_asset_store.dart';
 import '../assets/imported_image_layout.dart';
@@ -2351,6 +2352,154 @@ class EditorController extends ChangeNotifier {
     _afterPageChanged();
   }
 
+  bool renamePage(String pageId, String name) {
+    if (!_allowNavigation()) return false;
+    return execute(RenamePageCommand(pageId, name));
+  }
+
+  /// Duplicates [pageId] immediately after its source and opens the copy in
+  /// this participant view. Every page-owned identity is rebound; immutable
+  /// document assets remain shared by design.
+  bool duplicatePage(String pageId) {
+    if (!_allowNavigation()) return false;
+    if (document.pages.length >= WhiteboardDocument.maxPageCount) {
+      lastError =
+          'Maximal ${WhiteboardDocument.maxPageCount} Seiten sind möglich.';
+      notifyListeners();
+      return false;
+    }
+    final sourceIndex = document.pageIndexById(pageId);
+    if (sourceIndex == null) {
+      lastError = 'Die ausgewählte Seite existiert nicht mehr.';
+      notifyListeners();
+      return false;
+    }
+
+    commitViewport();
+    final source = document.pages[sourceIndex];
+    final cloner = PageIdentityRebinder(
+      reservedIds: collectDocumentIdentityValues(document),
+      newId: _uuid.v4,
+    );
+    final duplicate = cloner.clone(
+      source,
+      name: _duplicatePageName(source.name),
+      resolveAssetId: (sourceAssetId) => sourceAssetId,
+    );
+    final added = execute(
+      AddPageCommand(
+        duplicate,
+        insertAt: sourceIndex + 1,
+        selectNewPage: _followsDocumentNavigation,
+      ),
+    );
+    if (!added) return false;
+    _activePageId = duplicate.id;
+    _afterPageChanged();
+    return true;
+  }
+
+  bool reorderPages(Iterable<String> orderedPageIds) {
+    if (!_allowNavigation()) return false;
+    return execute(ReorderPagesCommand(orderedPageIds));
+  }
+
+  /// Rebases a drag intent captured against [sourcePageIds] onto the current
+  /// live page list without ever trusting a potentially stale list index.
+  ///
+  /// Pages added or removed by another participant are tolerated while the
+  /// surviving source pages retain their relative order. A concurrent reorder
+  /// is ambiguous and therefore leaves the document unchanged.
+  bool reorderPageFromDrag({
+    required String pageId,
+    required List<String> sourcePageIds,
+    required int insertionIndex,
+  }) {
+    final sourceIds = sourcePageIds.toSet();
+    if (sourcePageIds.isEmpty ||
+        sourceIds.length != sourcePageIds.length ||
+        !sourceIds.contains(pageId)) {
+      return _rejectPageReorder(
+        'Die Ausgangsreihenfolge des Seiten-Drags ist ungültig.',
+      );
+    }
+    final sourceWithoutDragged = sourcePageIds
+        .where((candidate) => candidate != pageId)
+        .toList(growable: false);
+    if (insertionIndex < 0 || insertionIndex > sourceWithoutDragged.length) {
+      return _rejectPageReorder(
+        'Die Zielposition des Seiten-Drags ist ungültig.',
+      );
+    }
+
+    final liveOrder = document.pages.map((page) => page.id).toList();
+    final liveIds = liveOrder.toSet();
+    if (!liveIds.contains(pageId)) {
+      return _rejectPageReorder(
+        'Die gezogene Seite wurde zwischenzeitlich gelöscht.',
+      );
+    }
+    final expectedSurvivingSourceOrder = sourcePageIds
+        .where(liveIds.contains)
+        .toList(growable: false);
+    final liveSurvivingSourceOrder = liveOrder
+        .where(sourceIds.contains)
+        .toList(growable: false);
+    if (!listEquals(expectedSurvivingSourceOrder, liveSurvivingSourceOrder)) {
+      return _rejectPageReorder(
+        'Die Seiten wurden während des Ziehens anderweitig sortiert. '
+        'Bitte erneut ziehen.',
+      );
+    }
+
+    String? nextAnchor;
+    for (
+      var index = insertionIndex;
+      index < sourceWithoutDragged.length;
+      index++
+    ) {
+      final candidate = sourceWithoutDragged[index];
+      if (liveIds.contains(candidate)) {
+        nextAnchor = candidate;
+        break;
+      }
+    }
+    String? previousAnchor;
+    for (var index = insertionIndex - 1; index >= 0; index--) {
+      final candidate = sourceWithoutDragged[index];
+      if (liveIds.contains(candidate)) {
+        previousAnchor = candidate;
+        break;
+      }
+    }
+    if (nextAnchor == null && previousAnchor == null) {
+      return _rejectPageReorder(
+        'Die Zielposition ist nach einer Seitenänderung nicht mehr eindeutig. '
+        'Bitte erneut ziehen.',
+      );
+    }
+
+    final rebased = liveOrder
+        .where((candidate) => candidate != pageId)
+        .toList();
+    final targetIndex = nextAnchor != null
+        ? rebased.indexOf(nextAnchor)
+        : rebased.indexOf(previousAnchor!) + 1;
+    if (targetIndex < 0) {
+      return _rejectPageReorder(
+        'Die Zielseite wurde zwischenzeitlich entfernt. Bitte erneut ziehen.',
+      );
+    }
+    rebased.insert(targetIndex, pageId);
+    return reorderPages(rebased);
+  }
+
+  bool _rejectPageReorder(String message) {
+    lastError = message;
+    notifyListeners();
+    return false;
+  }
+
   /// Deletes [pageId] through the shared command history.
   ///
   /// Participant views keep their own navigation state. When an independent
@@ -2358,34 +2507,41 @@ class EditorController extends ChangeNotifier {
   /// nearest surviving page *before* publishing the document mutation. This
   /// prevents the synchronous history notification from briefly falling back
   /// to the document owner's globally selected page.
-  bool deletePage(String pageId) {
+  bool deletePage(String pageId) => deletePages(<String>{pageId});
+
+  /// Deletes all requested pages as one atomic Undo/Redo entry.
+  bool deletePages(Iterable<String> pageIds) {
     if (!_allowNavigation()) return false;
     final pages = document.pages;
-    if (pages.length <= 1) {
-      lastError = 'Die letzte verbleibende Seite kann nicht gelöscht werden.';
+    final requested = pageIds.toSet();
+    if (requested.isEmpty) return true;
+    final existingIds = pages.map((page) => page.id).toSet();
+    if (!existingIds.containsAll(requested)) {
+      lastError = 'Mindestens eine ausgewählte Seite existiert nicht mehr.';
       notifyListeners();
       return false;
     }
-    final deleteIndex = document.pageIndexById(pageId);
-    if (deleteIndex == null) {
-      lastError = 'Die ausgewählte Seite existiert nicht mehr.';
+    if (requested.length >= pages.length) {
+      lastError = 'Die letzte verbleibende Seite kann nicht gelöscht werden.';
       notifyListeners();
       return false;
     }
 
     final previousActivePageId = page.id;
-    final deletesActivePage = previousActivePageId == pageId;
+    final deletesActivePage = requested.contains(previousActivePageId);
     if (deletesActivePage) {
       commitViewport();
       if (!_followsDocumentNavigation) {
-        final replacementOldIndex = deleteIndex < pages.length - 1
-            ? deleteIndex + 1
-            : deleteIndex - 1;
-        _activePageId = pages[replacementOldIndex].id;
+        final activeIndex = document.pageIndexById(previousActivePageId)!;
+        _activePageId = _nearestSurvivingPageId(
+          pages,
+          removedPageIds: requested,
+          originIndex: activeIndex,
+        );
       }
     }
 
-    final deleted = execute(RemovePageCommand(pageId));
+    final deleted = execute(RemovePagesCommand(requested));
     if (!deleted) {
       _activePageId = previousActivePageId;
       return false;
@@ -2394,6 +2550,21 @@ class EditorController extends ChangeNotifier {
       _afterPageChanged();
     }
     return true;
+  }
+
+  String _duplicatePageName(String sourceName) {
+    final existing = document.pages.map((page) => page.name).toSet();
+    final normalized = sourceName.trim().isEmpty ? 'Seite' : sourceName.trim();
+    for (var copy = 1; copy <= WhiteboardDocument.maxPageCount; copy++) {
+      final suffix = copy == 1 ? ' – Kopie' : ' – Kopie $copy';
+      final maximumBaseLength = 120 - suffix.length;
+      final base = normalized.length <= maximumBaseLength
+          ? normalized
+          : normalized.substring(0, maximumBaseLength).trimRight();
+      final candidate = '$base$suffix';
+      if (!existing.contains(candidate)) return candidate;
+    }
+    throw StateError('Für die Seitenkopie konnte kein Name erzeugt werden.');
   }
 
   void addTemplate(TemplateKind kind) {
@@ -3757,6 +3928,20 @@ class EditorController extends ChangeNotifier {
           locked: value.locked,
         ),
       };
+}
+
+String _nearestSurvivingPageId(
+  List<BoardPage> pages, {
+  required Set<String> removedPageIds,
+  required int originIndex,
+}) {
+  for (var index = originIndex + 1; index < pages.length; index++) {
+    if (!removedPageIds.contains(pages[index].id)) return pages[index].id;
+  }
+  for (var index = originIndex - 1; index >= 0; index--) {
+    if (!removedPageIds.contains(pages[index].id)) return pages[index].id;
+  }
+  throw StateError('Es ist keine verbleibende Seite vorhanden.');
 }
 
 final class _HandwritingConversionSnapshot {

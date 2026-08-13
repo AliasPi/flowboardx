@@ -540,6 +540,274 @@ void main() {
     expect((await repository.load(first.id))?.title, 'Sicher');
   });
 
+  test(
+    'trash move and restore preserve assets backup journal and folder metadata',
+    () async {
+      final deletedAt = timestamp.add(const Duration(hours: 3));
+      repository = FileDocumentRepository(
+        temporary,
+        useBackgroundIsolate: false,
+        clock: () => deletedAt,
+      );
+      final original = WhiteboardDocument.create(
+        id: 'trash-complete-directory',
+        title: 'Erste Fassung',
+        now: timestamp,
+      );
+      final current = original.copyWith(
+        title: 'Gespeicherte Fassung',
+        revision: 1,
+        updatedAt: timestamp.add(const Duration(minutes: 1)),
+      );
+      final journalDocument = current.copyWith(
+        title: 'Noch nicht verlorene Fassung',
+        revision: 2,
+        updatedAt: timestamp.add(const Duration(minutes: 2)),
+      );
+      await repository.save(original);
+      await repository.save(current);
+      final asset = File(
+        '${(await repository.assetDirectory(original.id)).path}'
+        '${Platform.pathSeparator}photo.bin',
+      );
+      await asset.writeAsBytes(<int>[0, 17, 128, 255], flush: true);
+      final payload = const DocumentCodec().encode(journalDocument);
+      await repository
+          .journalFileFor(original.id)
+          .writeAsString(
+            jsonEncode(<String, Object?>{
+              'journalVersion': 1,
+              'documentId': original.id,
+              'revision': journalDocument.revision,
+              'updatedAt': journalDocument.updatedAt.toIso8601String(),
+              'checksum': checksum(payload),
+              'payload': payload,
+            }),
+            flush: true,
+          );
+      final backupBytes = await repository
+          .backupFileFor(original.id)
+          .readAsBytes();
+      final journalBytes = await repository
+          .journalFileFor(original.id)
+          .readAsBytes();
+      final assetBytes = await asset.readAsBytes();
+
+      final trashed = await repository.moveToTrash(
+        original.id,
+        originalFolderId: 'folder-a',
+      );
+
+      expect(trashed.deletedAt, deletedAt);
+      expect(trashed.originalFolderId, 'folder-a');
+      expect(trashed.title, journalDocument.title);
+      expect(await repository.documentDirectory(original.id).exists(), isFalse);
+      expect((await repository.list()), isEmpty);
+      expect((await repository.listTrashed()).single.id, original.id);
+      final trashDirectory = repository.trashDocumentDirectory(original.id);
+      expect(
+        await File(
+          '${trashDirectory.path}${Platform.pathSeparator}'
+          'document.flowboard.backup.json',
+        ).readAsBytes(),
+        backupBytes,
+      );
+      expect(
+        await File(
+          '${trashDirectory.path}${Platform.pathSeparator}'
+          'document.flowboard.journal.json',
+        ).readAsBytes(),
+        journalBytes,
+      );
+      expect(
+        await File(
+          '${trashDirectory.path}${Platform.pathSeparator}'
+          'assets${Platform.pathSeparator}photo.bin',
+        ).readAsBytes(),
+        assetBytes,
+      );
+
+      final restored = await repository.restoreFromTrash(original.id);
+
+      expect(restored.document.title, journalDocument.title);
+      expect(restored.recoveryAvailable, isTrue);
+      expect(restored.originalFolderId, 'folder-a');
+      expect(await trashDirectory.exists(), isFalse);
+      expect(
+        await repository.backupFileFor(original.id).readAsBytes(),
+        backupBytes,
+      );
+      expect(
+        await repository.journalFileFor(original.id).readAsBytes(),
+        journalBytes,
+      );
+      expect(await asset.readAsBytes(), assetBytes);
+      expect((await repository.list()).single.recoveryAvailable, isTrue);
+    },
+  );
+
+  test('restore collision leaves trash source complete', () async {
+    final original = WhiteboardDocument.create(
+      id: 'trash-collision',
+      title: 'Im Papierkorb',
+      now: timestamp,
+    );
+    await repository.save(original);
+    await repository.moveToTrash(original.id);
+    final trashPrimary = File(
+      '${repository.trashDocumentDirectory(original.id).path}'
+      '${Platform.pathSeparator}document.flowboard.json',
+    );
+    final trashBytes = await trashPrimary.readAsBytes();
+    final active = original.copyWith(
+      title: 'Aktive Kollision',
+      revision: 7,
+      updatedAt: timestamp.add(const Duration(hours: 1)),
+    );
+    // Simulate an externally created legacy/corrupt collision. Normal
+    // repository saves are intentionally blocked by the trash tombstone.
+    final activeDirectory = repository.documentDirectory(original.id);
+    await activeDirectory.create(recursive: true);
+    await repository
+        .documentFileFor(original.id)
+        .writeAsString(const DocumentCodec().encode(active), flush: true);
+
+    await expectLater(
+      repository.restoreFromTrash(original.id),
+      throwsA(isA<DocumentStorageException>()),
+    );
+
+    expect((await repository.load(original.id))?.title, 'Aktive Kollision');
+    expect(await trashPrimary.readAsBytes(), trashBytes);
+    expect((await repository.listTrashed()).single.title, 'Im Papierkorb');
+
+    await repository.deletePermanentlyFromTrash(original.id);
+
+    expect(
+      await repository.trashDocumentDirectory(original.id).exists(),
+      isFalse,
+    );
+    expect((await repository.load(original.id))?.title, 'Aktive Kollision');
+  });
+
+  test(
+    'trash tombstone blocks save and asset ghosts but permits queued restore',
+    () async {
+      final original = WhiteboardDocument.create(
+        id: 'trash-tombstone',
+        title: 'Im Papierkorb',
+        now: timestamp,
+      );
+      await repository.save(original);
+      await repository.moveToTrash(original.id);
+      final replacement = original.copyWith(
+        title: 'Darf nicht als Ghost entstehen',
+        revision: 4,
+        updatedAt: timestamp.add(const Duration(hours: 1)),
+      );
+
+      await expectLater(
+        repository.save(replacement),
+        throwsA(isA<DocumentStorageException>()),
+      );
+      await expectLater(
+        repository.assetDirectory(original.id),
+        throwsA(isA<DocumentStorageException>()),
+      );
+      expect(await repository.documentDirectory(original.id).exists(), isFalse);
+      expect(
+        await repository.trashDocumentDirectory(original.id).exists(),
+        isTrue,
+      );
+
+      // Creator rollbacks use the legacy active-document delete operation.
+      // It must never consume the tombstone that caused creation to abort.
+      await repository.delete(original.id);
+      expect(
+        await repository.trashDocumentDirectory(original.id).exists(),
+        isTrue,
+      );
+
+      // restoreFromTrash owns the same ID lock. Operations queued during its
+      // rename window observe the post-restore state and are allowed.
+      final restore = repository.restoreFromTrash(original.id);
+      final save = repository.save(replacement);
+      final assets = repository.assetDirectory(original.id);
+      final results = await Future.wait<Object>(<Future<Object>>[
+        restore,
+        save.then<Object>((_) => true),
+        assets,
+      ]);
+
+      expect(results.first, isA<RestoredTrashDocument>());
+      expect((await repository.load(original.id))?.title, replacement.title);
+      expect((results.last as Directory).existsSync(), isTrue);
+      expect(
+        await repository.trashDocumentDirectory(original.id).exists(),
+        isFalse,
+      );
+    },
+  );
+
+  test('trash-root creation failure removes pre-rename sidecars', () async {
+    final document = WhiteboardDocument.create(
+      id: 'trash-root-blocked',
+      title: 'Bleibt aktiv',
+      now: timestamp,
+    );
+    await repository.save(document);
+    await File(
+      repository.trashDirectory.path,
+    ).writeAsString('blocks directory creation', flush: true);
+    final activeDirectory = repository.documentDirectory(document.id);
+    final sidecar = File(
+      '${activeDirectory.path}${Platform.pathSeparator}'
+      'document.flowboard.trash.json',
+    );
+    final sidecarBackup = File(
+      '${activeDirectory.path}${Platform.pathSeparator}'
+      'document.flowboard.trash.backup.json',
+    );
+
+    await expectLater(
+      repository.moveToTrash(document.id),
+      throwsA(isA<DocumentStorageException>()),
+    );
+
+    expect(await activeDirectory.exists(), isTrue);
+    expect((await repository.load(document.id))?.title, 'Bleibt aktiv');
+    expect(await sidecar.exists(), isFalse);
+    expect(await sidecarBackup.exists(), isFalse);
+  });
+
+  test('lists metadata-less and corrupt trash directories', () async {
+    final document = WhiteboardDocument.create(
+      id: 'trash-without-metadata',
+      title: 'Aus Dokument gelesen',
+      now: timestamp,
+    );
+    await repository.save(document);
+    await repository.moveToTrash(document.id);
+    await repository.trashMetadataFileFor(document.id).delete();
+    final corruptDirectory = repository.trashDocumentDirectory('corrupt-entry');
+    await corruptDirectory.create(recursive: true);
+    await File(
+      '${corruptDirectory.path}${Platform.pathSeparator}'
+      'document.flowboard.json',
+    ).writeAsString('{broken', flush: true);
+
+    final trashed = await repository.listTrashed();
+
+    final readable = trashed.singleWhere((item) => item.id == document.id);
+    final corrupt = trashed.singleWhere((item) => item.id == 'corrupt-entry');
+    expect(readable.title, 'Aus Dokument gelesen');
+    expect(readable.recoverable, isTrue);
+    expect(readable.originalFolderId, isNull);
+    expect(corrupt.title, 'Beschädigtes Dokument');
+    expect(corrupt.pageCount, 0);
+    expect(corrupt.recoverable, isFalse);
+  });
+
   test('missing folder index keeps existing documents at the root', () async {
     final document = WhiteboardDocument.create(id: 'legacy', now: timestamp);
     await repository.save(document);

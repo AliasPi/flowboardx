@@ -66,22 +66,34 @@ class DocumentLibraryController extends ChangeNotifier {
   List<DocumentLibraryEntry> _entries = const <DocumentLibraryEntry>[];
   String? _loadError;
   String? _operationError;
+  String? _trashError;
   bool _creating = false;
   bool _organizing = false;
+  bool _trashLoading = false;
   final Set<String> _busyDocumentIds = <String>{};
+  final Set<String> _busyTrashDocumentIds = <String>{};
   final Set<String> _selectedDocumentIds = <String>{};
   LibraryOrganization _organization = LibraryOrganization.empty;
+  List<TrashedDocumentSummary> _trashedDocuments =
+      const <TrashedDocumentSummary>[];
   String? _activeFolderId;
   var _loadGeneration = 0;
+  var _trashLoadGeneration = 0;
   var _disposed = false;
 
   DocumentLibraryStatus get status => _status;
   List<DocumentLibraryEntry> get entries => _entries;
   String? get loadError => _loadError;
   String? get operationError => _operationError;
+  String? get trashError => _trashError;
   bool get isCreating => _creating;
   bool get isOrganizing => _organizing;
+  bool get isTrashLoading => _trashLoading;
+  bool get trashSupported => repository is DocumentTrashRepository;
+  List<TrashedDocumentSummary> get trashedDocuments => _trashedDocuments;
   Set<String> get busyDocumentIds => Set.unmodifiable(_busyDocumentIds);
+  Set<String> get busyTrashDocumentIds =>
+      Set.unmodifiable(_busyTrashDocumentIds);
   Set<String> get selectedDocumentIds =>
       Set<String>.unmodifiable(_selectedDocumentIds);
   bool get hasSelection => _selectedDocumentIds.isNotEmpty;
@@ -114,6 +126,9 @@ class DocumentLibraryController extends ChangeNotifier {
       _organization.documentFolderIds[documentId];
 
   bool isBusy(String documentId) => _busyDocumentIds.contains(documentId);
+
+  bool isTrashBusy(String documentId) =>
+      _busyTrashDocumentIds.contains(documentId);
 
   void openFolder(String? folderId) {
     if (folderId != null && folderById(folderId) == null) return;
@@ -370,6 +385,7 @@ class DocumentLibraryController extends ChangeNotifier {
       _entries = List.unmodifiable(hydrated);
       _status = DocumentLibraryStatus.ready;
       _safeNotify();
+      await reloadTrash();
     } catch (error) {
       if (!_isCurrent(generation)) return;
       _loadError = _messageFor(
@@ -378,7 +394,55 @@ class DocumentLibraryController extends ChangeNotifier {
       );
       _status = DocumentLibraryStatus.error;
       _safeNotify();
+      await reloadTrash();
     }
+  }
+
+  Future<void> reloadTrash() async {
+    final generation = ++_trashLoadGeneration;
+    if (repository is! DocumentTrashRepository) {
+      _trashedDocuments = const <TrashedDocumentSummary>[];
+      _trashError = null;
+      _trashLoading = false;
+      return;
+    }
+    _trashLoading = true;
+    _trashError = null;
+    _safeNotify();
+    try {
+      final items =
+          (await (repository as DocumentTrashRepository).listTrashed()).toList(
+            growable: true,
+          );
+      if (_disposed || generation != _trashLoadGeneration) return;
+      items.sort((first, second) {
+        final deleted = second.deletedAt.compareTo(first.deletedAt);
+        return deleted != 0 ? deleted : first.id.compareTo(second.id);
+      });
+      _trashedDocuments = List<TrashedDocumentSummary>.unmodifiable(items);
+    } catch (error) {
+      if (_disposed || generation != _trashLoadGeneration) return;
+      _trashError = _messageFor(
+        error,
+        fallback: 'Der Papierkorb konnte nicht geladen werden.',
+      );
+    } finally {
+      if (!_disposed && generation == _trashLoadGeneration) {
+        _trashLoading = false;
+        _safeNotify();
+      }
+    }
+  }
+
+  /// Makes every snapshot started before this point ineligible to publish.
+  ///
+  /// Trash mutations and reloads use different repository calls, so a slow
+  /// list request can otherwise overwrite a newer local move/restore/delete.
+  /// Resetting the loading flag also prevents an invalidated request's guarded
+  /// `finally` block from leaving the UI permanently busy.
+  void _invalidateTrashReload() {
+    _trashLoadGeneration++;
+    _trashLoading = false;
   }
 
   Future<DocumentLibraryOpenResult?> createDocument({String? title}) async {
@@ -516,11 +580,25 @@ class DocumentLibraryController extends ChangeNotifier {
     _busyDocumentIds.addAll(ids);
     _safeNotify();
     final deleted = <String>{};
+    final movedToTrash = <TrashedDocumentSummary>[];
+    final trashRepository = repository is DocumentTrashRepository
+        ? repository as DocumentTrashRepository
+        : null;
+    if (trashRepository != null) _invalidateTrashReload();
     Object? firstError;
     try {
       for (final id in ids) {
         try {
-          await repository.delete(id);
+          if (trashRepository == null) {
+            await repository.delete(id);
+          } else {
+            movedToTrash.add(
+              await trashRepository.moveToTrash(
+                id,
+                originalFolderId: _organization.documentFolderIds[id],
+              ),
+            );
+          }
           deleted.add(id);
         } catch (error) {
           firstError ??= error;
@@ -531,6 +609,26 @@ class DocumentLibraryController extends ChangeNotifier {
         _entries = List.unmodifiable(
           _entries.where((entry) => !deleted.contains(entry.summary.id)),
         );
+        if (movedToTrash.isNotEmpty) {
+          // Also reject a reload that began while the filesystem mutations
+          // were in flight and may have captured only part of the batch.
+          _invalidateTrashReload();
+          final movedIds = movedToTrash.map((item) => item.id).toSet();
+          final nextTrash =
+              _trashedDocuments
+                  .where((item) => !movedIds.contains(item.id))
+                  .toList(growable: true)
+                ..addAll(movedToTrash)
+                ..sort((first, second) {
+                  final deletedAt = second.deletedAt.compareTo(first.deletedAt);
+                  return deletedAt != 0
+                      ? deletedAt
+                      : first.id.compareTo(second.id);
+                });
+          _trashedDocuments = List<TrashedDocumentSummary>.unmodifiable(
+            nextTrash,
+          );
+        }
         _selectedDocumentIds.removeAll(deleted);
         final assignments = Map<String, String>.from(
           _organization.documentFolderIds,
@@ -549,25 +647,137 @@ class DocumentLibraryController extends ChangeNotifier {
             );
         try {
           await _saveOrganization(next);
-          _organization = next;
         } catch (error) {
           // Stale assignments are harmless and normalized on the next load.
           // Never retry an already successful destructive operation.
           firstError ??= error;
         }
+        // The filesystem operation already succeeded. Keep in-memory state
+        // consistent even if the optional folder index could not be updated;
+        // the trash sidecar retains the original assignment for restoration.
+        _organization = next;
         _status = DocumentLibraryStatus.ready;
       }
       if (firstError != null) {
         _operationError = _messageFor(
           firstError,
           fallback: deleted.isEmpty
-              ? 'Die Dokumente konnten nicht gelöscht werden.'
-              : '${deleted.length} Dokumente wurden gelöscht; mindestens eines konnte nicht gelöscht werden.',
+              ? trashRepository == null
+                    ? 'Die Dokumente konnten nicht gelöscht werden.'
+                    : 'Die Dokumente konnten nicht in den Papierkorb verschoben werden.'
+              : trashRepository == null
+              ? '${deleted.length} Dokumente wurden gelöscht; mindestens eines konnte nicht gelöscht werden.'
+              : '${deleted.length} Dokumente wurden in den Papierkorb verschoben; mindestens eines konnte nicht verschoben werden.',
         );
       }
       return Set<String>.unmodifiable(deleted);
     } finally {
       _busyDocumentIds.removeAll(ids);
+      _safeNotify();
+    }
+  }
+
+  Future<bool> restoreTrashedDocument(String documentId) async {
+    if (repository is! DocumentTrashRepository ||
+        isTrashBusy(documentId) ||
+        _entryById(documentId) != null) {
+      if (_entryById(documentId) != null) {
+        _operationError =
+            'Ein aktives Dokument mit derselben ID verhindert die Wiederherstellung.';
+        _safeNotify();
+      }
+      return false;
+    }
+    final summary = _trashedEntryById(documentId);
+    if (summary == null || !summary.recoverable) return false;
+    _busyTrashDocumentIds.add(documentId);
+    _invalidateTrashReload();
+    _operationError = null;
+    _safeNotify();
+    final priorOrganization = _organization;
+    final validOriginalFolderId = folderById(summary.originalFolderId)?.id;
+    final assignments = Map<String, String>.from(
+      priorOrganization.documentFolderIds,
+    );
+    if (validOriginalFolderId == null) {
+      assignments.remove(documentId);
+    } else {
+      assignments[documentId] = validOriginalFolderId;
+    }
+    final nextOrganization =
+        LibraryOrganization(
+          folders: priorOrganization.folders,
+          documentFolderIds: assignments,
+        ).normalized(
+          existingDocumentIds: <String>{
+            ..._entries.map((entry) => entry.summary.id),
+            documentId,
+          },
+        );
+    var organizationPrepared = false;
+    try {
+      // Persist the destination folder before the directory rename. A process
+      // death immediately after restoration therefore cannot orphan the
+      // recovered board from its still-existing original folder.
+      await _saveOrganization(nextOrganization);
+      organizationPrepared = true;
+      final restored = await (repository as DocumentTrashRepository)
+          .restoreFromTrash(documentId);
+      _invalidateTrashReload();
+      _organization = nextOrganization;
+      _trashedDocuments = List<TrashedDocumentSummary>.unmodifiable(
+        _trashedDocuments.where((item) => item.id != documentId),
+      );
+      _upsert(restored.document, recoveryAvailable: restored.recoveryAvailable);
+      return true;
+    } catch (error) {
+      if (organizationPrepared) {
+        try {
+          await _saveOrganization(priorOrganization);
+        } catch (_) {
+          // A stale assignment cannot remove document data and is normalized
+          // on the next library load. Preserve the restoration error below.
+        }
+      }
+      _organization = priorOrganization;
+      _operationError = _messageFor(
+        error,
+        fallback: 'Das Whiteboard konnte nicht wiederhergestellt werden.',
+      );
+      return false;
+    } finally {
+      _busyTrashDocumentIds.remove(documentId);
+      _safeNotify();
+    }
+  }
+
+  Future<bool> permanentlyDeleteTrashedDocument(String documentId) async {
+    if (repository is! DocumentTrashRepository ||
+        isTrashBusy(documentId) ||
+        _trashedEntryById(documentId) == null) {
+      return false;
+    }
+    _busyTrashDocumentIds.add(documentId);
+    _invalidateTrashReload();
+    _operationError = null;
+    _safeNotify();
+    try {
+      await (repository as DocumentTrashRepository).deletePermanentlyFromTrash(
+        documentId,
+      );
+      _invalidateTrashReload();
+      _trashedDocuments = List<TrashedDocumentSummary>.unmodifiable(
+        _trashedDocuments.where((item) => item.id != documentId),
+      );
+      return true;
+    } catch (error) {
+      _operationError = _messageFor(
+        error,
+        fallback: 'Das Whiteboard konnte nicht endgültig gelöscht werden.',
+      );
+      return false;
+    } finally {
+      _busyTrashDocumentIds.remove(documentId);
       _safeNotify();
     }
   }
@@ -584,6 +794,12 @@ class DocumentLibraryController extends ChangeNotifier {
     if (_status == DocumentLibraryStatus.error && _entries.isNotEmpty) {
       _status = DocumentLibraryStatus.ready;
     }
+    _safeNotify();
+  }
+
+  void clearTrashError() {
+    if (_trashError == null) return;
+    _trashError = null;
     _safeNotify();
   }
 
@@ -756,6 +972,13 @@ class DocumentLibraryController extends ChangeNotifier {
     return null;
   }
 
+  TrashedDocumentSummary? _trashedEntryById(String id) {
+    for (final entry in _trashedDocuments) {
+      if (entry.id == id) return entry;
+    }
+    return null;
+  }
+
   bool _isCurrent(int generation) =>
       !_disposed && generation == _loadGeneration;
 
@@ -767,6 +990,7 @@ class DocumentLibraryController extends ChangeNotifier {
   void dispose() {
     _disposed = true;
     _loadGeneration++;
+    _trashLoadGeneration++;
     super.dispose();
   }
 }

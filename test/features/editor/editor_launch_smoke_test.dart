@@ -74,6 +74,48 @@ void main() {
     );
   }
 
+  testWidgets('page tray opens the page organizer', (tester) async {
+    tester.view.devicePixelRatio = 1;
+    tester.view.physicalSize = const Size(1280, 800);
+    final directory = (await tester.runAsync(
+      () => Directory.systemTemp.createTemp('flowboard-page-organizer-entry-'),
+    ))!;
+    final document = WhiteboardDocument.create(
+      id: 'page-organizer-entry',
+      now: DateTime.utc(2026, 8, 13, 12),
+    );
+    final repository = _MemoryRepository(directory, document);
+    addTearDown(() async {
+      tester.view.resetDevicePixelRatio();
+      tester.view.resetPhysicalSize();
+      await tester.runAsync(() async {
+        if (await directory.exists()) await directory.delete(recursive: true);
+      });
+    });
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: EditorScreen(
+          document: document,
+          repository: repository,
+          assetDirectory: directory,
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.tap(find.byTooltip('Seiten'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 450));
+    expect(find.byKey(const ValueKey('open-page-organizer')), findsOneWidget);
+
+    await tester.tap(find.byKey(const ValueKey('open-page-organizer')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 450));
+    expect(find.byKey(const ValueKey('page-organizer-dialog')), findsOneWidget);
+    expect(find.text('Seiten organisieren'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('split top bar keeps right pen shortcuts participant-scoped', (
     tester,
   ) async {

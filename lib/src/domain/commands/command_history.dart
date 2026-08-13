@@ -349,7 +349,7 @@ List<BoardPage> _mergeDocumentPages({
   }
 
   diagnostics.genericPageMerges++;
-  return _mergeItems<BoardPage>(
+  final merged = _mergeItems<BoardPage>(
     current: current.pages,
     from: from.pages,
     to: to.pages,
@@ -363,6 +363,22 @@ List<BoardPage> _mergeDocumentPages({
     ),
     allowDirectTransition: false,
   );
+  // `_mergeItems` intentionally starts from the current order so additions and
+  // removals can be merged without overwriting a later participant. A pure
+  // reorder has no such membership delta, however, and would otherwise become
+  // a no-op during Undo/Redo. Apply the target permutation only while the live
+  // ID order still exactly matches this transition's source order. A later
+  // participant reorder (or page add/remove) therefore keeps winning.
+  if (_sameItemIdOrder(current.pages, from.pages, (page) => page.id) &&
+      _sameItemIdSet(from.pages, to.pages, (page) => page.id)) {
+    final mergedById = <String, BoardPage>{
+      for (final page in merged) page.id: page,
+    };
+    return List<BoardPage>.unmodifiable(<BoardPage>[
+      for (final target in to.pages) mergedById[target.id]!,
+    ]);
+  }
+  return merged;
 }
 
 BoardPage _restorePageContent(BoardPage target, ViewportState viewport) =>
@@ -771,6 +787,26 @@ const Set<String> _additiveNumericKeys = <String>{
 
 typedef _ItemMerger<T> = T Function(T current, T from, T to);
 typedef _ItemRemovalGuard<T> = bool Function(T current, T from);
+
+bool _sameItemIdOrder<T>(
+  List<T> left,
+  List<T> right,
+  String Function(T item) idOf,
+) {
+  if (left.length != right.length) return false;
+  for (var index = 0; index < left.length; index++) {
+    if (idOf(left[index]) != idOf(right[index])) return false;
+  }
+  return true;
+}
+
+bool _sameItemIdSet<T>(
+  List<T> left,
+  List<T> right,
+  String Function(T item) idOf,
+) =>
+    left.length == right.length &&
+    left.map(idOf).toSet().containsAll(right.map(idOf));
 
 List<T> _mergeItems<T>({
   required List<T> current,

@@ -7,7 +7,7 @@ import 'package:uuid/uuid.dart';
 import '../../data/document_repository.dart';
 import '../../domain/model/board_object.dart';
 import '../../domain/model/document.dart';
-import '../../domain/model/ink.dart';
+import '../../domain/model/page_identity_rebinder.dart';
 
 /// Result of extracting selected pages into an independently persisted board.
 final class CreatedPagesDocument {
@@ -71,7 +71,7 @@ final class SelectedPagesDocumentCreator {
       throw const FormatException('Der Dokumentname darf nicht leer sein.');
     }
 
-    final usedIds = _allSourceIds(sourceDocument);
+    final usedIds = collectDocumentIdentityValues(sourceDocument);
     usedIds.addAll((await repository.list()).map((summary) => summary.id));
     final destinationDocumentId = _freshId(usedIds, 'Dokument');
     Directory? destinationAssets;
@@ -90,9 +90,19 @@ final class SelectedPagesDocumentCreator {
         materializedFiles: materializedFiles,
       );
 
+      final cloner = PageIdentityRebinder(
+        reservedIds: usedIds,
+        newId: _uuid.v4,
+      );
       final pages = <BoardPage>[
         for (final page in selectedPages)
-          _clonePage(page, assetIds: reboundAssets.assetIds, usedIds: usedIds),
+          cloner.clone(
+            page,
+            resolveAssetId: (sourceAssetId) =>
+                _requiredReboundAsset(sourceAssetId, reboundAssets.assetIds),
+            resolveThumbnailAssetId: (sourceAssetId) =>
+                reboundAssets.assetIds[sourceAssetId],
+          ),
       ];
       final timestamp = _clock().toUtc();
       final document = WhiteboardDocument(
@@ -130,24 +140,6 @@ final class SelectedPagesDocumentCreator {
       Error.throwWithStackTrace(error, stack);
     }
   }
-
-  Set<String> _allSourceIds(WhiteboardDocument document) => <String>{
-    document.id,
-    for (final asset in document.assets) asset.id,
-    for (final preset in document.presets) preset.id,
-    for (final page in document.pages) ...<String>{
-      page.id,
-      if (page.template != null) page.template!.id,
-      for (final stroke in page.strokes) stroke.id,
-      for (final object in page.objects) object.id,
-      for (final layer in page.annotationLayers) ...<String>{
-        layer.id,
-        for (final stroke in layer.strokes) stroke.id,
-      },
-      for (final group in page.groups) group.id,
-      for (final group in page.contentGroups) group.id,
-    },
-  };
 
   _AssetReferences _collectAssetReferences(List<BoardPage> pages) {
     final required = <String>{};
@@ -321,122 +313,6 @@ final class SelectedPagesDocumentCreator {
       );
     }
     return File(resolvedFile);
-  }
-
-  BoardPage _clonePage(
-    BoardPage source, {
-    required Map<String, String> assetIds,
-    required Set<String> usedIds,
-  }) {
-    final itemIds = <String, String>{};
-    final strokes = <InkStroke>[];
-    for (final stroke in source.strokes) {
-      final id = _freshId(usedIds, 'Strich');
-      itemIds[stroke.id] = id;
-      strokes.add(stroke.copyWith(id: id, clearPointerId: true));
-    }
-
-    final objects = <BoardObject>[];
-    for (final object in source.objects) {
-      final id = _freshId(usedIds, 'Objekt');
-      itemIds[object.id] = id;
-      final json = Map<String, Object?>.from(object.toJson())..['id'] = id;
-      switch (object) {
-        case final ImageObject image:
-          json['assetId'] = _requiredReboundAsset(image.assetId, assetIds);
-        case final PdfObject pdf:
-          json['assetId'] = _requiredReboundAsset(pdf.assetId, assetIds);
-        case final TextObject text:
-          json['sourceStrokeIds'] = text.sourceStrokeIds
-              .map((id) => itemIds[id])
-              .whereType<String>()
-              .toList(growable: false);
-        default:
-          break;
-      }
-      objects.add(BoardObject.fromJson(json));
-    }
-
-    final annotations = <ObjectInkLayer>[];
-    for (final layer in source.annotationLayers) {
-      final objectId = itemIds[layer.objectId];
-      if (objectId == null) continue;
-      annotations.add(
-        ObjectInkLayer(
-          id: _freshId(usedIds, 'Anmerkung'),
-          objectId: objectId,
-          strokes: [
-            for (final stroke in layer.strokes)
-              stroke.copyWith(
-                id: _freshId(usedIds, 'Anmerkungsstrich'),
-                clearPointerId: true,
-              ),
-          ],
-          pdfPageIndex: layer.pdfPageIndex,
-          visible: layer.visible,
-        ),
-      );
-    }
-
-    final groups = <InkGroup>[];
-    for (final group in source.groups) {
-      final members = group.strokeIds
-          .map((id) => itemIds[id])
-          .whereType<String>()
-          .toList(growable: false);
-      if (members.isEmpty) continue;
-      groups.add(
-        InkGroup(
-          id: _freshId(usedIds, 'Strichgruppe'),
-          kind: group.kind,
-          strokeIds: members,
-          bounds: group.bounds,
-          createdAt: group.createdAt,
-        ),
-      );
-    }
-
-    final contentGroups = <ContentGroup>[];
-    for (final group in source.contentGroups) {
-      final members = group.memberIds
-          .map((id) => itemIds[id])
-          .whereType<String>()
-          .toList(growable: false);
-      if (members.length < 2) continue;
-      contentGroups.add(
-        ContentGroup(
-          id: _freshId(usedIds, 'Inhaltsgruppe'),
-          memberIds: members,
-          bounds: group.bounds,
-          locked: group.locked,
-          createdAt: group.createdAt,
-        ),
-      );
-    }
-
-    final template = source.template;
-    return BoardPage(
-      id: _freshId(usedIds, 'Seite'),
-      name: source.name,
-      viewport: source.viewport,
-      strokes: strokes,
-      objects: objects,
-      annotationLayers: annotations,
-      groups: groups,
-      contentGroups: contentGroups,
-      selection: SelectionState.empty,
-      template: template == null
-          ? null
-          : TemplateInstance(
-              id: _freshId(usedIds, 'Vorlage'),
-              kind: template.kind,
-              version: template.version,
-              properties: template.properties,
-            ),
-      thumbnailAssetId: source.thumbnailAssetId == null
-          ? null
-          : assetIds[source.thumbnailAssetId!],
-    );
   }
 
   String _requiredReboundAsset(

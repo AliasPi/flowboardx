@@ -293,6 +293,20 @@ class _DocumentLibraryScreenState extends State<DocumentLibraryScreen> {
             ],
           ),
         ),
+        if (_controller.trashSupported) ...<Widget>[
+          _LargeIconButton(
+            key: const ValueKey<String>('library-trash-button'),
+            tooltip: _controller.trashedDocuments.isEmpty
+                ? 'Papierkorb'
+                : 'Papierkorb (${_controller.trashedDocuments.length})',
+            icon: _controller.trashedDocuments.isEmpty
+                ? Icons.delete_outline_rounded
+                : Icons.delete_rounded,
+            onPressed: _showTrash,
+            theme: colors,
+          ),
+          const SizedBox(width: 8),
+        ],
         _LargeIconButton(
           tooltip: 'Dokumente neu laden',
           icon: Icons.refresh_rounded,
@@ -710,13 +724,16 @@ class _DocumentLibraryScreenState extends State<DocumentLibraryScreen> {
   }
 
   Future<void> _deleteDocument(DocumentLibraryEntry entry) async {
+    final movesToTrash = _controller.trashSupported;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
         icon: Icon(Icons.delete_outline_rounded, color: widget.theme.danger),
         title: const Text('Whiteboard löschen?'),
         content: Text(
-          '„${entry.summary.title}“ und alle zugehörigen lokalen Dateien werden dauerhaft gelöscht.',
+          movesToTrash
+              ? '„${entry.summary.title}“ wird mit allen zugehörigen lokalen Dateien in den Papierkorb verschoben.'
+              : '„${entry.summary.title}“ und alle zugehörigen lokalen Dateien werden dauerhaft gelöscht.',
         ),
         actions: <Widget>[
           TextButton(
@@ -732,7 +749,7 @@ class _DocumentLibraryScreenState extends State<DocumentLibraryScreen> {
               foregroundColor: const Color(0xFF2B080A),
             ),
             onPressed: () => Navigator.of(dialogContext).pop(true),
-            child: const Text('Löschen'),
+            child: Text(movesToTrash ? 'In Papierkorb' : 'Löschen'),
           ),
         ],
       ),
@@ -741,9 +758,15 @@ class _DocumentLibraryScreenState extends State<DocumentLibraryScreen> {
     final deleted = await _controller.deleteDocument(entry.summary.id);
     if (mounted && deleted) {
       unawaited(Future.sync(() => widget.onDocumentsChanged?.call()));
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('Whiteboard gelöscht.')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            movesToTrash
+                ? 'Whiteboard in den Papierkorb verschoben.'
+                : 'Whiteboard gelöscht.',
+          ),
+        ),
+      );
     }
   }
 
@@ -816,6 +839,7 @@ class _DocumentLibraryScreenState extends State<DocumentLibraryScreen> {
     final ids = _controller.selectedDocumentIds;
     if (ids.isEmpty) return;
     final count = ids.length;
+    final movesToTrash = _controller.trashSupported;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
@@ -823,8 +847,10 @@ class _DocumentLibraryScreenState extends State<DocumentLibraryScreen> {
         title: Text(
           '$count ${count == 1 ? 'Whiteboard' : 'Whiteboards'} löschen?',
         ),
-        content: const Text(
-          'Die ausgewählten Dokumente und ihre lokalen Dateien werden dauerhaft gelöscht.',
+        content: Text(
+          movesToTrash
+              ? 'Die ausgewählten Dokumente werden mit ihren lokalen Dateien in den Papierkorb verschoben.'
+              : 'Die ausgewählten Dokumente und ihre lokalen Dateien werden dauerhaft gelöscht.',
         ),
         actions: <Widget>[
           TextButton(
@@ -838,7 +864,7 @@ class _DocumentLibraryScreenState extends State<DocumentLibraryScreen> {
               foregroundColor: const Color(0xFF2B080A),
             ),
             onPressed: () => Navigator.of(dialogContext).pop(true),
-            child: const Text('Endgültig löschen'),
+            child: Text(movesToTrash ? 'In Papierkorb' : 'Endgültig löschen'),
           ),
         ],
       ),
@@ -848,7 +874,74 @@ class _DocumentLibraryScreenState extends State<DocumentLibraryScreen> {
     if (!mounted || deleted.isEmpty) return;
     unawaited(Future.sync(() => widget.onDocumentsChanged?.call()));
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('${deleted.length} Dokumente gelöscht.')),
+      SnackBar(
+        content: Text(
+          movesToTrash
+              ? '${deleted.length} Dokumente in den Papierkorb verschoben.'
+              : '${deleted.length} Dokumente gelöscht.',
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showTrash() async {
+    if (!_controller.trashSupported) return;
+    await showDialog<void>(
+      context: context,
+      builder: (_) => _DocumentTrashDialog(
+        controller: _controller,
+        theme: widget.theme,
+        onRestore: _restoreTrashedDocument,
+        onDeletePermanently: _deleteTrashedDocumentPermanently,
+      ),
+    );
+  }
+
+  Future<void> _restoreTrashedDocument(TrashedDocumentSummary document) async {
+    final restored = await _controller.restoreTrashedDocument(document.id);
+    if (!mounted || !restored) return;
+    unawaited(Future.sync(() => widget.onDocumentsChanged?.call()));
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Whiteboard wiederhergestellt.')),
+    );
+  }
+
+  Future<void> _deleteTrashedDocumentPermanently(
+    TrashedDocumentSummary document,
+  ) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        icon: Icon(Icons.delete_forever_rounded, color: widget.theme.danger),
+        title: const Text('Endgültig löschen?'),
+        content: Text(
+          '„${document.title}“ wird unwiderruflich mit allen lokalen Dateien gelöscht.',
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('Abbrechen'),
+          ),
+          FilledButton(
+            key: const ValueKey<String>('confirm-trash-delete-button'),
+            style: FilledButton.styleFrom(
+              backgroundColor: widget.theme.danger,
+              foregroundColor: const Color(0xFF2B080A),
+            ),
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('Endgültig löschen'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || confirmed != true) return;
+    final deleted = await _controller.permanentlyDeleteTrashedDocument(
+      document.id,
+    );
+    if (!mounted || !deleted) return;
+    unawaited(Future.sync(() => widget.onDocumentsChanged?.call()));
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Whiteboard endgültig gelöscht.')),
     );
   }
 
@@ -1032,6 +1125,245 @@ class _DocumentLibraryScreenState extends State<DocumentLibraryScreen> {
 }
 
 enum _ArchiveShareTarget { saveLocally, quickShare, wlanQr }
+
+class _DocumentTrashDialog extends StatefulWidget {
+  const _DocumentTrashDialog({
+    required this.controller,
+    required this.theme,
+    required this.onRestore,
+    required this.onDeletePermanently,
+  });
+
+  final DocumentLibraryController controller;
+  final DocumentLibraryThemeData theme;
+  final Future<void> Function(TrashedDocumentSummary document) onRestore;
+  final Future<void> Function(TrashedDocumentSummary document)
+  onDeletePermanently;
+
+  @override
+  State<_DocumentTrashDialog> createState() => _DocumentTrashDialogState();
+}
+
+class _DocumentTrashDialogState extends State<_DocumentTrashDialog> {
+  @override
+  void initState() {
+    super.initState();
+    widget.controller.addListener(_handleControllerChanged);
+  }
+
+  @override
+  void didUpdateWidget(covariant _DocumentTrashDialog oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!identical(oldWidget.controller, widget.controller)) {
+      oldWidget.controller.removeListener(_handleControllerChanged);
+      widget.controller.addListener(_handleControllerChanged);
+    }
+  }
+
+  void _handleControllerChanged() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    widget.controller.removeListener(_handleControllerChanged);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final controller = widget.controller;
+    final height = (MediaQuery.sizeOf(context).height * .58)
+        .clamp(260.0, 540.0)
+        .toDouble();
+    final error = controller.trashError ?? controller.operationError;
+    return AlertDialog(
+      icon: Icon(Icons.delete_outline_rounded, color: widget.theme.primary),
+      title: Row(
+        children: <Widget>[
+          const Expanded(child: Text('Papierkorb')),
+          IconButton(
+            key: const ValueKey<String>('trash-refresh-button'),
+            tooltip: 'Papierkorb neu laden',
+            onPressed: controller.isTrashLoading
+                ? null
+                : () => unawaited(controller.reloadTrash()),
+            icon: const Icon(Icons.refresh_rounded),
+          ),
+        ],
+      ),
+      content: SizedBox(
+        width: 640,
+        height: height,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            if (error != null) ...<Widget>[
+              _OperationErrorBanner(
+                message: error,
+                theme: widget.theme,
+                onDismiss: controller.trashError != null
+                    ? controller.clearTrashError
+                    : controller.clearOperationError,
+              ),
+              const SizedBox(height: 12),
+            ],
+            if (controller.isTrashLoading)
+              LinearProgressIndicator(
+                key: const ValueKey<String>('trash-loading'),
+                color: widget.theme.primary,
+                backgroundColor: widget.theme.surfaceRaised,
+              ),
+            if (controller.isTrashLoading) const SizedBox(height: 8),
+            Expanded(child: _buildContents(controller)),
+          ],
+        ),
+      ),
+      actions: <Widget>[
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Schließen'),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildContents(DocumentLibraryController controller) {
+    final documents = controller.trashedDocuments;
+    if (documents.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            Icon(
+              Icons.delete_sweep_outlined,
+              size: 50,
+              color: widget.theme.mutedText,
+            ),
+            const SizedBox(height: 14),
+            Text(
+              controller.isTrashLoading
+                  ? 'Papierkorb wird geladen …'
+                  : 'Der Papierkorb ist leer.',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: widget.theme.mutedText, fontSize: 16),
+            ),
+          ],
+        ),
+      );
+    }
+    return ListView.separated(
+      itemCount: documents.length,
+      separatorBuilder: (_, _) => const SizedBox(height: 10),
+      itemBuilder: (context, index) => _buildDocument(documents[index]),
+    );
+  }
+
+  Widget _buildDocument(TrashedDocumentSummary document) {
+    final busy = widget.controller.isTrashBusy(document.id);
+    final originalFolder = widget.controller.folderById(
+      document.originalFolderId,
+    );
+    final folderDescription = originalFolder != null
+        ? 'Ursprünglicher Ordner: ${originalFolder.name}'
+        : document.originalFolderId != null
+        ? 'Ursprünglicher Ordner existiert nicht mehr'
+        : 'Ohne Ordner';
+    final pageDescription = document.pageCount == 1
+        ? '1 Seite'
+        : document.pageCount > 1
+        ? '${document.pageCount} Seiten'
+        : 'Dokumentdaten nicht lesbar';
+    return Container(
+      key: ValueKey<String>('trash-item-${document.id}'),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: widget.theme.surfaceRaised,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: document.recoverable
+              ? widget.theme.outline
+              : widget.theme.danger.withValues(alpha: .7),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Expanded(
+                child: Text(
+                  document.title,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: widget.theme.text,
+                    fontSize: 17,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              if (busy)
+                const Padding(
+                  padding: EdgeInsets.only(left: 12),
+                  child: SizedBox.square(
+                    dimension: 22,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 5),
+          Text(
+            'Gelöscht ${_formatUpdatedAt(document.deletedAt)}  •  $pageDescription\n$folderDescription',
+            style: TextStyle(color: widget.theme.mutedText, height: 1.35),
+          ),
+          if (!document.recoverable) ...<Widget>[
+            const SizedBox(height: 8),
+            Text(
+              'Keine intakte Dokumentversion gefunden. Endgültiges Löschen bleibt möglich.',
+              style: TextStyle(color: widget.theme.danger, fontSize: 13),
+            ),
+          ],
+          const SizedBox(height: 12),
+          Wrap(
+            alignment: WrapAlignment.end,
+            spacing: 8,
+            runSpacing: 8,
+            children: <Widget>[
+              OutlinedButton.icon(
+                key: ValueKey<String>('trash-delete-${document.id}'),
+                onPressed: busy
+                    ? null
+                    : () => widget.onDeletePermanently(document),
+                icon: const Icon(Icons.delete_forever_rounded),
+                label: const Text('Endgültig löschen'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: widget.theme.danger,
+                  minimumSize: const Size(64, 48),
+                ),
+              ),
+              FilledButton.icon(
+                key: ValueKey<String>('trash-restore-${document.id}'),
+                onPressed: busy || !document.recoverable
+                    ? null
+                    : () => widget.onRestore(document),
+                icon: const Icon(Icons.restore_rounded),
+                label: const Text('Wiederherstellen'),
+                style: FilledButton.styleFrom(
+                  minimumSize: const Size(64, 48),
+                  backgroundColor: widget.theme.primary,
+                  foregroundColor: const Color(0xFF08241C),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
 
 class _ArchiveShareTargetDialog extends StatelessWidget {
   const _ArchiveShareTargetDialog();

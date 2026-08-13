@@ -507,6 +507,126 @@ final class RemovePageCommand implements DocumentCommand {
   }
 }
 
+/// Removes several pages as one Undo/Redo entry.
+final class RemovePagesCommand implements DocumentCommand {
+  RemovePagesCommand(Iterable<String> pageIds, {this.now})
+    : pageIds = Set<String>.unmodifiable(pageIds);
+
+  final Set<String> pageIds;
+  final DateTime? now;
+
+  @override
+  String get label => pageIds.length == 1 ? 'Seite löschen' : 'Seiten löschen';
+
+  @override
+  WhiteboardDocument apply(WhiteboardDocument document) {
+    if (pageIds.isEmpty) return document;
+    final existingIds = document.pages.map((page) => page.id).toSet();
+    final missingIds = pageIds.difference(existingIds);
+    if (missingIds.isNotEmpty) {
+      throw StateError('Mindestens eine ausgewählte Seite existiert nicht.');
+    }
+    if (pageIds.length >= document.pages.length) {
+      throw StateError('Die letzte Seite kann nicht gelöscht werden.');
+    }
+
+    final activePageId = document.currentPage.id;
+    final activeOldIndex = document.currentPageIndex;
+    final pages = document.pages
+        .where((page) => !pageIds.contains(page.id))
+        .toList(growable: false);
+    var current = pages.indexWhere((page) => page.id == activePageId);
+    if (current < 0) {
+      final replacementId = _nearestSurvivingPageId(
+        document.pages,
+        removedPageIds: pageIds,
+        originIndex: activeOldIndex,
+      );
+      current = pages.indexWhere((page) => page.id == replacementId);
+    }
+    return document.copyWith(
+      pages: pages,
+      currentPageIndex: current.clamp(0, pages.length - 1),
+      updatedAt: now ?? DateTime.now().toUtc(),
+      revision: document.revision + 1,
+    );
+  }
+}
+
+final class RenamePageCommand implements DocumentCommand {
+  const RenamePageCommand(this.pageId, this.name, {this.now});
+
+  final String pageId;
+  final String name;
+  final DateTime? now;
+
+  @override
+  String get label => 'Seite umbenennen';
+
+  @override
+  WhiteboardDocument apply(WhiteboardDocument document) {
+    final normalized = name.trim();
+    if (normalized.isEmpty) {
+      throw const FormatException('Der Seitenname darf nicht leer sein.');
+    }
+    if (normalized.length > 120) {
+      throw const FormatException(
+        'Der Seitenname darf maximal 120 Zeichen lang sein.',
+      );
+    }
+    final page = _page(document, pageId);
+    if (page.name == normalized) return document;
+    return document.replacePage(page.copyWith(name: normalized), now: now);
+  }
+}
+
+/// Applies an exact permutation while retaining the active page by identity.
+final class ReorderPagesCommand implements DocumentCommand {
+  ReorderPagesCommand(Iterable<String> orderedPageIds, {this.now})
+    : orderedPageIds = List<String>.unmodifiable(orderedPageIds);
+
+  final List<String> orderedPageIds;
+  final DateTime? now;
+
+  @override
+  String get label => 'Seiten sortieren';
+
+  @override
+  WhiteboardDocument apply(WhiteboardDocument document) {
+    if (orderedPageIds.length != document.pages.length ||
+        orderedPageIds.toSet().length != orderedPageIds.length ||
+        !orderedPageIds.toSet().containsAll(
+          document.pages.map((page) => page.id),
+        )) {
+      throw const FormatException(
+        'Die Seitenreihenfolge muss jede Seite genau einmal enthalten.',
+      );
+    }
+    var changed = false;
+    for (var index = 0; index < orderedPageIds.length; index++) {
+      if (document.pages[index].id != orderedPageIds[index]) {
+        changed = true;
+        break;
+      }
+    }
+    if (!changed) return document;
+
+    final byId = <String, BoardPage>{
+      for (final page in document.pages) page.id: page,
+    };
+    final activePageId = document.currentPage.id;
+    final pages = <BoardPage>[
+      for (final pageId in orderedPageIds) byId[pageId]!,
+    ];
+    return document.copyWith(
+      pages: pages,
+      currentPageIndex: orderedPageIds.indexOf(activePageId),
+      updatedAt: now ?? DateTime.now().toUtc(),
+      revision: document.revision + 1,
+    );
+  }
+}
+
 final class SelectPageCommand implements DocumentCommand {
   const SelectPageCommand(this.pageId, {this.now});
 
@@ -527,6 +647,20 @@ final class SelectPageCommand implements DocumentCommand {
       revision: document.revision + 1,
     );
   }
+}
+
+String _nearestSurvivingPageId(
+  List<BoardPage> pages, {
+  required Set<String> removedPageIds,
+  required int originIndex,
+}) {
+  for (var index = originIndex + 1; index < pages.length; index++) {
+    if (!removedPageIds.contains(pages[index].id)) return pages[index].id;
+  }
+  for (var index = originIndex - 1; index >= 0; index--) {
+    if (!removedPageIds.contains(pages[index].id)) return pages[index].id;
+  }
+  throw StateError('Es ist keine verbleibende Seite vorhanden.');
 }
 
 BoardPage _page(WhiteboardDocument document, String pageId) {

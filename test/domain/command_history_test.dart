@@ -382,6 +382,110 @@ void main() {
       );
     });
 
+    test('reorder undo and redo preserve active page and foreign content', () {
+      final initial = WhiteboardDocument(
+        id: 'page-order',
+        title: 'Reihenfolge',
+        createdAt: now,
+        updatedAt: now,
+        pages: <BoardPage>[
+          BoardPage.empty(id: 'p1'),
+          BoardPage.empty(id: 'p2'),
+          BoardPage.empty(id: 'p3'),
+        ],
+        currentPageIndex: 1,
+      );
+      final history = CommandHistory(initial);
+      history.execute(
+        ReorderPagesCommand(const <String>['p3', 'p2', 'p1'], now: now),
+        ownerId: 'organizer',
+      );
+      history.execute(
+        AddStrokeCommand('p2', stroke('foreign', 5), now: now),
+        ownerId: 'other-participant',
+      );
+
+      history.undo(ownerId: 'organizer');
+      expect(history.document.pages.map((page) => page.id), <String>[
+        'p1',
+        'p2',
+        'p3',
+      ]);
+      expect(history.document.currentPage.id, 'p2');
+      expect(history.document.pageById('p2')!.strokes.single.id, 'foreign');
+
+      history.redo(ownerId: 'organizer');
+      expect(history.document.pages.map((page) => page.id), <String>[
+        'p3',
+        'p2',
+        'p1',
+      ]);
+      expect(history.document.currentPage.id, 'p2');
+      expect(history.document.pageById('p2')!.strokes.single.id, 'foreign');
+    });
+
+    test('reorder undo does not overwrite a later participant reorder', () {
+      final initial = WhiteboardDocument(
+        id: 'foreign-page-order',
+        title: 'Reihenfolge',
+        createdAt: now,
+        updatedAt: now,
+        pages: <BoardPage>[
+          BoardPage.empty(id: 'p1'),
+          BoardPage.empty(id: 'p2'),
+          BoardPage.empty(id: 'p3'),
+        ],
+      );
+      final history = CommandHistory(initial);
+      history.execute(
+        ReorderPagesCommand(const <String>['p2', 'p1', 'p3'], now: now),
+        ownerId: 'first',
+      );
+      history.execute(
+        ReorderPagesCommand(const <String>['p3', 'p2', 'p1'], now: now),
+        ownerId: 'second',
+      );
+
+      history.undo(ownerId: 'first');
+      expect(history.document.pages.map((page) => page.id), <String>[
+        'p3',
+        'p2',
+        'p1',
+      ]);
+    });
+
+    test('multi-page delete is atomic and chooses the nearest survivor', () {
+      final initial = WhiteboardDocument(
+        id: 'multi-delete',
+        title: 'Mehrfachlöschung',
+        createdAt: now,
+        updatedAt: now,
+        pages: <BoardPage>[
+          BoardPage.empty(id: 'p1'),
+          BoardPage.empty(id: 'p2'),
+          BoardPage.empty(id: 'p3'),
+          BoardPage.empty(id: 'p4'),
+        ],
+        currentPageIndex: 1,
+      );
+      final history = CommandHistory(initial);
+      history.execute(RemovePagesCommand(const <String>{'p2', 'p3'}, now: now));
+
+      expect(history.document.pages.map((page) => page.id), <String>[
+        'p1',
+        'p4',
+      ]);
+      expect(history.document.currentPage.id, 'p4');
+      expect(history.undoDepth, 1);
+      history.undo();
+      expect(history.document.pages.map((page) => page.id), <String>[
+        'p1',
+        'p2',
+        'p3',
+        'p4',
+      ]);
+    });
+
     test('groups mixed content and transforms it as one selection', () {
       var document = WhiteboardDocument.create(id: 'doc', now: now);
       final pageId = document.currentPage.id;

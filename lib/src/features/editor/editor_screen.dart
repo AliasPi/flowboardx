@@ -39,6 +39,7 @@ import 'board_participant_controller.dart';
 import 'editor_controller.dart';
 import 'editor_help_dialog.dart';
 import 'editor_pen_quick_controls.dart';
+import 'page_organizer_dialog.dart';
 import 'participant_mode_toggle.dart';
 import 'pdf_import_dialog.dart';
 import 'pdf_import_coordinator.dart';
@@ -1774,7 +1775,7 @@ class _EditorScreenState extends State<EditorScreen>
     final itemExtent = math.min(290.0, math.max(230.0, screen.width * .24));
     _pageSheetOpen = true;
     try {
-      await showModalBottomSheet<void>(
+      final action = await showModalBottomSheet<_PagePickerAction>(
         context: context,
         showDragHandle: true,
         isScrollControlled: true,
@@ -1796,8 +1797,17 @@ class _EditorScreenState extends State<EditorScreen>
             Navigator.pop(sheetContext);
             _editor.goToPage(index);
           },
+          onOrganizePages: () =>
+              Navigator.pop(sheetContext, _PagePickerAction.organize),
         ),
       );
+      if (action == _PagePickerAction.organize && mounted) {
+        await PageOrganizerDialog.show(
+          context,
+          controller: _editor,
+          thumbnails: Map<String, ui.Image>.of(_thumbnails),
+        );
+      }
     } finally {
       _pageSheetOpen = false;
       if (mounted && _thumbnailRefreshQueued) _startThumbnailRefresh();
@@ -3269,6 +3279,7 @@ class _PagePickerSheet extends StatefulWidget {
     required this.thumbnails,
     required this.onAddPage,
     required this.onPageSelected,
+    required this.onOrganizePages,
   });
 
   final double height;
@@ -3279,6 +3290,7 @@ class _PagePickerSheet extends StatefulWidget {
   final Map<String, ui.Image> thumbnails;
   final VoidCallback onAddPage;
   final ValueChanged<int> onPageSelected;
+  final VoidCallback onOrganizePages;
 
   @override
   State<_PagePickerSheet> createState() => _PagePickerSheetState();
@@ -3304,33 +3316,60 @@ class _PagePickerSheetState extends State<_PagePickerSheet> {
     child: SizedBox(
       width: double.infinity,
       height: widget.height,
-      child: HorizontalPageTray(
-        controller: _controller,
-        itemCount: widget.pages.length + 1,
-        itemBuilder: (context, index) {
-          if (index == widget.pages.length) {
-            return SizedBox(
-              width: math.max(190, widget.itemExtent * .72),
-              child: FilledButton.tonalIcon(
-                onPressed: widget.onAddPage,
-                icon: const Icon(Icons.add_rounded),
-                label: const Text('Neue Seite'),
-              ),
-            );
-          }
-          final page = widget.pages[index];
-          return _PageCard(
-            width: widget.itemExtent,
-            pageNumber: index + 1,
-            selected: index == widget.currentPageIndex,
-            thumbnail: widget.thumbnails[page.id],
-            onTap: () => widget.onPageSelected(index),
-          );
-        },
+      child: Column(
+        children: <Widget>[
+          Padding(
+            padding: const EdgeInsets.fromLTRB(24, 0, 18, 0),
+            child: Row(
+              children: <Widget>[
+                Expanded(
+                  child: Text(
+                    'Seiten',
+                    style: Theme.of(context).textTheme.titleLarge,
+                  ),
+                ),
+                FilledButton.tonalIcon(
+                  key: const ValueKey('open-page-organizer'),
+                  onPressed: widget.onOrganizePages,
+                  icon: const Icon(Icons.dashboard_customize_outlined),
+                  label: const Text('Organisieren'),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: HorizontalPageTray(
+              controller: _controller,
+              itemCount: widget.pages.length + 1,
+              itemBuilder: (context, index) {
+                if (index == widget.pages.length) {
+                  return SizedBox(
+                    width: math.max(190, widget.itemExtent * .72),
+                    child: FilledButton.tonalIcon(
+                      onPressed: widget.onAddPage,
+                      icon: const Icon(Icons.add_rounded),
+                      label: const Text('Neue Seite'),
+                    ),
+                  );
+                }
+                final page = widget.pages[index];
+                return _PageCard(
+                  width: widget.itemExtent,
+                  pageNumber: index + 1,
+                  selected: index == widget.currentPageIndex,
+                  thumbnail: widget.thumbnails[page.id],
+                  onTap: () => widget.onPageSelected(index),
+                );
+              },
+            ),
+          ),
+        ],
       ),
     ),
   );
 }
+
+enum _PagePickerAction { organize }
 
 /// Horizontal card tray used by the page picker.
 ///

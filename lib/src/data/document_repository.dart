@@ -21,6 +21,57 @@ abstract interface class DocumentOrganizationRepository {
   Future<void> saveOrganization(LibraryOrganization organization);
 }
 
+/// Optional repository capability for recoverable document deletion.
+///
+/// Implementations must keep the complete document directory, including
+/// assets and recovery files, together while moving it into or out of trash.
+/// [DocumentRepository.delete] remains the low-level permanent-delete
+/// operation for repositories which do not expose this capability.
+abstract interface class DocumentTrashRepository {
+  Future<TrashedDocumentSummary> moveToTrash(
+    String documentId, {
+    String? originalFolderId,
+  });
+
+  Future<List<TrashedDocumentSummary>> listTrashed();
+
+  Future<RestoredTrashDocument> restoreFromTrash(String documentId);
+
+  Future<void> deletePermanentlyFromTrash(String documentId);
+}
+
+final class TrashedDocumentSummary {
+  const TrashedDocumentSummary({
+    required this.id,
+    required this.title,
+    required this.deletedAt,
+    required this.pageCount,
+    required this.revision,
+    required this.recoverable,
+    this.originalFolderId,
+  });
+
+  final String id;
+  final String title;
+  final DateTime deletedAt;
+  final int pageCount;
+  final int revision;
+  final bool recoverable;
+  final String? originalFolderId;
+}
+
+final class RestoredTrashDocument {
+  const RestoredTrashDocument({
+    required this.document,
+    this.recoveryAvailable = false,
+    this.originalFolderId,
+  });
+
+  final WhiteboardDocument document;
+  final bool recoveryAvailable;
+  final String? originalFolderId;
+}
+
 final class DocumentSummary {
   const DocumentSummary({
     required this.id,

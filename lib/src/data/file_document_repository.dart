@@ -37,16 +37,21 @@ final class FileDocumentSaveDiagnostics {
 }
 
 final class FileDocumentRepository
-    implements DocumentRepository, DocumentOrganizationRepository {
+    implements
+        DocumentRepository,
+        DocumentOrganizationRepository,
+        DocumentTrashRepository {
   FileDocumentRepository(
     this.root, {
     this.codec = const DocumentCodec(),
     this.useBackgroundIsolate = true,
-  });
+    DateTime Function()? clock,
+  }) : _clock = clock ?? DateTime.now;
 
   final Directory root;
   final DocumentCodec codec;
   final bool useBackgroundIsolate;
+  final DateTime Function() _clock;
   final Map<String, Future<void>> _locks = {};
   final LinkedHashMap<String, _EncoderSnapshot> _encoderSnapshots =
       LinkedHashMap<String, _EncoderSnapshot>();
@@ -58,6 +63,11 @@ final class FileDocumentRepository
 
   Directory documentDirectory(String documentId) =>
       Directory(_join(root.path, 'documents', _safeDirectoryName(documentId)));
+
+  Directory get trashDirectory => Directory(_join(root.path, 'trash'));
+
+  Directory trashDocumentDirectory(String documentId) =>
+      Directory(_join(trashDirectory.path, _safeDirectoryName(documentId)));
 
   File documentFileFor(String documentId) => File(
     _join(documentDirectory(documentId).path, 'document.flowboard.json'),
@@ -71,6 +81,17 @@ final class FileDocumentRepository
     _join(
       documentDirectory(documentId).path,
       'document.flowboard.journal.json',
+    ),
+  );
+
+  File trashMetadataFileFor(String documentId) => File(
+    _join(trashDocumentDirectory(documentId).path, _trashMetadataFileName),
+  );
+
+  File trashMetadataBackupFileFor(String documentId) => File(
+    _join(
+      trashDocumentDirectory(documentId).path,
+      _trashMetadataBackupFileName,
     ),
   );
 
@@ -149,12 +170,21 @@ final class FileDocumentRepository
       });
 
   @override
-  Future<Directory> assetDirectory(String documentId) async {
-    final directory = Directory(
-      _join(documentDirectory(documentId).path, 'assets'),
+  Future<Directory> assetDirectory(String documentId) =>
+      _withLock(documentId, () async {
+        await _throwIfTrashedUnlocked(documentId);
+        final directory = Directory(
+          _join(documentDirectory(documentId).path, 'assets'),
+        );
+        await directory.create(recursive: true);
+        return directory;
+      });
+
+  Future<void> _throwIfTrashedUnlocked(String documentId) async {
+    if (!await trashDocumentDirectory(documentId).exists()) return;
+    throw DocumentStorageException(
+      'Das Dokument $documentId befindet sich im Papierkorb und kann nicht überschrieben werden.',
     );
-    await directory.create(recursive: true);
-    return directory;
   }
 
   @override
@@ -180,70 +210,47 @@ final class FileDocumentRepository
   });
 
   @override
-  Future<WhiteboardDocument?> recover(String documentId) => _withLock(
-    documentId,
-    () async {
-      final directory = documentDirectory(documentId);
-      if (!await directory.exists()) return null;
-      final candidates = <_RecoveryCandidate>[];
-      final errors = <Object>[];
+  Future<WhiteboardDocument?> recover(String documentId) =>
+      _withLock(documentId, () => _recoverUnlocked(documentId));
 
-      await _tryCandidate(
-        candidates,
-        errors,
-        _RecoverySource.primary,
-        documentFileFor(documentId),
-        documentId,
+  Future<WhiteboardDocument?> _recoverUnlocked(String documentId) async {
+    final directory = documentDirectory(documentId);
+    if (!await directory.exists()) return null;
+    final inspection = await _inspectRecoveryDirectory(directory, documentId);
+    if (inspection.candidates.isEmpty) {
+      if (inspection.errors.isEmpty) return null;
+      throw DocumentStorageException(
+        'Keine intakte Version von $documentId gefunden.',
+        cause: inspection.errors.first,
       );
-      await _tryJournalCandidate(
-        candidates,
-        errors,
-        journalFileFor(documentId),
-        documentId,
-      );
-      await _tryCandidate(
-        candidates,
-        errors,
-        _RecoverySource.backup,
-        backupFileFor(documentId),
-        documentId,
-      );
-
-      if (candidates.isEmpty) {
-        if (errors.isEmpty) return null;
-        throw DocumentStorageException(
-          'Keine intakte Version von $documentId gefunden.',
-          cause: errors.first,
+    }
+    final candidates = inspection.candidates..sort(_compareRecoveryCandidates);
+    final selected = candidates.first;
+    final journal = journalFileFor(documentId);
+    if (selected.source == _RecoverySource.primary) {
+      final primarySnapshot = selected.primarySnapshot;
+      bool summarySafe;
+      if (primarySnapshot != null) {
+        summarySafe = await _refreshSummaryCache(
+          selected.document,
+          primarySnapshot.fingerprint,
+          primarySnapshot.stat,
         );
+      } else {
+        // A cache can always be regenerated. Do not leave a possibly stale
+        // entry trusted after recovery removes the journal marker.
+        summarySafe = await _deleteSummaryCache(documentId);
       }
-      candidates.sort(_compareRecoveryCandidates);
-      final selected = candidates.first;
-      final journal = journalFileFor(documentId);
-      if (selected.source == _RecoverySource.primary) {
-        final primarySnapshot = selected.primarySnapshot;
-        bool summarySafe;
-        if (primarySnapshot != null) {
-          summarySafe = await _refreshSummaryCache(
-            selected.document,
-            primarySnapshot.fingerprint,
-            primarySnapshot.stat,
-          );
-        } else {
-          // A cache can always be regenerated. Do not leave a possibly stale
-          // entry trusted after recovery removes the journal marker.
-          summarySafe = await _deleteSummaryCache(documentId);
-        }
-        if (summarySafe && await journal.exists()) await journal.delete();
-        return selected.document;
-      }
+      if (summarySafe && await journal.exists()) await journal.delete();
+      return selected.document;
+    }
 
-      final recovered = selected.document.copyWith(
-        metadata: selected.document.metadata.copyWith(recoveredFromCrash: true),
-      );
-      await _saveUnlocked(recovered);
-      return recovered;
-    },
-  );
+    final recovered = selected.document.copyWith(
+      metadata: selected.document.metadata.copyWith(recoveredFromCrash: true),
+    );
+    await _saveUnlocked(recovered);
+    return recovered;
+  }
 
   Future<DocumentSummary?> _listDocumentUnlocked(String documentId) async {
     final primary = documentFileFor(documentId);
@@ -327,15 +334,184 @@ final class FileDocumentRepository
   }
 
   @override
+  Future<TrashedDocumentSummary> moveToTrash(
+    String documentId, {
+    String? originalFolderId,
+  }) => _withLock(documentId, () async {
+    final source = documentDirectory(documentId);
+    if (!await source.exists()) {
+      throw DocumentStorageException(
+        'Das Dokument $documentId wurde nicht gefunden.',
+      );
+    }
+    final destination = trashDocumentDirectory(documentId);
+    if (await destination.exists()) {
+      throw DocumentStorageException(
+        'Im Papierkorb existiert bereits ein Dokument mit dieser ID.',
+      );
+    }
+
+    // Inspect without promoting or consuming journal/backup files: moving to
+    // trash must preserve the complete recovery state byte-for-byte.
+    final inspection = await _inspectRecoveryDirectory(source, documentId);
+    if (inspection.candidates.isEmpty) {
+      throw DocumentStorageException(
+        'Das Dokument $documentId konnte nicht für den Papierkorb gelesen werden.',
+        cause: inspection.errors.isEmpty ? null : inspection.errors.first,
+      );
+    }
+    final candidates = inspection.candidates..sort(_compareRecoveryCandidates);
+    final document = candidates.first.document;
+    final deletedAt = _clock().toUtc();
+    final metadata = _TrashMetadata(
+      documentId: document.id,
+      title: document.title,
+      deletedAt: deletedAt,
+      pageCount: document.pages.length,
+      revision: document.revision,
+      originalFolderId: _normalizedOptionalId(originalFolderId),
+    );
+    final metadataFile = File(_join(source.path, _trashMetadataFileName));
+    final metadataBackup = File(
+      _join(source.path, _trashMetadataBackupFileName),
+    );
+    try {
+      await _replaceAtomically(
+        metadataFile,
+        jsonEncode(metadata.toJson()),
+        backup: metadataBackup,
+      );
+      await trashDirectory.create(recursive: true);
+      await source.rename(destination.path);
+    } catch (error) {
+      // A failed destination creation/rename leaves the live document
+      // untouched. Remove only metadata written by this attempt; document and
+      // asset files remain.
+      await _deleteBestEffort(metadataFile);
+      await _deleteBestEffort(metadataBackup);
+      throw DocumentStorageException(
+        'Das Dokument konnte nicht in den Papierkorb verschoben werden.',
+        cause: error,
+      );
+    }
+    await _invalidateEncoder(documentId);
+    return metadata.toSummary(recoverable: true);
+  });
+
+  @override
+  Future<List<TrashedDocumentSummary>> listTrashed() async {
+    final rootDirectory = trashDirectory;
+    if (!await rootDirectory.exists()) return const <TrashedDocumentSummary>[];
+    final summaries = <TrashedDocumentSummary>[];
+    await for (final entity in rootDirectory.list(followLinks: false)) {
+      if (entity is! Directory) continue;
+      final documentId = _documentIdFromDirectory(entity);
+      if (documentId == null) continue;
+      final summary = await _withLock(
+        documentId,
+        () => _listTrashedDocumentUnlocked(entity, documentId),
+      );
+      summaries.add(summary);
+    }
+    summaries.sort((first, second) {
+      final deleted = second.deletedAt.compareTo(first.deletedAt);
+      return deleted != 0 ? deleted : first.id.compareTo(second.id);
+    });
+    return List<TrashedDocumentSummary>.unmodifiable(summaries);
+  }
+
+  @override
+  Future<RestoredTrashDocument> restoreFromTrash(
+    String documentId,
+  ) => _withLock(documentId, () async {
+    final source = trashDocumentDirectory(documentId);
+    if (!await source.exists()) {
+      throw DocumentStorageException(
+        'Das Dokument wurde im Papierkorb nicht gefunden.',
+      );
+    }
+    final destination = documentDirectory(documentId);
+    if (await destination.exists()) {
+      throw DocumentStorageException(
+        'Ein aktives Dokument mit derselben ID verhindert die Wiederherstellung.',
+      );
+    }
+    final metadata = await _readTrashMetadata(source, documentId);
+    final inspection = await _inspectRecoveryDirectory(source, documentId);
+    if (inspection.candidates.isEmpty) {
+      throw DocumentStorageException(
+        'Im Papierkorb wurde keine intakte Dokumentversion gefunden.',
+        cause: inspection.errors.isEmpty ? null : inspection.errors.first,
+      );
+    }
+    final candidates = inspection.candidates..sort(_compareRecoveryCandidates);
+    final selected = candidates.first;
+    final hadJournal = await File(
+      _join(source.path, 'document.flowboard.journal.json'),
+    ).exists();
+    await destination.parent.create(recursive: true);
+    try {
+      await source.rename(destination.path);
+      await _deleteBestEffort(
+        File(_join(destination.path, _trashMetadataFileName)),
+      );
+      await _deleteBestEffort(
+        File(_join(destination.path, _trashMetadataBackupFileName)),
+      );
+      return RestoredTrashDocument(
+        document: selected.document,
+        recoveryAvailable:
+            hadJournal || selected.source != _RecoverySource.primary,
+        originalFolderId: metadata?.originalFolderId,
+      );
+    } catch (error) {
+      // Roll the complete directory back when validation/promotion after the
+      // rename fails. Never leave half a document in both locations.
+      if (await destination.exists() && !await source.exists()) {
+        try {
+          await source.parent.create(recursive: true);
+          await destination.rename(source.path);
+        } on FileSystemException {
+          // The original error contains the useful recovery context. A later
+          // list still exposes whichever complete directory survived.
+        }
+      }
+      if (error is DocumentStorageException) rethrow;
+      throw DocumentStorageException(
+        'Das Dokument konnte nicht wiederhergestellt werden.',
+        cause: error,
+      );
+    }
+  });
+
+  @override
+  Future<void> deletePermanentlyFromTrash(String documentId) =>
+      _withLock(documentId, () async {
+        final directory = trashDocumentDirectory(documentId);
+        if (!await directory.exists()) {
+          throw const DocumentStorageException(
+            'Das Dokument wurde im Papierkorb nicht gefunden.',
+          );
+        }
+        await directory.delete(recursive: true);
+        await _invalidateEncoder(documentId);
+      });
+
+  @override
   Future<void> delete(String documentId) => _withLock(documentId, () async {
     final directory = documentDirectory(documentId);
     if (await directory.exists()) await directory.delete(recursive: true);
+    await _invalidateEncoder(documentId);
+  });
+
+  Future<void> _invalidateEncoder(String documentId) async {
     final cacheKey = '${root.absolute.path}\u0000$documentId';
     _encoderSnapshots.remove(cacheKey);
     await _sharedDocumentEncoder.invalidate(cacheKey);
-  });
+  }
 
   Future<void> _saveUnlocked(WhiteboardDocument document) async {
+    await _throwIfTrashedUnlocked(document.id);
     final totalWatch = Stopwatch()..start();
     final directory = documentDirectory(document.id);
     await directory.create(recursive: true);
@@ -438,6 +614,87 @@ final class FileDocumentRepository
     } catch (error) {
       errors.add(error);
     }
+  }
+
+  Future<_RecoveryInspection> _inspectRecoveryDirectory(
+    Directory directory,
+    String documentId,
+  ) async {
+    final candidates = <_RecoveryCandidate>[];
+    final errors = <Object>[];
+    await _tryCandidate(
+      candidates,
+      errors,
+      _RecoverySource.primary,
+      File(_join(directory.path, 'document.flowboard.json')),
+      documentId,
+    );
+    await _tryJournalCandidate(
+      candidates,
+      errors,
+      File(_join(directory.path, 'document.flowboard.journal.json')),
+      documentId,
+    );
+    await _tryCandidate(
+      candidates,
+      errors,
+      _RecoverySource.backup,
+      File(_join(directory.path, 'document.flowboard.backup.json')),
+      documentId,
+    );
+    return _RecoveryInspection(candidates: candidates, errors: errors);
+  }
+
+  Future<_TrashMetadata?> _readTrashMetadata(
+    Directory directory,
+    String documentId,
+  ) async {
+    for (final name in <String>[
+      _trashMetadataFileName,
+      _trashMetadataBackupFileName,
+    ]) {
+      final file = File(_join(directory.path, name));
+      if (!await file.exists()) continue;
+      try {
+        final decoded = jsonDecode(await file.readAsString());
+        if (decoded is! Map) continue;
+        final metadata = _TrashMetadata.fromJson(
+          Map<String, Object?>.from(decoded),
+        );
+        if (metadata.documentId == documentId) return metadata;
+      } catch (_) {
+        // A damaged sidecar must not hide the complete trash directory. The
+        // document payload (or a final corrupt-entry fallback) is used below.
+      }
+    }
+    return null;
+  }
+
+  Future<TrashedDocumentSummary> _listTrashedDocumentUnlocked(
+    Directory directory,
+    String documentId,
+  ) async {
+    final metadata = await _readTrashMetadata(directory, documentId);
+    final inspection = await _inspectRecoveryDirectory(directory, documentId);
+    inspection.candidates.sort(_compareRecoveryCandidates);
+    final document = inspection.candidates.isEmpty
+        ? null
+        : inspection.candidates.first.document;
+    DateTime fallbackDeletedAt;
+    try {
+      fallbackDeletedAt = (await directory.stat()).modified.toUtc();
+    } catch (_) {
+      fallbackDeletedAt = _clock().toUtc();
+    }
+    return TrashedDocumentSummary(
+      id: documentId,
+      title: metadata?.title ?? document?.title ?? 'Beschädigtes Dokument',
+      deletedAt: metadata?.deletedAt ?? fallbackDeletedAt,
+      pageCount: metadata?.pageCount ?? document?.pages.length ?? 0,
+      revision: metadata?.revision ?? document?.revision ?? 0,
+      recoverable: document != null,
+      originalFolderId: metadata?.originalFolderId,
+    );
   }
 
   Future<_EncodedDocument> _encodeForSave(WhiteboardDocument document) async {
@@ -939,6 +1196,99 @@ final class _RecoveryCandidate {
   final _RecoverySource source;
   final WhiteboardDocument document;
   final _PrimarySnapshot? primarySnapshot;
+}
+
+final class _RecoveryInspection {
+  const _RecoveryInspection({required this.candidates, required this.errors});
+
+  final List<_RecoveryCandidate> candidates;
+  final List<Object> errors;
+}
+
+final class _TrashMetadata {
+  const _TrashMetadata({
+    required this.documentId,
+    required this.title,
+    required this.deletedAt,
+    required this.pageCount,
+    required this.revision,
+    this.originalFolderId,
+  });
+
+  final String documentId;
+  final String title;
+  final DateTime deletedAt;
+  final int pageCount;
+  final int revision;
+  final String? originalFolderId;
+
+  Map<String, Object?> toJson() => <String, Object?>{
+    'trashVersion': _trashMetadataVersion,
+    'documentId': documentId,
+    'title': title,
+    'deletedAt': deletedAt.toUtc().toIso8601String(),
+    'pageCount': pageCount,
+    'revision': revision,
+    if (originalFolderId != null) 'originalFolderId': originalFolderId,
+  };
+
+  factory _TrashMetadata.fromJson(Map<String, Object?> json) {
+    final version = json['trashVersion'];
+    final documentId = json['documentId'];
+    final title = json['title'];
+    final deletedAtSource = json['deletedAt'];
+    final pageCountSource = json['pageCount'];
+    final revisionSource = json['revision'];
+    final originalFolderIdSource = json['originalFolderId'];
+    if (version != _trashMetadataVersion ||
+        documentId is! String ||
+        documentId.trim().isEmpty ||
+        title is! String ||
+        title.trim().isEmpty ||
+        deletedAtSource is! String ||
+        pageCountSource is! num ||
+        revisionSource is! num ||
+        (originalFolderIdSource != null && originalFolderIdSource is! String)) {
+      throw const FormatException('Papierkorb-Metadaten sind ungültig.');
+    }
+    final deletedAt = DateTime.tryParse(deletedAtSource);
+    final pageCount = pageCountSource.toInt();
+    final revision = revisionSource.toInt();
+    if (deletedAt == null ||
+        pageCountSource != pageCount ||
+        pageCount < 1 ||
+        pageCount > WhiteboardDocument.maxPageCount ||
+        revisionSource != revision ||
+        revision < 0) {
+      throw const FormatException('Papierkorb-Metadaten sind inkonsistent.');
+    }
+    return _TrashMetadata(
+      documentId: documentId,
+      title: title,
+      deletedAt: deletedAt.toUtc(),
+      pageCount: pageCount,
+      revision: revision,
+      originalFolderId: _normalizedOptionalId(
+        originalFolderIdSource as String?,
+      ),
+    );
+  }
+
+  TrashedDocumentSummary toSummary({required bool recoverable}) =>
+      TrashedDocumentSummary(
+        id: documentId,
+        title: title,
+        deletedAt: deletedAt,
+        pageCount: pageCount,
+        revision: revision,
+        recoverable: recoverable,
+        originalFolderId: originalFolderId,
+      );
+}
+
+String? _normalizedOptionalId(String? value) {
+  final normalized = value?.trim();
+  return normalized == null || normalized.isEmpty ? null : normalized;
 }
 
 int _compareRecoveryCandidates(
@@ -1484,6 +1834,10 @@ final class _PrimarySnapshot {
 }
 
 const int _documentSummaryCacheVersion = 1;
+const int _trashMetadataVersion = 1;
+const String _trashMetadataFileName = 'document.flowboard.trash.json';
+const String _trashMetadataBackupFileName =
+    'document.flowboard.trash.backup.json';
 const int _maximumJournalHeaderBytes = 4096;
 const int _documentEncodingBufferBytes = 64 * 1024;
 const int _maximumRootEncoderSnapshots = 8;

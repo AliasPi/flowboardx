@@ -28,6 +28,7 @@ void main() {
 
   Widget app({
     required DocumentLibraryOpenCallback onOpen,
+    DocumentRepository? documentRepository,
     DocumentIdFactory? idFactory,
     FolderIdFactory? folderIdFactory,
     DocumentLibraryClock? clock,
@@ -35,7 +36,7 @@ void main() {
   }) {
     return MaterialApp(
       home: DocumentLibraryScreen(
-        repository: repository,
+        repository: documentRepository ?? repository,
         onOpen: onOpen,
         documentIdFactory: idFactory,
         folderIdFactory: folderIdFactory,
@@ -201,6 +202,104 @@ void main() {
       findsNothing,
     );
   });
+
+  testWidgets('hides trash wording for repositories without that capability', (
+    tester,
+  ) async {
+    final legacy = _LegacyWidgetRepository(assets);
+    final document = WhiteboardDocument.create(
+      id: 'legacy-delete',
+      title: 'Legacy',
+    );
+    legacy.documents[document.id] = document;
+    await tester.pumpWidget(app(onOpen: (_, _) {}, documentRepository: legacy));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.byKey(const ValueKey<String>('library-trash-button')),
+      findsNothing,
+    );
+    await tester.tap(
+      find.byKey(const ValueKey<String>('document-menu-legacy-delete')),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(
+      find.byKey(const ValueKey<String>('delete-legacy-delete')),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('dauerhaft gelöscht'), findsOneWidget);
+    expect(find.text('In Papierkorb'), findsNothing);
+  });
+
+  testWidgets(
+    'trash restores and permanently deletes only after confirmation',
+    (tester) async {
+      final document = WhiteboardDocument.create(
+        id: 'trash-actions',
+        title: 'Papierkorb-Test',
+      );
+      repository.documents[document.id] = document;
+      await tester.pumpWidget(app(onOpen: (_, _) {}));
+      await tester.pumpAndSettle();
+
+      Future<void> moveDocumentToTrash() async {
+        await tester.tap(
+          find.byKey(const ValueKey<String>('document-menu-trash-actions')),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(
+          find.byKey(const ValueKey<String>('delete-trash-actions')),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(
+          find.byKey(const ValueKey<String>('confirm-delete-button')),
+        );
+        await tester.pumpAndSettle();
+      }
+
+      await moveDocumentToTrash();
+      await tester.tap(
+        find.byKey(const ValueKey<String>('library-trash-button')),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('Papierkorb'), findsOneWidget);
+      expect(
+        find.byKey(const ValueKey<String>('trash-item-trash-actions')),
+        findsOneWidget,
+      );
+      await tester.tap(
+        find.byKey(const ValueKey<String>('trash-restore-trash-actions')),
+      );
+      await tester.pumpAndSettle();
+      expect(repository.documents.containsKey(document.id), isTrue);
+      expect(repository.trash, isEmpty);
+
+      await tester.tap(find.text('Schließen'));
+      await tester.pump(const Duration(seconds: 5));
+      await tester.pumpAndSettle();
+      await moveDocumentToTrash();
+      await tester.tap(
+        find.byKey(const ValueKey<String>('library-trash-button')),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find.byKey(const ValueKey<String>('trash-delete-trash-actions')),
+      );
+      await tester.pumpAndSettle();
+      expect(repository.permanentlyDeletedTrashIds, isEmpty);
+      await tester.tap(
+        find.byKey(const ValueKey<String>('confirm-trash-delete-button')),
+      );
+      await tester.pumpAndSettle();
+
+      expect(repository.permanentlyDeletedTrashIds, <String>[document.id]);
+      expect(repository.documents, isEmpty);
+      expect(repository.trash, isEmpty);
+      expect(find.text('Der Papierkorb ist leer.'), findsOneWidget);
+    },
+  );
 
   testWidgets('shows list and open errors without throwing', (tester) async {
     repository.listError = const DocumentStorageException(
@@ -758,7 +857,10 @@ WhiteboardDocument _contentDocument(String id, String title) {
 }
 
 class _WidgetRepository
-    implements DocumentRepository, DocumentOrganizationRepository {
+    implements
+        DocumentRepository,
+        DocumentOrganizationRepository,
+        DocumentTrashRepository {
   _WidgetRepository(this.assets);
 
   final Directory assets;
@@ -770,6 +872,11 @@ class _WidgetRepository
   final List<WhiteboardDocument> saved = <WhiteboardDocument>[];
   final List<String> deletedIds = <String>[];
   final List<String> recoverCalls = <String>[];
+  final Map<String, WhiteboardDocument> trashedDocuments =
+      <String, WhiteboardDocument>{};
+  final Map<String, TrashedDocumentSummary> trash =
+      <String, TrashedDocumentSummary>{};
+  final List<String> permanentlyDeletedTrashIds = <String>[];
   Future<void>? listGate;
   Object? listError;
   Object? loadError;
@@ -782,6 +889,58 @@ class _WidgetRepository
   Future<void> delete(String documentId) async {
     deletedIds.add(documentId);
     documents.remove(documentId);
+  }
+
+  @override
+  Future<TrashedDocumentSummary> moveToTrash(
+    String documentId, {
+    String? originalFolderId,
+  }) async {
+    final document = documents.remove(documentId);
+    if (document == null) {
+      throw const DocumentStorageException('Dokument fehlt.');
+    }
+    deletedIds.add(documentId);
+    trashedDocuments[documentId] = document;
+    final summary = TrashedDocumentSummary(
+      id: document.id,
+      title: document.title,
+      deletedAt: DateTime.utc(2026, 8, 1),
+      pageCount: document.pages.length,
+      revision: document.revision,
+      recoverable: true,
+      originalFolderId: originalFolderId,
+    );
+    trash[documentId] = summary;
+    return summary;
+  }
+
+  @override
+  Future<List<TrashedDocumentSummary>> listTrashed() async =>
+      trash.values.toList(growable: false);
+
+  @override
+  Future<RestoredTrashDocument> restoreFromTrash(String documentId) async {
+    final document = trashedDocuments.remove(documentId);
+    final summary = trash.remove(documentId);
+    if (document == null || summary == null) {
+      throw const DocumentStorageException('Dokument fehlt im Papierkorb.');
+    }
+    documents[documentId] = document;
+    return RestoredTrashDocument(
+      document: document,
+      originalFolderId: summary.originalFolderId,
+    );
+  }
+
+  @override
+  Future<void> deletePermanentlyFromTrash(String documentId) async {
+    if (!trash.containsKey(documentId)) {
+      throw const DocumentStorageException('Dokument fehlt im Papierkorb.');
+    }
+    trash.remove(documentId);
+    trashedDocuments.remove(documentId);
+    permanentlyDeletedTrashIds.add(documentId);
   }
 
   @override
@@ -822,5 +981,39 @@ class _WidgetRepository
   @override
   Future<void> saveOrganization(LibraryOrganization organization) async {
     this.organization = organization;
+  }
+}
+
+class _LegacyWidgetRepository implements DocumentRepository {
+  _LegacyWidgetRepository(this.assets);
+
+  final Directory assets;
+  final Map<String, WhiteboardDocument> documents =
+      <String, WhiteboardDocument>{};
+
+  @override
+  Future<Directory> assetDirectory(String documentId) async => assets;
+
+  @override
+  Future<void> delete(String documentId) async {
+    documents.remove(documentId);
+  }
+
+  @override
+  Future<List<DocumentSummary>> list() async => documents.values
+      .map(DocumentSummary.fromDocument)
+      .toList(growable: false);
+
+  @override
+  Future<WhiteboardDocument?> load(String documentId) async =>
+      documents[documentId];
+
+  @override
+  Future<WhiteboardDocument?> recover(String documentId) async =>
+      documents[documentId];
+
+  @override
+  Future<void> save(WhiteboardDocument document) async {
+    documents[document.id] = document;
   }
 }

@@ -10,6 +10,7 @@ import 'package:flowboard_x/src/domain/model/ink.dart';
 import 'package:flowboard_x/src/features/editor/selected_pages_document_creator.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
+import 'package:uuid/uuid.dart';
 
 void main() {
   late Directory temporary;
@@ -266,6 +267,50 @@ void main() {
       expect(await repository.list(), isEmpty);
     },
   );
+
+  test('trash tombstone survives creator ID collision and rollback', () async {
+    const collidedId = 'trashed-destination-id';
+    final trashed = WhiteboardDocument.create(
+      id: collidedId,
+      title: 'Gelöschtes Original',
+      now: DateTime.utc(2026),
+    );
+    await repository.save(trashed);
+    await repository.moveToTrash(trashed.id);
+    final source = WhiteboardDocument.create(
+      id: 'source-document',
+      title: 'Quelle',
+      now: DateTime.utc(2026),
+    );
+    var uuidCalls = 0;
+    final creator = SelectedPagesDocumentCreator(
+      uuid: _SequenceUuid(() {
+        uuidCalls++;
+        return uuidCalls == 1 ? collidedId : 'fresh-$uuidCalls';
+      }),
+    );
+
+    await expectLater(
+      creator.create(
+        sourceDocument: source,
+        sourceAssetDirectory: sourceAssets,
+        selectedPageIds: <String>[source.currentPage.id],
+        title: 'Auswahl',
+        repository: repository,
+      ),
+      throwsA(isA<DocumentStorageException>()),
+    );
+
+    expect(await repository.documentDirectory(collidedId).exists(), isFalse);
+    expect(
+      await repository.trashDocumentDirectory(collidedId).exists(),
+      isTrue,
+    );
+    expect(
+      (await repository.listTrashed()).single.title,
+      'Gelöschtes Original',
+    );
+  });
 }
 
 const _transform = ObjectTransform(x: 10, y: 20, width: 300, height: 200);
@@ -337,4 +382,16 @@ final class _SaveFailingRepository implements DocumentRepository {
   @override
   Future<void> save(WhiteboardDocument document) =>
       throw const DocumentStorageException('Absichtlicher Speicherfehler');
+}
+
+final class _SequenceUuid implements Uuid {
+  _SequenceUuid(this.next);
+
+  final String Function() next;
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) {
+    if (invocation.memberName == #v4) return next();
+    return super.noSuchMethod(invocation);
+  }
 }
