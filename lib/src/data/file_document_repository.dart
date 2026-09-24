@@ -318,17 +318,37 @@ final class FileDocumentRepository
   Future<List<DocumentSummary>> list() async {
     final documentsRoot = Directory(_join(root.path, 'documents'));
     if (!await documentsRoot.exists()) return const [];
-    final summaries = <DocumentSummary>[];
+    final documentIds = <String>[];
     await for (final entity in documentsRoot.list(followLinks: false)) {
       if (entity is! Directory) continue;
       final documentId = _documentIdFromDirectory(entity);
       if (documentId == null) continue;
-      final summary = await _withLock(
-        documentId,
-        () => _listDocumentUnlocked(documentId),
-      );
-      if (summary != null) summaries.add(summary);
+      documentIds.add(documentId);
     }
+    // Most entries already have a tiny validated summary cache. Reading them
+    // serially made startup latency grow linearly with the document count.
+    // Bound parallelism so older uncached documents cannot exhaust memory by
+    // spawning an isolate for every full document at once.
+    final results = List<DocumentSummary?>.filled(documentIds.length, null);
+    var nextIndex = 0;
+    Future<void> worker() async {
+      while (nextIndex < documentIds.length) {
+        final index = nextIndex++;
+        final id = documentIds[index];
+        results[index] = await _withLock(id, () => _listDocumentUnlocked(id));
+      }
+    }
+
+    const maximumWorkers = 4;
+    await Future.wait(
+      List<Future<void>>.generate(
+        documentIds.length < maximumWorkers
+            ? documentIds.length
+            : maximumWorkers,
+        (_) => worker(),
+      ),
+    );
+    final summaries = results.whereType<DocumentSummary>().toList();
     summaries.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
     return List.unmodifiable(summaries);
   }

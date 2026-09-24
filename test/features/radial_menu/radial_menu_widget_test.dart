@@ -498,6 +498,62 @@ void main() {
     expect(positions.last, closeToOffset(after));
   });
 
+  testWidgets('a quick center flick glides to the first edge', (tester) async {
+    final controller = RadialMenuController();
+    addTearDown(controller.dispose);
+    final positions = <Offset>[];
+    await tester.pumpWidget(
+      host(
+        controller: controller,
+        callbacks: RadialMenuCallbacks(onPositionChanged: positions.add),
+      ),
+    );
+    final surface = find.byKey(const ValueKey<String>('radial-menu-surface'));
+    final before = tester.getCenter(surface);
+
+    await tester.flingFrom(before, const Offset(150, 60), 1800);
+    await tester.pumpAndSettle();
+
+    final after = tester.getCenter(surface);
+    final size = tester.getSize(find.byType(RadialMenu));
+    final margin =
+        RadialMenuGeometry(tester.getSize(surface)).centerRadius + 12;
+    expect(after.dx, closeTo(size.width - margin, 1));
+    expect(after.dy, greaterThan(before.dy + 60));
+    expect(after.dy, lessThan(size.height - margin));
+    expect(positions, hasLength(1));
+    expect(positions.single, closeToOffset(after));
+  });
+
+  testWidgets('a deliberate slow drag stops exactly where released', (
+    tester,
+  ) async {
+    final controller = RadialMenuController();
+    addTearDown(controller.dispose);
+    final positions = <Offset>[];
+    await tester.pumpWidget(
+      host(
+        controller: controller,
+        callbacks: RadialMenuCallbacks(onPositionChanged: positions.add),
+      ),
+    );
+    final surface = find.byKey(const ValueKey<String>('radial-menu-surface'));
+    final before = tester.getCenter(surface);
+    final gesture = await tester.startGesture(before);
+    for (var index = 0; index < 5; index++) {
+      await gesture.moveBy(const Offset(20, 0));
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+    await gesture.up();
+    await tester.pumpAndSettle();
+
+    final after = tester.getCenter(surface);
+    expect(after.dx, closeTo(before.dx + 100, 1));
+    expect(after.dy, closeTo(before.dy, 1));
+    expect(positions, hasLength(1));
+    expect(positions.single, closeToOffset(after));
+  });
+
   testWidgets('closed center reaches every viewport edge without being lost', (
     tester,
   ) async {

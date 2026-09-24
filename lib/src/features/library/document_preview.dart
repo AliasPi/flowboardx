@@ -53,6 +53,20 @@ class DocumentPagePreviewPainter extends CustomPainter {
   static const int maxPointsPerStroke = 140;
   static const double maxPreviewStrokeWidth = 512;
 
+  /// Keep the scene merge and paint work bounded for densely written boards.
+  /// Sampling across the complete stroke history preserves a recognizable
+  /// overview instead of showing only the oldest 320 strokes.
+  static List<InkStroke> samplePreviewStrokes(List<InkStroke> strokes) {
+    if (strokes.length <= maxPreviewStrokes) return strokes;
+    return List<InkStroke>.generate(
+      maxPreviewStrokes,
+      (index) =>
+          strokes[(index * (strokes.length - 1) / (maxPreviewStrokes - 1))
+              .round()],
+      growable: false,
+    );
+  }
+
   final BoardPage page;
   final Color backgroundColor;
 
@@ -91,7 +105,7 @@ class DocumentPagePreviewPainter extends CustomPainter {
     };
     final scene = orderedBoardSceneItems(
       objects: page.objects,
-      strokes: page.strokes,
+      strokes: samplePreviewStrokes(page.strokes),
     );
     var paintedFreeStrokes = 0;
     for (final item in scene) {

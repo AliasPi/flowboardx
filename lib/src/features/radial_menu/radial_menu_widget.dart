@@ -101,12 +101,17 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
   static const double _fiveFingerDetentHysteresis = .70;
   static const int _minimumPageGestureFingers = 4;
   static const int _maximumPageGestureFingers = 5;
+  static const double _minimumFlingSpeed = 850;
+  static const double _minimumFlingTravel = 55;
 
   late RadialMenuController _controller;
   late bool _ownsController;
   late final AnimationController _openAnimation;
   late final AnimationController _submenuAnimation;
   late final AnimationController _tailAnimation;
+  late final AnimationController _centerFlingAnimation;
+  Offset _flingFrom = Offset.zero;
+  Offset _flingTo = Offset.zero;
   late bool _lastOpen;
   late RadialMenuBranch? _lastBranch;
 
@@ -166,6 +171,23 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
       vsync: this,
       duration: const Duration(milliseconds: 620),
     );
+    _centerFlingAnimation =
+        AnimationController(
+            vsync: this,
+            duration: const Duration(milliseconds: 300),
+          )
+          ..addListener(() {
+            final progress = Curves.easeOutCubic.transform(
+              _centerFlingAnimation.value,
+            );
+            _moveCenterTo(Offset.lerp(_flingFrom, _flingTo, progress)!);
+          })
+          ..addStatusListener((status) {
+            if (status == AnimationStatus.completed &&
+                _centerPosition != null) {
+              widget.callbacks.onPositionChanged?.call(_centerPosition!);
+            }
+          });
     GestureBinding.instance.pointerRouter.addGlobalRoute(
       _handleGlobalPointerEvent,
     );
@@ -191,6 +213,7 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
     }
     if (oldWidget.positionResetToken != widget.positionResetToken &&
         !_availableSize.isEmpty) {
+      _centerFlingAnimation.stop();
       final centered = _clampCenter(
         Offset(_availableSize.width / 2, _availableSize.height / 2),
       );
@@ -244,6 +267,7 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
     _openAnimation.dispose();
     _submenuAnimation.dispose();
     _tailAnimation.dispose();
+    _centerFlingAnimation.dispose();
     super.dispose();
   }
 
@@ -518,6 +542,7 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
             widget.callbacks.onPageDeleteRequested?.call(pages[target.index]);
           },
           onPanDown: (details) {
+            _centerFlingAnimation.stop();
             _panStartTarget = painter.hitTargetAt(
               details.localPosition,
               Size.square(_diameter),
@@ -570,7 +595,10 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
                 break;
             }
           },
-          onPanEnd: (_) => _finishDrag(commitTapFallback: true),
+          onPanEnd: (details) => _finishDrag(
+            commitTapFallback: true,
+            endVelocity: details.velocity.pixelsPerSecond,
+          ),
           onPanCancel: () => _finishDrag(),
           child: Stack(
             fit: StackFit.expand,
@@ -603,7 +631,10 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
     );
   }
 
-  void _finishDrag({bool commitTapFallback = false}) {
+  void _finishDrag({
+    bool commitTapFallback = false,
+    Offset endVelocity = Offset.zero,
+  }) {
     // Tap and pan recognizers share the same pointer arena. A rejected pan can
     // receive onPanCancel immediately before onTapUp on some Android panels.
     // It must not clear the tap's pressed target, otherwise that first tap is
@@ -615,6 +646,7 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
       return;
     }
     final completedMode = _dragMode;
+    final completedTravel = _panTravel;
     final fallbackTarget =
         commitTapFallback &&
             _panStarted &&
@@ -635,11 +667,55 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
       // Persist the final position once. Calling this callback for every
       // pointer packet used to cancel and recreate the editor's debounce timer
       // at stylus frequency while the radial menu was being dragged.
-      widget.callbacks.onPositionChanged?.call(_centerPosition!);
+      if (!_startCenterFling(endVelocity, completedTravel)) {
+        widget.callbacks.onPositionChanged?.call(_centerPosition!);
+      }
     }
     if (fallbackTarget.isInteractive) {
       unawaited(_activateTarget(fallbackTarget));
     }
+  }
+
+  bool _startCenterFling(Offset velocity, double dragTravel) {
+    final current = _centerPosition;
+    if (current == null ||
+        dragTravel < _minimumFlingTravel ||
+        !velocity.dx.isFinite ||
+        !velocity.dy.isFinite ||
+        velocity.distance < _minimumFlingSpeed) {
+      return false;
+    }
+    final target = _edgeTargetFor(current, velocity);
+    final distance = (target - current).distance;
+    if (distance < 20) return false;
+    _flingFrom = current;
+    _flingTo = target;
+    _centerFlingAnimation.duration = Duration(
+      milliseconds: (distance / velocity.distance * 1400)
+          .clamp(200.0, 450.0)
+          .round(),
+    );
+    unawaited(_centerFlingAnimation.forward(from: 0));
+    return true;
+  }
+
+  Offset _edgeTargetFor(Offset current, Offset velocity) {
+    final min = _clampCenter(const Offset(-1000000, -1000000));
+    final max = _clampCenter(const Offset(1000000, 1000000));
+    var travelTime = double.infinity;
+    if (velocity.dx > 0 && max.dx - current.dx > 1) {
+      travelTime = math.min(travelTime, (max.dx - current.dx) / velocity.dx);
+    } else if (velocity.dx < 0 && current.dx - min.dx > 1) {
+      travelTime = math.min(travelTime, (min.dx - current.dx) / velocity.dx);
+    }
+    if (velocity.dy > 0 && max.dy - current.dy > 1) {
+      travelTime = math.min(travelTime, (max.dy - current.dy) / velocity.dy);
+    } else if (velocity.dy < 0 && current.dy - min.dy > 1) {
+      travelTime = math.min(travelTime, (min.dy - current.dy) / velocity.dy);
+    }
+    return travelTime.isFinite
+        ? _clampCenter(current + velocity * travelTime)
+        : current;
   }
 
   void _moveCenterTo(Offset requested) {

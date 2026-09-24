@@ -21,7 +21,7 @@ void main() {
   });
 
   test(
-    'reload sorts summaries and hydrates real preview pages with a cap',
+    'reload is ready without decoding documents and previews are bounded',
     () async {
       final older = WhiteboardDocument.create(
         id: 'older',
@@ -50,10 +50,119 @@ void main() {
         'newer',
         'older',
       ]);
+      expect(repository.loadCalls, isEmpty);
+      controller.requestPreview('newer');
+      controller.requestPreview('older');
+      await _waitForPreview(controller, 'older');
       expect(controller.entries.first.previewPage?.id, 'newer_page_1');
       expect(repository.maximumConcurrentLoads, 1);
     },
   );
+
+  test('large libraries decode only explicitly requested previews', () async {
+    for (var index = 0; index < 100; index++) {
+      final document = WhiteboardDocument.create(id: 'board-$index');
+      repository.documents[document.id] = document;
+    }
+    final controller = DocumentLibraryController(repository: repository);
+    addTearDown(controller.dispose);
+
+    await controller.reload();
+
+    expect(controller.status, DocumentLibraryStatus.ready);
+    expect(controller.entries, hasLength(100));
+    expect(repository.loadCalls, isEmpty);
+    controller.requestPreview('board-42');
+    await _waitForPreview(controller, 'board-42');
+    expect(repository.loadCalls, <String>['board-42']);
+  });
+
+  test(
+    'previews use a bounded cache instead of retaining every board',
+    () async {
+      for (var index = 0; index < 30; index++) {
+        final document = WhiteboardDocument.create(id: 'board-$index');
+        repository.documents[document.id] = document;
+      }
+      final controller = DocumentLibraryController(repository: repository);
+      addTearDown(controller.dispose);
+      await controller.reload();
+
+      for (var index = 0; index < 30; index++) {
+        final id = 'board-$index';
+        controller.requestPreview(id);
+        await _waitForPreview(controller, id);
+      }
+
+      expect(
+        controller.entries.where((entry) => entry.previewPage != null),
+        hasLength(24),
+      );
+      expect(
+        controller.entries
+            .singleWhere((entry) => entry.summary.id == 'board-0')
+            .previewPage,
+        isNull,
+      );
+      controller.requestPreview('board-0');
+      await _waitForPreview(controller, 'board-0');
+      expect(repository.loadCalls.where((id) => id == 'board-0'), hasLength(2));
+    },
+  );
+
+  test('mounted cards are not evicted on a large display', () async {
+    for (var index = 0; index < 30; index++) {
+      final document = WhiteboardDocument.create(id: 'board-$index');
+      repository.documents[document.id] = document;
+    }
+    final controller = DocumentLibraryController(repository: repository);
+    addTearDown(controller.dispose);
+    await controller.reload();
+
+    for (var index = 0; index < 30; index++) {
+      final id = 'board-$index';
+      controller.retainPreview(id);
+      controller.requestPreview(id);
+      await _waitForPreview(controller, id);
+    }
+
+    expect(
+      controller.entries.where((entry) => entry.previewPage != null),
+      hasLength(30),
+    );
+    for (var index = 0; index < 30; index++) {
+      controller.releasePreview('board-$index');
+    }
+    controller.requestPreview('board-0');
+    expect(repository.loadCalls.where((id) => id == 'board-0'), hasLength(1));
+  });
+
+  test('offscreen queued previews are skipped while scrolling', () async {
+    for (final id in <String>['visible', 'offscreen']) {
+      repository.documents[id] = WhiteboardDocument.create(id: id);
+    }
+    repository.loadDelay = const Duration(milliseconds: 20);
+    final controller = DocumentLibraryController(
+      repository: repository,
+      previewConcurrency: 1,
+    );
+    addTearDown(controller.dispose);
+    await controller.reload();
+
+    controller.retainPreview('visible');
+    controller.requestPreview('visible');
+    controller.retainPreview('offscreen');
+    controller.requestPreview('offscreen');
+    controller.releasePreview('offscreen');
+    await _waitForPreview(controller, 'visible');
+    await Future<void>.delayed(const Duration(milliseconds: 1));
+
+    expect(repository.loadCalls, <String>['visible']);
+    controller.retainPreview('offscreen');
+    controller.requestPreview('offscreen');
+    await _waitForPreview(controller, 'offscreen');
+    expect(repository.loadCalls, <String>['visible', 'offscreen']);
+  });
 
   test(
     'create saves a UUID document before returning its asset directory',
@@ -421,6 +530,20 @@ void main() {
 
     expect(controller.selectedDocumentIds, <String>{dragged.id});
   });
+}
+
+Future<void> _waitForPreview(
+  DocumentLibraryController controller,
+  String documentId,
+) async {
+  for (var attempt = 0; attempt < 100; attempt++) {
+    final entry = controller.entries.where(
+      (entry) => entry.summary.id == documentId,
+    );
+    if (entry.isNotEmpty && entry.single.previewPage != null) return;
+    await Future<void>.delayed(const Duration(milliseconds: 2));
+  }
+  fail('Vorschau für $documentId wurde nicht geladen.');
 }
 
 class _FakeDocumentRepository

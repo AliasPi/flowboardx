@@ -661,6 +661,7 @@ class _DocumentLibraryScreenState extends State<DocumentLibraryScreen> {
               return _DocumentCard(
                 key: ValueKey<String>('document-card-$id'),
                 entry: entry,
+                previewController: _controller,
                 busy: _controller.isBusy(id),
                 selected: _controller.selectedDocumentIds.contains(id),
                 selectionMode: _controller.hasSelection,
@@ -2133,6 +2134,7 @@ class _DocumentDragPayload {
 class _DocumentCard extends StatelessWidget {
   const _DocumentCard({
     required this.entry,
+    required this.previewController,
     required this.busy,
     required this.selected,
     required this.selectionMode,
@@ -2149,6 +2151,7 @@ class _DocumentCard extends StatelessWidget {
   });
 
   final DocumentLibraryEntry entry;
+  final DocumentLibraryController previewController;
   final bool busy;
   final bool selected;
   final bool selectionMode;
@@ -2166,7 +2169,6 @@ class _DocumentCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final summary = entry.summary;
     final requiresRecovery = summary.recoveryAvailable;
-    final page = entry.previewPage;
     final payload = _DocumentDragPayload(
       Set<String>.unmodifiable(dragDocumentIds),
     );
@@ -2206,12 +2208,11 @@ class _DocumentCard extends StatelessWidget {
                   Expanded(
                     child: ColoredBox(
                       color: const Color(0xFFF8F7F2),
-                      child: page == null
-                          ? _PreviewUnavailable(
-                              recoveryAvailable: requiresRecovery,
-                              theme: theme,
-                            )
-                          : DocumentPagePreview(page: page),
+                      child: _DocumentCardPreview(
+                        entry: entry,
+                        theme: theme,
+                        controller: previewController,
+                      ),
                     ),
                   ),
                   Container(
@@ -2552,14 +2553,91 @@ class _DocumentDragFeedback extends StatelessWidget {
   );
 }
 
+/// A sliver only mounts visible (and nearby cached) cards. Requesting the
+/// preview here avoids decoding every document before the library is usable.
+class _DocumentCardPreview extends StatefulWidget {
+  const _DocumentCardPreview({
+    required this.entry,
+    required this.theme,
+    required this.controller,
+  });
+
+  final DocumentLibraryEntry entry;
+  final DocumentLibraryThemeData theme;
+  final DocumentLibraryController controller;
+
+  @override
+  State<_DocumentCardPreview> createState() => _DocumentCardPreviewState();
+}
+
+class _DocumentCardPreviewState extends State<_DocumentCardPreview> {
+  @override
+  void initState() {
+    super.initState();
+    widget.controller.retainPreview(widget.entry.summary.id);
+    _requestIfNeeded();
+  }
+
+  @override
+  void didUpdateWidget(covariant _DocumentCardPreview oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.entry.summary.id != widget.entry.summary.id ||
+        !identical(oldWidget.controller, widget.controller)) {
+      oldWidget.controller.releasePreview(oldWidget.entry.summary.id);
+      widget.controller.retainPreview(widget.entry.summary.id);
+    }
+    if (!identical(oldWidget.entry, widget.entry) ||
+        oldWidget.entry.summary.id != widget.entry.summary.id ||
+        oldWidget.entry.summary.revision != widget.entry.summary.revision ||
+        oldWidget.entry.previewPage != widget.entry.previewPage ||
+        oldWidget.entry.previewError != widget.entry.previewError) {
+      _requestIfNeeded();
+    }
+  }
+
+  void _requestIfNeeded() {
+    if (widget.entry.previewPage != null || widget.entry.previewError != null) {
+      return;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted &&
+          widget.entry.previewPage == null &&
+          widget.entry.previewError == null) {
+        widget.controller.requestPreview(widget.entry.summary.id);
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    widget.controller.releasePreview(widget.entry.summary.id);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final entry = widget.entry;
+    final page = entry.previewPage;
+    return page == null
+        ? _PreviewUnavailable(
+            recoveryAvailable: entry.summary.recoveryAvailable,
+            theme: widget.theme,
+            loading: entry.previewError == null,
+          )
+        : DocumentPagePreview(page: page);
+  }
+}
+
 class _PreviewUnavailable extends StatelessWidget {
   const _PreviewUnavailable({
     required this.recoveryAvailable,
     required this.theme,
+    this.loading = false,
   });
 
   final bool recoveryAvailable;
   final DocumentLibraryThemeData theme;
+  final bool loading;
 
   @override
   Widget build(BuildContext context) {
@@ -2578,6 +2656,8 @@ class _PreviewUnavailable extends StatelessWidget {
           Text(
             recoveryAvailable
                 ? 'Sicherung zum Wiederherstellen'
+                : loading
+                ? 'Vorschau wird geladen …'
                 : 'Vorschau nicht verfügbar',
             style: const TextStyle(color: Color(0xFF66716B), fontSize: 13),
           ),

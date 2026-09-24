@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'dart:collection';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -50,7 +52,7 @@ class DocumentLibraryController extends ChangeNotifier {
     DocumentIdFactory? documentIdFactory,
     FolderIdFactory? folderIdFactory,
     DocumentLibraryClock? clock,
-    this.previewConcurrency = 4,
+    this.previewConcurrency = 2,
   }) : assert(previewConcurrency > 0),
        _documentIdFactory = documentIdFactory ?? _newDocumentId,
        _folderIdFactory = folderIdFactory ?? _newDocumentId,
@@ -73,6 +75,15 @@ class DocumentLibraryController extends ChangeNotifier {
   final Set<String> _busyDocumentIds = <String>{};
   final Set<String> _busyTrashDocumentIds = <String>{};
   final Set<String> _selectedDocumentIds = <String>{};
+  final Queue<String> _previewQueue = Queue<String>();
+  final Set<String> _requestedPreviews = <String>{};
+  final Map<String, int> _mountedPreviewCounts = <String, int>{};
+  final LinkedHashSet<String> _cachedPreviews = LinkedHashSet<String>();
+  static const int _maximumCachedPreviews = 24;
+  int _activePreviewLoads = 0;
+  int _previewGeneration = 0;
+  List<DocumentLibraryEntry>? _visibleEntriesCache;
+  Map<String, int>? _folderCountsCache;
   LibraryOrganization _organization = LibraryOrganization.empty;
   List<TrashedDocumentSummary> _trashedDocuments =
       const <TrashedDocumentSummary>[];
@@ -100,19 +111,27 @@ class DocumentLibraryController extends ChangeNotifier {
   List<LibraryFolder> get folders => _organization.folders;
   String? get activeFolderId => _activeFolderId;
   LibraryFolder? get activeFolder => folderById(_activeFolderId);
-  List<DocumentLibraryEntry> get visibleEntries => List.unmodifiable(
-    _entries.where(
-      (entry) =>
-          _organization.documentFolderIds[entry.summary.id] == _activeFolderId,
-    ),
-  );
+  List<DocumentLibraryEntry> get visibleEntries =>
+      _visibleEntriesCache ??= List<DocumentLibraryEntry>.unmodifiable(
+        _entries.where(
+          (entry) =>
+              _organization.documentFolderIds[entry.summary.id] ==
+              _activeFolderId,
+        ),
+      );
 
-  int documentCountInFolder(String folderId) => _entries
-      .where(
-        (entry) =>
-            _organization.documentFolderIds[entry.summary.id] == folderId,
-      )
-      .length;
+  int documentCountInFolder(String folderId) {
+    return (_folderCountsCache ??= _countDocumentsByFolder())[folderId] ?? 0;
+  }
+
+  Map<String, int> _countDocumentsByFolder() {
+    final counts = <String, int>{};
+    for (final entry in _entries) {
+      final folderId = _organization.documentFolderIds[entry.summary.id];
+      if (folderId != null) counts[folderId] = (counts[folderId] ?? 0) + 1;
+    }
+    return counts;
+  }
 
   LibraryFolder? folderById(String? id) {
     if (id == null) return null;
@@ -344,6 +363,7 @@ class DocumentLibraryController extends ChangeNotifier {
 
   Future<void> reload() async {
     final generation = ++_loadGeneration;
+    _cancelPreviewRequests();
     _status = DocumentLibraryStatus.loading;
     _loadError = null;
     _safeNotify();
@@ -359,12 +379,12 @@ class DocumentLibraryController extends ChangeNotifier {
       if (_activeFolderId != null && folderById(_activeFolderId) == null) {
         _activeFolderId = null;
       }
-      _selectedDocumentIds.removeWhere(
-        (id) => !summaries.any((summary) => summary.id == id),
-      );
+      final existingIds = summaries.map((summary) => summary.id).toSet();
+      _selectedDocumentIds.removeWhere((id) => !existingIds.contains(id));
       final priorEntries = <String, DocumentLibraryEntry>{
         for (final entry in _entries) entry.summary.id: entry,
       };
+      _cancelPreviewRequests();
       _entries = List.unmodifiable(
         summaries.map((summary) {
           final prior = priorEntries[summary.id];
@@ -379,10 +399,7 @@ class DocumentLibraryController extends ChangeNotifier {
           );
         }),
       );
-      _safeNotify();
-      final hydrated = await _hydrate(summaries, generation);
-      if (!_isCurrent(generation)) return;
-      _entries = List.unmodifiable(hydrated);
+      _rememberExistingPreviews();
       _status = DocumentLibraryStatus.ready;
       _safeNotify();
       await reloadTrash();
@@ -395,6 +412,121 @@ class DocumentLibraryController extends ChangeNotifier {
       _status = DocumentLibraryStatus.error;
       _safeNotify();
       await reloadTrash();
+    }
+  }
+
+  /// Loads only previews whose cards have actually entered the sliver viewport.
+  /// Opening the library must not decode every page of every saved document.
+  void retainPreview(String documentId) {
+    _mountedPreviewCounts[documentId] =
+        (_mountedPreviewCounts[documentId] ?? 0) + 1;
+  }
+
+  void releasePreview(String documentId) {
+    final count = _mountedPreviewCounts[documentId] ?? 0;
+    if (count <= 1) {
+      _mountedPreviewCounts.remove(documentId);
+      if (_previewQueue.remove(documentId)) {
+        _requestedPreviews.remove(documentId);
+      }
+    } else {
+      _mountedPreviewCounts[documentId] = count - 1;
+    }
+  }
+
+  void requestPreview(String documentId) {
+    final entry = _entryById(documentId);
+    if (entry == null ||
+        entry.previewPage != null ||
+        entry.previewError != null ||
+        !_requestedPreviews.add(documentId)) {
+      return;
+    }
+    _previewQueue.add(documentId);
+    _pumpPreviewQueue();
+  }
+
+  void _pumpPreviewQueue() {
+    while (!_disposed &&
+        _activePreviewLoads < previewConcurrency &&
+        _previewQueue.isNotEmpty) {
+      final id = _previewQueue.removeFirst();
+      final entry = _entryById(id);
+      if (entry == null) continue;
+      _activePreviewLoads++;
+      unawaited(_loadPreview(id, entry.summary.revision, _previewGeneration));
+    }
+  }
+
+  Future<void> _loadPreview(String id, int revision, int generation) async {
+    BoardPage? page;
+    String? error;
+    bool recovered = false;
+    try {
+      final document = await repository.load(id);
+      if (document == null) {
+        error = 'Dokument nicht gefunden';
+      } else {
+        page = document.pages[document.currentPageIndex];
+        recovered = document.metadata.recoveredFromCrash;
+      }
+    } catch (exception) {
+      error = _messageFor(exception, fallback: 'Vorschau nicht verfügbar');
+    } finally {
+      if (!_disposed && generation == _previewGeneration) {
+        final index = _entries.indexWhere((entry) => entry.summary.id == id);
+        if (index >= 0 && _entries[index].summary.revision == revision) {
+          final next = _entries.toList(growable: false);
+          next[index] = DocumentLibraryEntry(
+            summary: next[index].summary,
+            previewPage: page,
+            wasRecovered: recovered,
+            previewError: error,
+          );
+          if (page != null) {
+            _cachedPreviews.remove(id);
+            _cachedPreviews.add(id);
+            while (_cachedPreviews.length > _maximumCachedPreviews) {
+              // A 4K board can show more cards than the cache target at once.
+              // Never evict a mounted card or its widget will immediately
+              // request the same document again in an endless load loop.
+              final evicted = _cachedPreviews.firstWhere(
+                (candidate) => !_mountedPreviewCounts.containsKey(candidate),
+                orElse: () => '',
+              );
+              if (evicted.isEmpty) break;
+              _cachedPreviews.remove(evicted);
+              _requestedPreviews.remove(evicted);
+              final evictedIndex = next.indexWhere(
+                (entry) => entry.summary.id == evicted,
+              );
+              if (evictedIndex >= 0) {
+                next[evictedIndex] = DocumentLibraryEntry(
+                  summary: next[evictedIndex].summary,
+                );
+              }
+            }
+          }
+          _entries = List.unmodifiable(next);
+          _safeNotify();
+        }
+        _activePreviewLoads--;
+        _pumpPreviewQueue();
+      }
+    }
+  }
+
+  void _cancelPreviewRequests() {
+    _previewGeneration++;
+    _previewQueue.clear();
+    _requestedPreviews.clear();
+    _cachedPreviews.clear();
+    _activePreviewLoads = 0;
+  }
+
+  void _rememberExistingPreviews() {
+    for (final entry in _entries) {
+      if (entry.previewPage != null) _cachedPreviews.add(entry.summary.id);
     }
   }
 
@@ -609,6 +741,8 @@ class DocumentLibraryController extends ChangeNotifier {
         _entries = List.unmodifiable(
           _entries.where((entry) => !deleted.contains(entry.summary.id)),
         );
+        _cancelPreviewRequests();
+        _rememberExistingPreviews();
         if (movedToTrash.isNotEmpty) {
           // Also reject a reload that began while the filesystem mutations
           // were in flight and may have captured only part of the batch.
@@ -894,51 +1028,6 @@ class DocumentLibraryController extends ChangeNotifier {
     _safeNotify();
   }
 
-  Future<List<DocumentLibraryEntry>> _hydrate(
-    List<DocumentSummary> summaries,
-    int generation,
-  ) async {
-    if (summaries.isEmpty) return const <DocumentLibraryEntry>[];
-    final results = List<DocumentLibraryEntry?>.filled(summaries.length, null);
-    var nextIndex = 0;
-
-    Future<void> worker() async {
-      while (_isCurrent(generation)) {
-        final index = nextIndex++;
-        if (index >= summaries.length) return;
-        final summary = summaries[index];
-        try {
-          final document = await repository.load(summary.id);
-          results[index] = DocumentLibraryEntry(
-            summary: summary,
-            previewPage: document == null
-                ? null
-                : document.pages[document.currentPageIndex],
-            wasRecovered: document?.metadata.recoveredFromCrash ?? false,
-            previewError: document == null ? 'Dokument nicht gefunden' : null,
-          );
-        } catch (error) {
-          results[index] = DocumentLibraryEntry(
-            summary: summary,
-            previewError: _messageFor(
-              error,
-              fallback: 'Vorschau nicht verfügbar',
-            ),
-          );
-        }
-      }
-    }
-
-    final workers = mathMin(previewConcurrency, summaries.length);
-    await Future.wait(List<Future<void>>.generate(workers, (_) => worker()));
-    return List<DocumentLibraryEntry>.generate(
-      summaries.length,
-      (index) =>
-          results[index] ?? DocumentLibraryEntry(summary: summaries[index]),
-      growable: false,
-    );
-  }
-
   void _upsert(WhiteboardDocument document, {required bool recoveryAvailable}) {
     final next =
         _entries
@@ -960,6 +1049,8 @@ class DocumentLibraryController extends ChangeNotifier {
           );
     _entries = List.unmodifiable(next);
     _loadGeneration++;
+    _cancelPreviewRequests();
+    _rememberExistingPreviews();
     _status = DocumentLibraryStatus.ready;
     _loadError = null;
     _safeNotify();
@@ -983,6 +1074,8 @@ class DocumentLibraryController extends ChangeNotifier {
       !_disposed && generation == _loadGeneration;
 
   void _safeNotify() {
+    _visibleEntriesCache = null;
+    _folderCountsCache = null;
     if (!_disposed) notifyListeners();
   }
 
@@ -991,6 +1084,7 @@ class DocumentLibraryController extends ChangeNotifier {
     _disposed = true;
     _loadGeneration++;
     _trashLoadGeneration++;
+    _cancelPreviewRequests();
     super.dispose();
   }
 }
@@ -999,7 +1093,5 @@ String _messageFor(Object error, {required String fallback}) {
   if (error case DocumentStorageException(:final message)) return message;
   return fallback;
 }
-
-int mathMin(int first, int second) => first < second ? first : second;
 
 String _newDocumentId() => const Uuid().v4();

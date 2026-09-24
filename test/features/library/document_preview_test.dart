@@ -21,6 +21,29 @@ void main() {
     expect(DocumentPagePreviewPainter.safePreviewStrokeWidth(2, .1), 8.5);
   });
 
+  test(
+    'dense page previews sample at most 320 strokes across the whole page',
+    () {
+      final strokes = List<InkStroke>.generate(
+        2000,
+        (index) => InkStroke(
+          id: 'stroke-$index',
+          points: const <InkPoint>[InkPoint(x: 0, y: 0)],
+        ),
+      );
+
+      final sample = DocumentPagePreviewPainter.samplePreviewStrokes(strokes);
+
+      expect(sample, hasLength(DocumentPagePreviewPainter.maxPreviewStrokes));
+      expect(sample.first, same(strokes.first));
+      expect(sample.last, same(strokes.last));
+      expect(
+        sample.map((stroke) => stroke.id).toSet(),
+        hasLength(sample.length),
+      );
+    },
+  );
+
   test('rasterizes a recovered huge-width dashed preview safely', () async {
     final page = BoardPage(
       id: 'recovered',

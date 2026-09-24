@@ -114,6 +114,25 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('many document cards request previews only near the viewport', (
+    tester,
+  ) async {
+    for (var index = 0; index < 80; index++) {
+      final document = WhiteboardDocument.create(
+        id: 'board-${index.toString().padLeft(3, '0')}',
+        title: 'Tafel $index',
+      );
+      repository.documents[document.id] = document;
+    }
+
+    await tester.pumpWidget(app(onOpen: (_, _) {}));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('80 Dokumente'), findsOneWidget);
+    expect(repository.loadCalls, isNotEmpty);
+    expect(repository.loadCalls.length, lessThan(20));
+  });
+
   testWidgets('opens recovery data and reports the matching asset directory', (
     tester,
   ) async {
@@ -872,6 +891,7 @@ class _WidgetRepository
   final List<WhiteboardDocument> saved = <WhiteboardDocument>[];
   final List<String> deletedIds = <String>[];
   final List<String> recoverCalls = <String>[];
+  final List<String> loadCalls = <String>[];
   final Map<String, WhiteboardDocument> trashedDocuments =
       <String, WhiteboardDocument>{};
   final Map<String, TrashedDocumentSummary> trash =
@@ -959,6 +979,7 @@ class _WidgetRepository
 
   @override
   Future<WhiteboardDocument?> load(String documentId) async {
+    loadCalls.add(documentId);
     if (loadError case final error?) throw error;
     return documents[documentId];
   }
