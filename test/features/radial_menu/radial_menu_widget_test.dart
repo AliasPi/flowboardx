@@ -525,6 +525,30 @@ void main() {
     expect(positions.single, closeToOffset(after));
   });
 
+  testWidgets('a gentle center flick adds only a short glide', (tester) async {
+    final controller = RadialMenuController();
+    addTearDown(controller.dispose);
+    final positions = <Offset>[];
+    await tester.pumpWidget(
+      host(
+        controller: controller,
+        callbacks: RadialMenuCallbacks(onPositionChanged: positions.add),
+      ),
+    );
+    final surface = find.byKey(const ValueKey<String>('radial-menu-surface'));
+    final before = tester.getCenter(surface);
+
+    await tester.flingFrom(before, const Offset(100, 0), 1100);
+    await tester.pumpAndSettle();
+
+    final after = tester.getCenter(surface);
+    expect(after.dx, greaterThan(before.dx + 100));
+    expect(after.dx, lessThan(before.dx + 190));
+    expect(after.dy, closeTo(before.dy, 1));
+    expect(positions, hasLength(1));
+    expect(positions.single, closeToOffset(after));
+  });
+
   testWidgets('a deliberate slow drag stops exactly where released', (
     tester,
   ) async {

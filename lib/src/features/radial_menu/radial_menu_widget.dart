@@ -103,6 +103,10 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
   static const int _maximumPageGestureFingers = 5;
   static const double _minimumFlingSpeed = 850;
   static const double _minimumFlingTravel = 55;
+  static const double _flingSpeedOffset = 700;
+  static const double _flingSpeedScale = 1.6;
+  static const double _maximumFlingSpeed = 2400;
+  static const double _flingDeceleration = 4000;
 
   late RadialMenuController _controller;
   late bool _ownsController;
@@ -177,7 +181,7 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
             duration: const Duration(milliseconds: 300),
           )
           ..addListener(() {
-            final progress = Curves.easeOutCubic.transform(
+            final progress = Curves.easeOutQuad.transform(
               _centerFlingAnimation.value,
             );
             _moveCenterTo(Offset.lerp(_flingFrom, _flingTo, progress)!);
@@ -685,37 +689,26 @@ class _RadialMenuState extends State<RadialMenu> with TickerProviderStateMixin {
         velocity.distance < _minimumFlingSpeed) {
       return false;
     }
-    final target = _edgeTargetFor(current, velocity);
+    // A small release velocity should add only a short glide. The previous
+    // edge target made every qualifying flick cross the entire remaining board.
+    final speed = velocity.distance;
+    final flingSpeed = ((speed - _flingSpeedOffset) * _flingSpeedScale).clamp(
+      0.0,
+      _maximumFlingSpeed,
+    );
+    final stoppingDistance = flingSpeed * flingSpeed / (2 * _flingDeceleration);
+    final target = _clampCenter(current + velocity / speed * stoppingDistance);
     final distance = (target - current).distance;
     if (distance < 20) return false;
     _flingFrom = current;
     _flingTo = target;
     _centerFlingAnimation.duration = Duration(
-      milliseconds: (distance / velocity.distance * 1400)
-          .clamp(200.0, 450.0)
+      milliseconds: (2 * distance / flingSpeed * 1000)
+          .clamp(160.0, 500.0)
           .round(),
     );
     unawaited(_centerFlingAnimation.forward(from: 0));
     return true;
-  }
-
-  Offset _edgeTargetFor(Offset current, Offset velocity) {
-    final min = _clampCenter(const Offset(-1000000, -1000000));
-    final max = _clampCenter(const Offset(1000000, 1000000));
-    var travelTime = double.infinity;
-    if (velocity.dx > 0 && max.dx - current.dx > 1) {
-      travelTime = math.min(travelTime, (max.dx - current.dx) / velocity.dx);
-    } else if (velocity.dx < 0 && current.dx - min.dx > 1) {
-      travelTime = math.min(travelTime, (min.dx - current.dx) / velocity.dx);
-    }
-    if (velocity.dy > 0 && max.dy - current.dy > 1) {
-      travelTime = math.min(travelTime, (max.dy - current.dy) / velocity.dy);
-    } else if (velocity.dy < 0 && current.dy - min.dy > 1) {
-      travelTime = math.min(travelTime, (min.dy - current.dy) / velocity.dy);
-    }
-    return travelTime.isFinite
-        ? _clampCenter(current + velocity * travelTime)
-        : current;
   }
 
   void _moveCenterTo(Offset requested) {
